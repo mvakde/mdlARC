@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -85,6 +85,42 @@ class MultiHeadSelfAttention(nn.Module):
         )
         return self.out_proj(attn_output)
 
+    def forward_with_cache(
+        self,
+        hidden_states: torch.Tensor,
+        pos_xyz: torch.Tensor,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Self-attention variant that maintains a KV cache.
+
+        Used for autoregressive generation to avoid recomputing keys/values
+        for the prefix tokens.
+        """
+        batch_size, seq_len, dim = hidden_states.shape
+
+        qkv = self.qkv_proj(hidden_states)
+        qkv = qkv.view(batch_size, seq_len, 3, self.n_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        queries, keys, values = qkv.unbind(0)
+
+        queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
+
+        if past_key_value is not None:
+            past_keys, past_values = past_key_value
+            keys = torch.cat([past_keys, keys], dim=2)
+            values = torch.cat([past_values, values], dim=2)
+
+        attn_scores = torch.matmul(queries, keys.transpose(-2, -1)) * self.scale
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        attn_output = torch.matmul(attn_weights, values)
+        attn_output = (
+            attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, dim)
+        )
+        attn_output = self.out_proj(attn_output)
+        present_key_value = (keys, values)
+        return attn_output, present_key_value
+
 
 class FeedForward(nn.Module):
     def __init__(self, config: TinyTransformerConfig) -> None:
@@ -129,6 +165,23 @@ class TransformerBlock(nn.Module):
         ff_output = self.ff(ff_input)
         hidden_states = hidden_states + ff_output
         return hidden_states
+
+    def forward_with_cache(
+        self,
+        hidden_states: torch.Tensor,
+        pos_xyz: torch.Tensor,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        attn_input = self.ln_1(hidden_states)
+        attn_output, present_key_value = self.attention.forward_with_cache(
+            attn_input, pos_xyz=pos_xyz, past_key_value=past_key_value
+        )
+        hidden_states = hidden_states + attn_output
+
+        ff_input = self.ln_2(hidden_states)
+        ff_output = self.ff(ff_input)
+        hidden_states = hidden_states + ff_output
+        return hidden_states, present_key_value
 
 
 class TinyTransformer(nn.Module):
@@ -216,8 +269,75 @@ class TinyTransformer(nn.Module):
                 shift_targets.view(-1),
                 ignore_index=IGNORE_INDEX,
             )
-
         return {"logits": logits, "loss": loss}
+
+    def forward_generate(
+        self,
+        input_ids: torch.Tensor,
+        example_ids: torch.Tensor,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        positions_3d: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Forward used for autoregressive generation with a KV cache.
+
+        When `past_key_values` is None, the call is treated as a full prompt
+        pass and the method returns per-layer key/value tensors that
+        represent the entire prefix. When `past_key_values` is provided,
+        `input_ids` and `positions_3d` should contain only the newly
+        generated tokens, and the cache is updated accordingly.
+        """
+        batch_size, seq_len = input_ids.size()
+        if seq_len > self.config.max_seq_len:
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds model capacity ({self.config.max_seq_len})."
+            )
+
+        device = input_ids.device
+
+        token_embeds = self.token_embedding(input_ids)
+        example_embeds = self.example_embedding(example_ids)
+
+        start_mask = (input_ids == START_TOKEN_ID).unsqueeze(-1).type_as(token_embeds)
+        hidden_states = token_embeds + start_mask * example_embeds.unsqueeze(1)
+        hidden_states = self.dropout(hidden_states)
+
+        # Initial prompt: no cache yet, compute 3D positions internally.
+        if past_key_values is None:
+            attention_mask = torch.ones_like(
+                input_ids, dtype=torch.bool, device=device
+            )
+            pos_xyz = self._compute_positions_3d(input_ids, attention_mask)
+
+            past_key_values_out: List[Tuple[torch.Tensor, torch.Tensor]] = []
+            for block in self.blocks:
+                hidden_states, present_kv = block.forward_with_cache(
+                    hidden_states, pos_xyz, past_key_value=None
+                )
+                past_key_values_out.append(present_kv)
+
+            hidden_states = self.norm(hidden_states)
+            logits = self.lm_head(hidden_states)
+            return {"logits": logits, "past_key_values": tuple(past_key_values_out)}
+
+        if positions_3d is None:
+            raise ValueError("positions_3d must be provided when using past_key_values.")
+
+        if len(past_key_values) != len(self.blocks):
+            raise ValueError(
+                f"Expected {len(self.blocks)} past key/value pairs, "
+                f"got {len(past_key_values)}."
+            )
+
+        past_key_values_out: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for block, layer_past in zip(self.blocks, past_key_values):
+            hidden_states, present_kv = block.forward_with_cache(
+                hidden_states, positions_3d, past_key_value=layer_past
+            )
+            past_key_values_out.append(present_kv)
+
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+        return {"logits": logits, "past_key_values": tuple(past_key_values_out)}
 
     # ------------------------ 3D RoPE utilities ------------------------
     def _compute_positions_3d(

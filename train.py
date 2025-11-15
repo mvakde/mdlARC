@@ -1,7 +1,7 @@
 import argparse
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -11,7 +11,10 @@ from tinytransformer import TinyTransformer, TinyTransformerConfig
 from utils import (
     ARCExampleDataset,
     END_TOKEN_ID,
+    IO_SEPARATOR_TOKEN_ID,
     MAX_SEQ_LEN,
+    NEXT_LINE_TOKEN_ID,
+    START_TOKEN_ID,
     create_dataloader,
     extract_output_tokens,
     tokens_to_string,
@@ -178,6 +181,35 @@ def train_one_epoch(
     return step
 
 
+def _update_position_state(
+    x: int, y: int, z: int, token_id: int, is_first: bool
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    """Update 3D grid position state for a single token.
+
+    Mirrors TinyTransformer._compute_positions_3d for sequential decoding.
+    """
+    if is_first and token_id == START_TOKEN_ID:
+        return (0, 0, 0), (x, y, z)
+
+    if token_id == IO_SEPARATOR_TOKEN_ID:
+        return (0, 0, 2), (0, 0, 3)
+
+    if token_id == END_TOKEN_ID:
+        return (0, 0, 4), (x, y, z)
+
+    px = min(max(x, 0), 29)
+    py = min(max(y, 0), 30)
+    pos = (px, py, z)
+
+    if token_id == NEXT_LINE_TOKEN_ID:
+        x = 0
+        y += 1
+    else:
+        x += 1
+
+    return pos, (x, y, z)
+
+
 @torch.no_grad()
 def greedy_generate(
     model: TinyTransformer,
@@ -188,19 +220,48 @@ def greedy_generate(
 ) -> torch.LongTensor:
     model.eval()
     generated = prompt_tokens.unsqueeze(0).to(device)
-    attention_mask = torch.ones_like(generated, dtype=torch.bool)
-    example_ids = torch.tensor([example_id], dtype=torch.long, device=device)
+    example_ids_tensor = torch.tensor([example_id], dtype=torch.long, device=device)
+
+    # Initialize 3D position state after consuming the prompt.
+    x, y, z = 0, 0, 1
+    prompt_list = prompt_tokens.tolist()
+    for idx, tok in enumerate(prompt_list):
+        _, (x, y, z) = _update_position_state(x, y, z, int(tok), is_first=(idx == 0))
+
+    # First pass: run the full prompt to build KV cache and get initial logits.
+    outputs = model.forward_generate(
+        input_ids=generated,
+        example_ids=example_ids_tensor,
+        past_key_values=None,
+    )
+    logits = outputs["logits"]
+    past_key_values = outputs["past_key_values"]
 
     for _ in range(max_new_tokens):
+        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+        token_id = int(next_token.item())
+        generated = torch.cat([generated, next_token], dim=1)
+
+        if token_id == END_TOKEN_ID:
+            break
         if generated.size(1) >= model.config.max_seq_len:
             print("Reached model max_seq_len during generation; stopping.")
             break
-        outputs = model(generated, example_ids, attention_mask=attention_mask)
-        next_token = torch.argmax(outputs["logits"][:, -1, :], dim=-1, keepdim=True)
-        generated = torch.cat([generated, next_token], dim=1)
-        attention_mask = torch.ones_like(generated, dtype=torch.bool)
-        if next_token.item() == END_TOKEN_ID:
-            break
+
+        pos, (x, y, z) = _update_position_state(
+            x, y, z, token_id, is_first=False
+        )
+        pos_tensor = torch.tensor([[list(pos)]], dtype=torch.long, device=device)
+
+        outputs = model.forward_generate(
+            input_ids=next_token,
+            example_ids=example_ids_tensor,
+            past_key_values=past_key_values,
+            positions_3d=pos_tensor,
+        )
+        logits = outputs["logits"]
+        past_key_values = outputs["past_key_values"]
+
     return generated.squeeze(0).cpu()
 
 
