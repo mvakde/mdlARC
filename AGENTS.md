@@ -12,6 +12,7 @@ This file explains how the main code pieces fit together and how they use the AR
     - `TransformerBlock` (LayerNorm → self-attention → residual + LayerNorm → feed-forward → residual).
     - `TinyTransformer`, which:
       - Embeds tokens (`token_embedding`) and a per-task example id (`example_embedding`).
+      - Adds the per-task example embedding to every token in a sequence, so task identity is present throughout the serialized ARC grids.
       - Builds a 3D position tensor via `_compute_positions_3d` from token ids and the ARC serialization scheme.
       - Applies a stack of `TransformerBlock`s, final LayerNorm, and a linear head to produce logits over the vocabulary.
       - Computes autoregressive cross-entropy loss by shifting targets one token to the right and masking padded positions with `IGNORE_INDEX`.
@@ -178,4 +179,3 @@ The companion `grouped-tasks/*/solutions.json` files contain the ground-truth ou
 - When modifying the model:
   - Preserve the semantics of the special tokens and how sequences are constructed—other components (dataset, position computation, evaluation) depend on them.
   - If you change `num_examples` or the set of `task_ids`, update checkpoints or regenerate them to avoid mismatches between `TinyTransformerConfig.num_examples` and `dataset.num_examples`.
-

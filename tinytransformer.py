@@ -282,11 +282,8 @@ class TinyTransformer(nn.Module):
 
         token_embeds = self.token_embedding(input_ids)
         example_embeds = self.example_embedding(example_ids)  # [B, D]
-
-        # Add example embedding only to the <start> token positions.
-        # This avoids broadcasting the example id across all tokens.
-        start_mask = (input_ids == START_TOKEN_ID).unsqueeze(-1).type_as(token_embeds)
-        hidden_states = token_embeds + start_mask * example_embeds.unsqueeze(1)
+        # Add the per-example embedding to every token in the sequence.
+        hidden_states = token_embeds + example_embeds.unsqueeze(1)
         hidden_states = self.dropout(hidden_states)
 
         # Compute 3D positions per token based on token semantics.
@@ -340,8 +337,9 @@ class TinyTransformer(nn.Module):
         token_embeds = self.token_embedding(input_ids)
         example_embeds = self.example_embedding(example_ids)
 
-        start_mask = (input_ids == START_TOKEN_ID).unsqueeze(-1).type_as(token_embeds)
-        hidden_states = token_embeds + start_mask * example_embeds.unsqueeze(1)
+        # During generation, also broadcast the example embedding across
+        # all tokens in the (prompt or incremental) sequence.
+        hidden_states = token_embeds + example_embeds.unsqueeze(1)
         hidden_states = self.dropout(hidden_states)
 
         # Initial prompt: no cache yet, compute 3D positions and use the
