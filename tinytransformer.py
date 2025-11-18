@@ -9,6 +9,7 @@ from utils import (
     IGNORE_INDEX,
     MAX_SEQ_LEN,
     VOCAB_SIZE,
+    START_TOKEN_ID,
     NEXT_LINE_TOKEN_ID,
     IO_SEPARATOR_TOKEN_ID,
     END_TOKEN_ID,
@@ -24,7 +25,7 @@ class TinyTransformerConfig:
     d_ff: int = 512
     n_layers: int = 4
     dropout: float = 0.1
-    num_examples: int = 1360
+    num_examples: int = 1024
 
     def __post_init__(self) -> None:
         if self.d_model % self.n_heads != 0:
@@ -55,7 +56,6 @@ class MultiHeadSelfAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
         pos_xyz: Optional[torch.Tensor] = None,
-        rope_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, dim = hidden_states.shape
 
@@ -66,7 +66,7 @@ class MultiHeadSelfAttention(nn.Module):
 
         if pos_xyz is not None:
             # pos_xyz: [B, S, 3] (x, y, z)
-            queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz, rope_mask)
+            queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
 
         attn_scores = torch.matmul(queries, keys.transpose(-2, -1)) * self.scale
 
@@ -91,7 +91,6 @@ class MultiHeadSelfAttention(nn.Module):
         pos_xyz: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
-        rope_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Self-attention variant that also exposes a KV cache.
@@ -111,7 +110,7 @@ class MultiHeadSelfAttention(nn.Module):
         queries, keys, values = qkv.unbind(0)
 
         if pos_xyz is not None:
-            queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz, rope_mask)
+            queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
 
         # Incremental decoding branch: concatenate cached K/V and attend
         # from the new tokens only. No causal mask is needed because there
@@ -126,7 +125,9 @@ class MultiHeadSelfAttention(nn.Module):
             attn_weights = self.dropout(attn_weights)
             attn_output = torch.matmul(attn_weights, values)
             attn_output = (
-                attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, dim)
+                attn_output.transpose(1, 2)
+                .contiguous()
+                .view(batch_size, seq_len, dim)
             )
             attn_output = self.out_proj(attn_output)
             present_key_value = (keys, values)
@@ -184,7 +185,6 @@ class TransformerBlock(nn.Module):
         attention_mask: Optional[torch.Tensor],
         causal_mask: torch.Tensor,
         pos_xyz: Optional[torch.Tensor],
-        rope_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         attn_input = self.ln_1(hidden_states)
         attn_output = self.attention(
@@ -192,7 +192,6 @@ class TransformerBlock(nn.Module):
             attention_mask=attention_mask,
             causal_mask=causal_mask,
             pos_xyz=pos_xyz,
-            rope_mask=rope_mask,
         )
         hidden_states = hidden_states + attn_output
 
@@ -207,7 +206,6 @@ class TransformerBlock(nn.Module):
         pos_xyz: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
-        rope_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         attn_input = self.ln_1(hidden_states)
@@ -216,7 +214,6 @@ class TransformerBlock(nn.Module):
             pos_xyz=pos_xyz,
             attention_mask=attention_mask,
             causal_mask=causal_mask,
-            rope_mask=rope_mask,
             past_key_value=past_key_value,
         )
         hidden_states = hidden_states + attn_output
@@ -289,16 +286,13 @@ class TinyTransformer(nn.Module):
         hidden_states = token_embeds + example_embeds.unsqueeze(1)
         hidden_states = self.dropout(hidden_states)
 
-        # Compute 3D positions per token based on token semantics, plus a
-        # mask indicating which tokens should receive RoPE.
-        pos_xyz, rope_mask = self._compute_positions_3d(input_ids, attention_mask)
+        # Compute 3D positions per token based on token semantics.
+        pos_xyz = self._compute_positions_3d(input_ids, attention_mask)
 
         causal_mask = self._build_causal_mask(seq_len, device)
 
         for block in self.blocks:
-            hidden_states = block(
-                hidden_states, attention_mask, causal_mask, pos_xyz, rope_mask
-            )
+            hidden_states = block(hidden_states, attention_mask, causal_mask, pos_xyz)
             hidden_states = hidden_states * attention_mask.unsqueeze(-1)
 
         hidden_states = self.norm(hidden_states)
@@ -323,7 +317,6 @@ class TinyTransformer(nn.Module):
         example_ids: torch.Tensor,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
         positions_3d: Optional[torch.Tensor] = None,
-        rope_mask: Optional[torch.Tensor] = None,
     ) -> dict:
         """Forward used for autoregressive generation with a KV cache.
 
@@ -352,10 +345,10 @@ class TinyTransformer(nn.Module):
         # Initial prompt: no cache yet, compute 3D positions and use the
         # exact same masking behavior as the standard forward pass.
         if past_key_values is None:
-            attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=device)
-            pos_xyz, rope_mask_full = self._compute_positions_3d(
-                input_ids, attention_mask
+            attention_mask = torch.ones_like(
+                input_ids, dtype=torch.bool, device=device
             )
+            pos_xyz = self._compute_positions_3d(input_ids, attention_mask)
             causal_mask = self._build_causal_mask(seq_len, device)
 
             past_key_values_out: List[Tuple[torch.Tensor, torch.Tensor]] = []
@@ -365,7 +358,6 @@ class TinyTransformer(nn.Module):
                     pos_xyz,
                     attention_mask=attention_mask,
                     causal_mask=causal_mask,
-                    rope_mask=rope_mask_full,
                     past_key_value=None,
                 )
                 past_key_values_out.append(present_kv)
@@ -375,12 +367,7 @@ class TinyTransformer(nn.Module):
             return {"logits": logits, "past_key_values": tuple(past_key_values_out)}
 
         if positions_3d is None:
-            raise ValueError(
-                "positions_3d must be provided when using past_key_values."
-            )
-
-        if rope_mask is None:
-            raise ValueError("rope_mask must be provided when using past_key_values.")
+            raise ValueError("positions_3d must be provided when using past_key_values.")
 
         if len(past_key_values) != len(self.blocks):
             raise ValueError(
@@ -391,12 +378,7 @@ class TinyTransformer(nn.Module):
         past_key_values_out: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for block, layer_past in zip(self.blocks, past_key_values):
             hidden_states, present_kv = block.forward_with_cache(
-                hidden_states,
-                positions_3d,
-                attention_mask=None,
-                causal_mask=None,
-                rope_mask=rope_mask,
-                past_key_value=layer_past,
+                hidden_states, positions_3d, past_key_value=layer_past
             )
             past_key_values_out.append(present_kv)
 
@@ -407,48 +389,62 @@ class TinyTransformer(nn.Module):
     # ------------------------ 3D RoPE utilities ------------------------
     def _compute_positions_3d(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Map tokens to 3D coordinates and a RoPE mask.
+    ) -> torch.Tensor:
+        """Map sequence tokens to 3D coordinates (x,y,z) per user spec.
 
-        Layout:
-          - RoPE is not applied to <input_output_separator> or <end>.
-          - Input grid tokens (digits and <next_line>) lie on the (x, y, 0) plane.
-          - Output grid tokens lie on the (x, y, 1) plane, with the same row/column layout.
+        Grid extents: x in [0, 29], y in [0, 30], z in {0..4}.
+        Mapping rules:
+          - <start> at (0,0,0)
+          - Input grid in z=1 layer; rows along y, columns along x; <next_line> occupies a cell
+          - <input_output_separator> at (0,0,2)
+          - Output grid in z=3 layer; same layout as input
+          - <end> at (0,0,4)
         """
         B, S = input_ids.shape
         device = input_ids.device
         pos = torch.zeros((B, S, 3), dtype=torch.long, device=device)
-        rope_mask = torch.zeros((B, S), dtype=torch.bool, device=device)
 
+        # Iterate per batch element to respect per-sequence semantics
         for b in range(B):
             x = 0
             y = 0
-            z = 0  # input grid plane
-            in_output = False
+            z = 1  # start in input layer after <start>
+            seen_sep = False
             for t in range(S):
                 if not attention_mask[b, t]:
+                    # beyond real tokens; leave zeros
+                    continue
+                tok = int(input_ids[b, t].item())
+                if t == 0 and tok == START_TOKEN_ID:
+                    pos[b, t, 0] = 0
+                    pos[b, t, 1] = 0
+                    pos[b, t, 2] = 0
+                    # Do not change grid counters
                     continue
 
-                tok = int(input_ids[b, t].item())
-
                 if tok == IO_SEPARATOR_TOKEN_ID:
-                    # Special token: no RoPE. Switch subsequent tokens to output plane.
+                    pos[b, t, 0] = 0
+                    pos[b, t, 1] = 0
+                    pos[b, t, 2] = 2
+                    # Switch to output grid after separator
                     x, y = 0, 0
-                    z = 1
-                    in_output = True
+                    z = 3
+                    seen_sep = True
                     continue
 
                 if tok == END_TOKEN_ID:
-                    # Special token: no RoPE and no further grid updates.
+                    pos[b, t, 0] = 0
+                    pos[b, t, 1] = 0
+                    pos[b, t, 2] = 4
                     continue
 
                 # Regular grid tokens (digits 0-9 and <next_line>)
+                # Clamp to grid bounds (30x31) defensively
                 px = min(max(x, 0), 29)
                 py = min(max(y, 0), 30)
                 pos[b, t, 0] = px
                 pos[b, t, 1] = py
                 pos[b, t, 2] = z
-                rope_mask[b, t] = True
 
                 if tok == NEXT_LINE_TOKEN_ID:
                     x = 0
@@ -456,7 +452,7 @@ class TinyTransformer(nn.Module):
                 else:
                     x += 1
 
-        return pos, rope_mask
+        return pos
 
 
 class RotaryEmbedding3D(nn.Module):
@@ -482,15 +478,9 @@ class RotaryEmbedding3D(nn.Module):
         self.d_y = py * 2
         self.d_z = pz * 2
         # Precompute inverse frequency for each axis slice
-        self.register_buffer(
-            "inv_freq_x", self._build_inv_freq(self.d_x), persistent=False
-        )
-        self.register_buffer(
-            "inv_freq_y", self._build_inv_freq(self.d_y), persistent=False
-        )
-        self.register_buffer(
-            "inv_freq_z", self._build_inv_freq(self.d_z), persistent=False
-        )
+        self.register_buffer("inv_freq_x", self._build_inv_freq(self.d_x), persistent=False)
+        self.register_buffer("inv_freq_y", self._build_inv_freq(self.d_y), persistent=False)
+        self.register_buffer("inv_freq_z", self._build_inv_freq(self.d_z), persistent=False)
 
     def _build_inv_freq(self, dim: int) -> torch.Tensor:
         if dim <= 0:
@@ -524,13 +514,11 @@ class RotaryEmbedding3D(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         pos_xyz: torch.Tensor,
-        rope_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply 3D RoPE to the first d_x, d_y, d_z channels respectively.
 
         q, k: [B, H, S, D]
         pos_xyz: [B, S, 3] with integer coordinates (x, y, z)
-        rope_mask: [B, S] bool mask; tokens with mask False receive no rotation.
         """
         B, H, S, D = q.shape
         assert D == self.head_dim
@@ -549,24 +537,6 @@ class RotaryEmbedding3D(nn.Module):
         sin_y = sin_y.unsqueeze(1)
         cos_z = cos_z.unsqueeze(1)
         sin_z = sin_z.unsqueeze(1)
-
-        if rope_mask is not None:
-            # Broadcast mask to [B, 1, S, 1] and gate cos/sin so that
-            # masked-out positions experience no rotation.
-            m = (
-                rope_mask.to(dtype=torch.bool, device=q.device)
-                .unsqueeze(1)
-                .unsqueeze(-1)
-            )
-            if self.d_x > 0:
-                cos_x = torch.where(m, cos_x, torch.ones_like(cos_x))
-                sin_x = torch.where(m, sin_x, torch.zeros_like(sin_x))
-            if self.d_y > 0:
-                cos_y = torch.where(m, cos_y, torch.ones_like(cos_y))
-                sin_y = torch.where(m, sin_y, torch.zeros_like(sin_y))
-            if self.d_z > 0:
-                cos_z = torch.where(m, cos_z, torch.ones_like(cos_z))
-                sin_z = torch.where(m, sin_z, torch.zeros_like(sin_z))
 
         # Slices
         dx, dy, dz = self.d_x, self.d_y, self.d_z

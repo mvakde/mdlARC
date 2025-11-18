@@ -14,6 +14,7 @@ from utils import (
     IO_SEPARATOR_TOKEN_ID,
     MAX_SEQ_LEN,
     NEXT_LINE_TOKEN_ID,
+    START_TOKEN_ID,
     create_dataloader,
     extract_output_tokens,
     tokens_to_string,
@@ -212,23 +213,20 @@ def _build_weight_decay_param_groups(
 
 def _update_position_state(
     x: int, y: int, z: int, token_id: int, is_first: bool
-) -> Tuple[Tuple[int, int, int], Tuple[int, int, int], bool]:
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
     """Update 3D grid position state for a single token.
 
-    Mirrors TinyTransformer._compute_positions_3d for sequential decoding:
-      - No RoPE on <input_output_separator> or <end>.
-      - Input grid tokens on (x, y, 0); output grid on (x, y, 1).
+    Mirrors TinyTransformer._compute_positions_3d for sequential decoding.
     """
-    # Special tokens: no RoPE, just update region state.
+    if is_first and token_id == START_TOKEN_ID:
+        return (0, 0, 0), (x, y, z)
+
     if token_id == IO_SEPARATOR_TOKEN_ID:
-        # Switch subsequent tokens to output plane z=1.
-        return (0, 0, 0), (0, 0, 1), False
+        return (0, 0, 2), (0, 0, 3)
 
     if token_id == END_TOKEN_ID:
-        # End marker: no position change and no RoPE.
-        return (0, 0, 0), (x, y, z), False
+        return (0, 0, 4), (x, y, z)
 
-    # Regular grid tokens (digits and <next_line>) receive RoPE.
     px = min(max(x, 0), 29)
     py = min(max(y, 0), 30)
     pos = (px, py, z)
@@ -239,7 +237,7 @@ def _update_position_state(
     else:
         x += 1
 
-    return pos, (x, y, z), True
+    return pos, (x, y, z)
 
 
 @torch.no_grad()
@@ -255,12 +253,10 @@ def greedy_generate(
     example_ids_tensor = torch.tensor([example_id], dtype=torch.long, device=device)
 
     # Initialize 3D position state after consuming the prompt.
-    x, y, z = 0, 0, 0
+    x, y, z = 0, 0, 1
     prompt_list = prompt_tokens.tolist()
     for idx, tok in enumerate(prompt_list):
-        _, (x, y, z), _ = _update_position_state(
-            x, y, z, int(tok), is_first=(idx == 0)
-        )
+        _, (x, y, z) = _update_position_state(x, y, z, int(tok), is_first=(idx == 0))
 
     # First pass: run the full prompt to build KV cache and get initial logits.
     outputs = model.forward_generate(
@@ -282,18 +278,16 @@ def greedy_generate(
             print("Reached model max_seq_len during generation; stopping.")
             break
 
-        pos, (x, y, z), rope_flag = _update_position_state(
+        pos, (x, y, z) = _update_position_state(
             x, y, z, token_id, is_first=False
         )
         pos_tensor = torch.tensor([[list(pos)]], dtype=torch.long, device=device)
-        rope_mask = torch.tensor([[rope_flag]], dtype=torch.bool, device=device)
 
         outputs = model.forward_generate(
             input_ids=next_token,
             example_ids=example_ids_tensor,
             past_key_values=past_key_values,
             positions_3d=pos_tensor,
-            rope_mask=rope_mask,
         )
         logits = outputs["logits"]
         past_key_values = outputs["past_key_values"]

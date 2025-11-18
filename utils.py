@@ -16,20 +16,21 @@ except Exception:  # pragma: no cover
 
 # Vocabulary definitions ----------------------------------------------------
 
-VOCAB_SIZE = 13
+VOCAB_SIZE = 14
 
-SPECIAL_TOKENS = ["<next_line>", "<input_output_separator>", "<end>"]
+SPECIAL_TOKENS = ["<start>", "<next_line>", "<input_output_separator>", "<end>"]
 TOKEN_TO_ID: Dict[str, int] = {str(i): i for i in range(10)}
 for offset, token in enumerate(SPECIAL_TOKENS, start=10):
     TOKEN_TO_ID[token] = offset
 
 ID_TO_TOKEN = {idx: token for token, idx in TOKEN_TO_ID.items()}
 
+START_TOKEN_ID = TOKEN_TO_ID["<start>"]
 NEXT_LINE_TOKEN_ID = TOKEN_TO_ID["<next_line>"]
 IO_SEPARATOR_TOKEN_ID = TOKEN_TO_ID["<input_output_separator>"]
 END_TOKEN_ID = TOKEN_TO_ID["<end>"]
 
-MAX_SEQ_LEN = 1862
+MAX_SEQ_LEN = 2048
 IGNORE_INDEX = -100
 
 
@@ -56,7 +57,7 @@ def encode_example(
     append_end: bool = True,
 ) -> List[int]:
     """Serializes an ARC pair into a single token stream."""
-    tokens: List[int] = []
+    tokens = [START_TOKEN_ID]
     tokens.extend(grid_to_tokens(input_grid))
     tokens.append(IO_SEPARATOR_TOKEN_ID)
     if include_output and output_grid is not None:
@@ -110,7 +111,7 @@ def tokens_to_string(tokens: Sequence[int]) -> str:
     """Convert a token id sequence into a space-delimited string.
 
     - Digits 0-9 remain as their numeric character.
-    - Special tokens use their literal names (e.g. "<next_line>").
+    - Special tokens use their literal names, e.g. "<start>".
     """
     parts: List[str] = []
     for tok in tokens:
@@ -125,7 +126,7 @@ def split_grids_from_tokens(tokens: Sequence[int]) -> List[List[List[int]]]:
     - Digits 0-9 map to cell values in the current row.
     - <next_line> ends the current row and starts a new row.
     - <input_output_separator> closes the current grid and starts a new one.
-    - <end> stops parsing.
+    - <start> is ignored; <end> stops parsing.
     """
     grids: List[List[List[int]]] = []
     current_grid: List[List[int]] = []
@@ -134,6 +135,9 @@ def split_grids_from_tokens(tokens: Sequence[int]) -> List[List[List[int]]]:
     for tok in tokens:
         if tok == END_TOKEN_ID:
             break
+        if tok == START_TOKEN_ID:
+            # ignore start markers
+            continue
         if tok == IO_SEPARATOR_TOKEN_ID:
             # close current row if non-empty
             if current_row:
