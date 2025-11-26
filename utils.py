@@ -168,8 +168,8 @@ def compute_positions_3d(
                 pos[b, t, 2] = 4
                 continue
 
-            px = min(max(x, 0), 29)
-            py = min(max(y, 0), 30)
+            px = min(max(x, 0), 30)
+            py = min(max(y, 0), 29)
             pos[b, t, 0] = px
             pos[b, t, 1] = py
             pos[b, t, 2] = z
@@ -360,6 +360,20 @@ class ARCExampleDataset(Dataset):
 
         self.num_examples = len(self.task_id_to_example_id)
 
+        print("Precomputing 3D positions...")
+        for ex in self.examples:
+            # We treat a single example as a batch of 1 to reuse your existing function
+            # or refactor the function to handle 1D tensors.
+            # Using your existing function for minimal code changes:
+            fake_batch = ex.tokens.unsqueeze(0)  # [1, seq_len]
+            mask = torch.ones_like(fake_batch, dtype=torch.bool)
+
+            # This is slow, but it only happens ONCE during startup
+            pos = compute_positions_3d(fake_batch, mask)
+
+            # Store the result (remove batch dim)
+            ex.cached_positions = pos.squeeze(0)
+
     def __len__(self) -> int:
         return len(self.examples)
 
@@ -392,14 +406,16 @@ def collate_examples(
     input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
     example_ids = torch.zeros(batch_size, dtype=torch.long)
+    positions_3d = torch.zeros((batch_size, max_len, 3), dtype=torch.long)
 
     for idx, example in enumerate(batch):
         seq_len = example.tokens.size(0)
         input_ids[idx, :seq_len] = example.tokens
         attention_mask[idx, :seq_len] = True
         example_ids[idx] = example.example_id
+        positions_3d[idx, :seq_len] = example.cached_positions
 
-    positions_3d = compute_positions_3d(input_ids, attention_mask)
+    # positions_3d = compute_positions_3d(input_ids, attention_mask)
 
     return {
         "input_ids": input_ids,
