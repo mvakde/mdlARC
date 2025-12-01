@@ -32,6 +32,7 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
 
 DEFAULT_DATA_PATH = Path("assets/ARC-2/grouped-tasks/training/challenges.json")
+MAX_NEW_TOKENS = 931
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,9 +47,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument(
-        "--max-steps", type=int, default=0, help="Optional cap on total training steps."
-    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument(
         "--device", type=str, default="mps", help="cpu | cuda | mps (Apple Silicon)"
@@ -71,7 +69,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--inference-task-id", type=str, default=None)
     parser.add_argument("--inference-pair-index", type=int, default=0)
-    parser.add_argument("--max-new-tokens", type=int, default=512)
     # Visibility / logging options
     parser.add_argument(
         "--log-train-strings",
@@ -192,7 +189,6 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     grad_clip: float,
-    max_steps: int,
     start_step: int = 0,
     log_train_strings: bool = False,
     log_train_limit: int = 0,
@@ -247,8 +243,6 @@ def train_one_epoch(
             avg_loss = total_loss / 10
             print(f"step={step} avg_loss={avg_loss:.4f}")
             total_loss = 0.0
-        if max_steps and step >= max_steps:
-            break
     return step
 
 
@@ -309,28 +303,60 @@ def _update_position_state(
     return pos, (x, y, z)
 
 
+def _derive_state_from_prompt_positions(
+    prompt_tokens: torch.LongTensor, prompt_positions: torch.LongTensor
+) -> Tuple[int, int, int]:
+    """Derive decoder state after consuming the prompt using cached positions."""
+    if prompt_tokens.numel() == 0:
+        return 0, 0, 1
+
+    last_token = int(prompt_tokens[-1].item())
+    last_pos = prompt_positions[-1]
+    x = int(last_pos[0].item())
+    y = int(last_pos[1].item())
+    z = int(last_pos[2].item())
+
+    if last_token == START_TOKEN_ID:
+        return 0, 0, 1
+    if last_token == IO_SEPARATOR_TOKEN_ID:
+        return 0, 0, 3
+    if last_token == END_TOKEN_ID:
+        return x, y, z
+    if last_token == NEXT_LINE_TOKEN_ID:
+        return 0, y + 1, z
+    return x + 1, y, z
+
+
 @torch.no_grad()
 def greedy_generate(
     model: TinyTransformer,
     prompt_tokens: torch.LongTensor,
     example_id: int,
     device: torch.device,
-    max_new_tokens: int,
+    cached_positions: Optional[torch.LongTensor] = None,
 ) -> torch.LongTensor:
     model.eval()
     prompt = prompt_tokens.unsqueeze(0)
     prompt_attention = torch.ones_like(prompt, dtype=torch.bool)
-    prompt_positions = compute_positions_3d(prompt, prompt_attention)
+    if cached_positions is not None:
+        prompt_positions = cached_positions.unsqueeze(0)
+        x, y, z = _derive_state_from_prompt_positions(
+            prompt_tokens, cached_positions
+        )
+    else:
+        prompt_positions = compute_positions_3d(prompt, prompt_attention)
+        x, y, z = 0, 0, 1
+        prompt_list = prompt_tokens.tolist()
+        for idx, tok in enumerate(prompt_list):
+            _, (x, y, z) = _update_position_state(
+                x, y, z, int(tok), is_first=(idx == 0)
+            )
 
+    generated_tokens = prompt_tokens.tolist()
+    seq_len = len(generated_tokens)
     generated = prompt.to(device)
     example_ids_tensor = torch.tensor([example_id], dtype=torch.long, device=device)
     prompt_positions = prompt_positions.to(device)
-
-    # Initialize 3D position state after consuming the prompt.
-    x, y, z = 0, 0, 1
-    prompt_list = prompt_tokens.tolist()
-    for idx, tok in enumerate(prompt_list):
-        _, (x, y, z) = _update_position_state(x, y, z, int(tok), is_first=(idx == 0))
 
     # First pass: run the full prompt to build KV cache and get initial logits.
     outputs = model.forward_generate(
@@ -342,14 +368,15 @@ def greedy_generate(
     logits = outputs["logits"]
     past_key_values = outputs["past_key_values"]
 
-    for _ in range(max_new_tokens):
+    for _ in range(MAX_NEW_TOKENS):
         next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
         token_id = int(next_token.item())
-        generated = torch.cat([generated, next_token], dim=1)
+        generated_tokens.append(token_id)
+        seq_len += 1
 
         if token_id == END_TOKEN_ID:
             break
-        if generated.size(1) >= model.config.max_seq_len:
+        if seq_len >= model.config.max_seq_len:
             print("Reached model max_seq_len during generation; stopping.")
             break
 
@@ -365,7 +392,7 @@ def greedy_generate(
         logits = outputs["logits"]
         past_key_values = outputs["past_key_values"]
 
-    return generated.squeeze(0).cpu()
+    return torch.tensor(generated_tokens, dtype=torch.long)
 
 
 def run_inference(
@@ -374,7 +401,6 @@ def run_inference(
     task_id: str,
     pair_index: int,
     device: torch.device,
-    max_new_tokens: int,
     log_prompt: bool = False,
     plot_grids_flag: bool = False,
 ) -> None:
@@ -397,9 +423,9 @@ def run_inference(
     generated = greedy_generate(
         model=model,
         prompt_tokens=candidate.tokens,
+        cached_positions=candidate.cached_positions,
         example_id=candidate.example_id,
         device=device,
-        max_new_tokens=max_new_tokens,
     )
     full_sequence = generated.tolist()
     output_tokens = extract_output_tokens(full_sequence)
@@ -439,7 +465,6 @@ def evaluate_dataset(
     dataset: ARCExampleDataset,
     data_path: Path,
     device: torch.device,
-    max_new_tokens: int,
     log_eval_strings: bool = False,
     log_eval_limit: int = 0,
 ) -> None:
@@ -486,9 +511,9 @@ def evaluate_dataset(
         generated = greedy_generate(
             model=model,
             prompt_tokens=example.tokens,
+            cached_positions=example.cached_positions,
             example_id=example.example_id,
             device=device,
-            max_new_tokens=max_new_tokens,
         )
         full_sequence = generated.tolist()
         output_tokens = extract_output_tokens(full_sequence)
@@ -689,12 +714,6 @@ def train_model(
                     state[k] = v.to(device)
         print("Restored optimizer state from checkpoint.")
 
-    if args.max_steps and step >= args.max_steps:
-        print(
-            f"Global step {step} >= max_steps ({args.max_steps}); skipping training loop."
-        )
-        return
-
     # model = torch.compile(model)
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
@@ -704,13 +723,10 @@ def train_model(
             optimizer=optimizer,
             device=device,
             grad_clip=args.grad_clip,
-            max_steps=args.max_steps,
             start_step=step,
             log_train_strings=args.log_train_strings,
             log_train_limit=args.log_train_limit,
         )
-        if args.max_steps and step >= args.max_steps:
-            break
     rng_state = _capture_rng_state(device)
     maybe_save_model(
         model,
@@ -736,7 +752,6 @@ def evaluate_model(
         dataset=dataset,
         data_path=data_path,
         device=device,
-        max_new_tokens=args.max_new_tokens,
         log_eval_strings=args.log_eval_strings,
         log_eval_limit=args.log_eval_limit,
     )
@@ -774,7 +789,6 @@ def run(args: argparse.Namespace) -> None:
                 task_id=args.inference_task_id,
                 pair_index=args.inference_pair_index,
                 device=device,
-                max_new_tokens=args.max_new_tokens,
                 log_prompt=args.log_inference_prompt,
                 plot_grids_flag=args.plot_inference_grids,
             )
@@ -784,7 +798,6 @@ def run(args: argparse.Namespace) -> None:
                 dataset=dataset,
                 data_path=data_path,
                 device=device,
-                max_new_tokens=args.max_new_tokens,
                 log_eval_strings=args.log_eval_strings,
                 log_eval_limit=args.log_eval_limit,
             )
