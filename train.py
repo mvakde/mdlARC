@@ -3,25 +3,14 @@ from dataclasses import asdict
 import random
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-import time
 
 import torch
 from torch import nn
 from torch.optim import AdamW
 import numpy as np
 
-from inference import greedy_generate, run_batched_inference
 from tinytransformer import TinyTransformer, TinyTransformerConfig
-from utils import (
-    ARCExampleDataset,
-    END_TOKEN_ID,
-    MAX_SEQ_LEN,
-    create_dataloader,
-    tokens_to_string,
-    tokens_to_grid,
-    split_grids_from_tokens,
-    plot_grids,
-)
+from utils import ARCExampleDataset, MAX_SEQ_LEN, create_dataloader, tokens_to_string
 
 # Prefer TF32 on capable CUDA hardware using the new fp32_precision API.
 if torch.cuda.is_available():
@@ -29,66 +18,6 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
 
 DEFAULT_DATA_PATH = Path("assets/ARC-2/grouped-tasks/training/challenges.json")
-MAX_NEW_TOKENS = 931
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Train and run inference with TinyTransformer."
-    )
-    parser.add_argument(
-        "--data-path", type=Path, default=None, help="Path to the challenges.json file."
-    )
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument(
-        "--device", type=str, default="mps", help="cpu | cuda | mps (Apple Silicon)"
-    )
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--save-path",
-        type=Path,
-        default=None,
-        help="Optional path to save the trained model.",
-    )
-    parser.add_argument(
-        "--checkpoint-path",
-        type=Path,
-        default=None,
-        help="Load weights before training/eval.",
-    )
-    parser.add_argument(
-        "--eval-only", action="store_true", help="Skip training and only run inference."
-    )
-    parser.add_argument("--inference-task-id", type=str, default=None)
-    parser.add_argument("--inference-pair-index", type=int, default=0)
-    # Visibility / logging options
-    parser.add_argument(
-        "--log-train-strings",
-        action="store_true",
-        help="Print example training sequences (decoded token strings).",
-    )
-    parser.add_argument(
-        "--log-train-limit",
-        type=int,
-        default=3,
-        help="Max number of training examples to log per run.",
-    )
-    parser.add_argument(
-        "--log-inference-prompt",
-        action="store_true",
-        help="Print the exact prompt sequence used for inference.",
-    )
-    parser.add_argument(
-        "--plot-inference-grids",
-        action="store_true",
-        help="During single-example inference, plot input/output grids.",
-    )
-    return parser.parse_args()
 
 
 def set_seed(seed: int) -> None:
@@ -258,67 +187,6 @@ def _build_weight_decay_param_groups(model: nn.Module, weight_decay: float) -> A
     if no_decay_params:
         param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
     return param_groups
-
-
-def run_inference(
-    model: TinyTransformer,
-    dataset: ARCExampleDataset,
-    task_id: str,
-    pair_index: int,
-    device: torch.device,
-    log_prompt: bool = False,
-    plot_grids_flag: bool = False,
-) -> None:
-    start_time = time.perf_counter()
-    results = run_batched_inference(
-        model=model,
-        dataset=dataset,
-        task_ids=[task_id],
-        device=device,
-        pair_index=pair_index,
-        max_new_tokens=MAX_NEW_TOKENS,
-        log_prompts=log_prompt,
-    )
-    if not results:
-        print("No inference results were produced.")
-        return
-
-    result = results[0]
-    full_sequence = result["sequence"]
-    output_tokens = result["output_tokens"]
-    predicted_grid = result["output_grid"]
-    elapsed = time.perf_counter() - start_time
-
-    print(f"\nInference results for task {task_id} pair {pair_index}")
-    print(
-        f"Generation time: {elapsed:.3f}s for "
-        f"{len(full_sequence) - len(result.get('prompt_tokens', []))} new tokens "
-        f"(total length {len(full_sequence)})"
-    )
-    print("Generated raw (string):", tokens_to_string(full_sequence))
-    print("Generated (string):", tokens_to_string(output_tokens))
-    if predicted_grid:
-        print("Decoded grid:")
-        for row in predicted_grid:
-            print(row)
-    else:
-        print("Decoded grid: <empty>")
-
-    if plot_grids_flag:
-        try:
-            prompt_tokens = result.get("prompt_tokens", [])
-            prompt_grids = split_grids_from_tokens(prompt_tokens)
-            gen_grids = split_grids_from_tokens(
-                [*prompt_tokens, *output_tokens, END_TOKEN_ID]
-            )
-            input_grid = prompt_grids[0] if prompt_grids else []
-            output_grid = (
-                gen_grids[1] if len(gen_grids) > 1 else tokens_to_grid(output_tokens)
-            )
-            to_plot = [input_grid, output_grid]
-            plot_grids(to_plot, title=f"task {task_id} pair {pair_index}")
-        except Exception as e:
-            print(f"Plotting failed: {e}")
 
 
 def maybe_save_model(
@@ -512,49 +380,13 @@ def train_model(
     )
 
 
-def run(args: argparse.Namespace) -> None:
-    checkpoint = load_checkpoint(args.checkpoint_path)
-    model, dataset, dataloader, device, data_path = build_model_and_data(
-        args, checkpoint=checkpoint
-    )
-
-    if not args.eval_only:
-        # MODE 1: Training
-        train_model(
-            args=args,
-            model=model,
-            dataloader=dataloader,
-            dataset=dataset,
-            device=device,
-            data_path=data_path,
-            checkpoint=checkpoint,
-        )
-        # Note: evaluate_model() call is removed here
-    else:
-        # MODE 2: Inference
-        # We enforce that a task ID must be present, because we deleted
-        # the "fallback" that used to evaluate the whole dataset.
-        if args.inference_task_id:
-            run_inference(
-                model=model,
-                dataset=dataset,
-                task_id=args.inference_task_id,
-                pair_index=args.inference_pair_index,
-                device=device,
-                log_prompt=args.log_inference_prompt,
-                plot_grids_flag=args.plot_inference_grids,
-            )
-        else:
-            raise ValueError(
-                "In eval_only mode, you must provide --inference-task-id "
-                "to run single-example inference."
-            )
-
-
-def main() -> None:
-    args = parse_args()
-    run(args)
-
-
 if __name__ == "__main__":
+    import sys
+
+    # Alias this module when executed as a script so cli.py can import it without
+    # triggering a second load under the "train" name.
+    sys.modules.setdefault("train", sys.modules[__name__])
+
+    from cli import main
+
     main()

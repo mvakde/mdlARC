@@ -69,8 +69,19 @@ class MultiHeadSelfAttention(nn.Module):
             key_mask = ~attention_mask[:, None, None, :]
             attn_scores = attn_scores.masked_fill(key_mask, float("-inf"))
 
+        # Also mask out queries that correspond to padding so we don't
+        # softmax rows that are entirely -inf (which would produce NaNs
+        # for left-padded batches).
+        query_mask = (
+            attention_mask[:, None, :, None] if attention_mask is not None else None
+        )
+        if query_mask is not None:
+            attn_scores = attn_scores.masked_fill(~query_mask, 0.0)
+
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
+        if query_mask is not None:
+            attn_weights = attn_weights * query_mask
         attn_output = torch.matmul(attn_weights, values)
         attn_output = (
             attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, dim)
@@ -129,8 +140,13 @@ class MultiHeadSelfAttention(nn.Module):
             if attention_mask is not None:
                 key_mask = ~attention_mask[:, None, None, :]
                 attn_scores = attn_scores.masked_fill(key_mask, float("-inf"))
+            query_mask = attention_mask[:, None, -seq_len:, None] if attention_mask is not None else None
+            if query_mask is not None:
+                attn_scores = attn_scores.masked_fill(~query_mask, 0.0)
             attn_weights = F.softmax(attn_scores, dim=-1)
             attn_weights = self.dropout(attn_weights)
+            if query_mask is not None:
+                attn_weights = attn_weights * query_mask
             attn_output = torch.matmul(attn_weights, values)
             attn_output = (
                 attn_output.transpose(1, 2)
@@ -152,9 +168,14 @@ class MultiHeadSelfAttention(nn.Module):
         if attention_mask is not None:
             key_mask = ~attention_mask[:, None, None, :]
             attn_scores = attn_scores.masked_fill(key_mask, float("-inf"))
+        query_mask = attention_mask[:, None, :, None] if attention_mask is not None else None
+        if query_mask is not None:
+            attn_scores = attn_scores.masked_fill(~query_mask, 0.0)
 
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
+        if query_mask is not None:
+            attn_weights = attn_weights * query_mask
         attn_output = torch.matmul(attn_weights, values)
         attn_output = (
             attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, dim)

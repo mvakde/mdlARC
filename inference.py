@@ -11,6 +11,8 @@ from utils import (
     START_TOKEN_ID,
     compute_positions_3d,
     extract_output_tokens,
+    plot_grids,
+    split_grids_from_tokens,
     tokens_to_grid,
     tokens_to_string,
 )
@@ -325,6 +327,68 @@ def run_batched_inference(
             }
         )
     return results
+
+
+def run_inference(
+    model: TinyTransformer,
+    dataset,
+    task_id: str,
+    pair_index: int,
+    device: torch.device,
+    log_prompt: bool = False,
+    plot_grids_flag: bool = False,
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+) -> None:
+    start_time = time.perf_counter()
+    results = run_batched_inference(
+        model=model,
+        dataset=dataset,
+        task_ids=[task_id],
+        device=device,
+        pair_index=pair_index,
+        max_new_tokens=max_new_tokens,
+        log_prompts=log_prompt,
+    )
+    if not results:
+        print("No inference results were produced.")
+        return
+
+    result = results[0]
+    full_sequence = result["sequence"]
+    output_tokens = result["output_tokens"]
+    predicted_grid = result["output_grid"]
+    elapsed = time.perf_counter() - start_time
+
+    print(f"\nInference results for task {task_id} pair {pair_index}")
+    print(
+        f"Generation time: {elapsed:.3f}s for "
+        f"{len(full_sequence) - len(result.get('prompt_tokens', []))} new tokens "
+        f"(total length {len(full_sequence)})"
+    )
+    print("Generated raw (string):", tokens_to_string(full_sequence))
+    print("Generated (string):", tokens_to_string(output_tokens))
+    if predicted_grid:
+        print("Decoded grid:")
+        for row in predicted_grid:
+            print(row)
+    else:
+        print("Decoded grid: <empty>")
+
+    if plot_grids_flag:
+        try:
+            prompt_tokens = result.get("prompt_tokens", [])
+            prompt_grids = split_grids_from_tokens(prompt_tokens)
+            gen_grids = split_grids_from_tokens(
+                [*prompt_tokens, *output_tokens, END_TOKEN_ID]
+            )
+            input_grid = prompt_grids[0] if prompt_grids else []
+            output_grid = (
+                gen_grids[1] if len(gen_grids) > 1 else tokens_to_grid(output_tokens)
+            )
+            to_plot = [input_grid, output_grid]
+            plot_grids(to_plot, title=f"task {task_id} pair {pair_index}")
+        except Exception as e:
+            print(f"Plotting failed: {e}")
 
 
 @torch.no_grad()
