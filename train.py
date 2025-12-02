@@ -252,7 +252,9 @@ def infer_num_examples_from_checkpoint(
 
 
 def build_model_and_data(
-    args: argparse.Namespace, checkpoint: Optional[Dict[str, Any]] = None
+    args: argparse.Namespace,
+    checkpoint: Optional[Dict[str, Any]] = None,
+    reuse_dataset: Optional[ARCExampleDataset] = None,  # <--- NEW ARGUMENT
 ) -> Tuple[
     TinyTransformer, ARCExampleDataset, torch.utils.data.DataLoader, torch.device, Path
 ]:
@@ -284,17 +286,25 @@ def build_model_and_data(
     if checkpoint and "task_ids" in checkpoint:
         task_whitelist = checkpoint["task_ids"]
 
-    dataset = ARCExampleDataset(
-        json_path=data_path,
-        splits=("train", "test"),
-        include_outputs=True,
-        max_seq_len=MAX_SEQ_LEN,
-        task_whitelist=task_whitelist,
-    )
+    # --- START OF CHANGED BLOCK ---
+    if reuse_dataset is not None:
+        print("Reusing existing dataset from RAM (skipping 3D pre-computation).")
+        dataset = reuse_dataset
+    else:
+        dataset = ARCExampleDataset(
+            json_path=data_path,
+            splits=("train", "test"),
+            include_outputs=True,
+            max_seq_len=MAX_SEQ_LEN,
+            task_whitelist=task_whitelist,
+        )
+    # --- END OF CHANGED BLOCK ---
+
+    # We always recreate the dataloader because batch_size might have changed in args
     dataloader = create_dataloader(
         dataset=dataset,
         batch_size=args.batch_size,
-        shuffle=not getattr(args, "eval_only", True),
+        shuffle=not getattr(args, "eval_only", False),
         num_workers=args.num_workers,
     )
 
@@ -326,7 +336,8 @@ def build_model_and_data(
         state_dict = checkpoint["model_state"]
         model.load_state_dict(state_dict, strict=False)
         _restore_rng_state(checkpoint.get("rng_state"), device)
-    # Stash checkpoint for downstream consumers (e.g., optimizer restore).
+
+    # Stash checkpoint for downstream consumers (e.g., so train_model can restore the optimizer).
     model._loaded_checkpoint = checkpoint
 
     return model, dataset, dataloader, device, data_path
@@ -363,6 +374,8 @@ def train_model(
                 if isinstance(v, torch.Tensor):
                     state[k] = v.to(device)
         print("Restored optimizer state from checkpoint.")
+
+    # print(f"DEBUG CHECK: Optimizer state size = {len(optimizer.state)} (0 = Fresh/Reset, >0 = Restored)")
 
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
