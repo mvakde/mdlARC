@@ -362,7 +362,8 @@ def validate_one_epoch(
 ) -> float:
     """Calculates validation loss (Output Loss) on the test set."""
     model.eval()
-    total_output_loss = 0.0
+    total_loss_sum = 0.0
+    total_tokens = 0
 
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
@@ -384,11 +385,19 @@ def validate_one_epoch(
 
         # 'output_loss' is the specific loss on tokens AFTER the separator
         out_loss = outputs.get("output_loss")
+        num_tokens = outputs.get("num_output_tokens")
 
-        if out_loss is not None:
-            total_output_loss += out_loss.item()
+        if out_loss is not None and num_tokens is not None:
+            n = num_tokens.item()
+            if n > 0:
+                # Reconstruct sum: batch_avg * batch_count
+                total_loss_sum += out_loss.item() * n
+                total_tokens += n
 
-    return total_output_loss
+    if total_tokens == 0:
+        return 0.0
+
+    return total_loss_sum / total_tokens
 
 
 def train_model(

@@ -384,10 +384,12 @@ class TinyTransformer(nn.Module):
             valid_input = valid_mask & is_input_phase
             valid_output = valid_mask & is_output_phase
 
+            num_output_tokens = valid_output.sum()
+
             input_loss = (raw_losses * valid_input).sum() / valid_input.sum().clamp(
                 min=1
             )
-            output_loss = (raw_losses * valid_output).sum() / valid_output.sum().clamp(
+            output_loss = (raw_losses * valid_output).sum() / num_output_tokens.clamp(
                 min=1
             )
 
@@ -396,6 +398,7 @@ class TinyTransformer(nn.Module):
             "loss": loss,
             "input_loss": input_loss,
             "output_loss": output_loss,
+            "num_output_tokens": num_output_tokens if targets is not None else None,
         }
 
     def forward_generate(
