@@ -6,6 +6,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 import numpy as np
+from numba import njit
 
 try:
     import matplotlib.pyplot as plt
@@ -119,10 +120,70 @@ def tokens_to_string(tokens: Sequence[int]) -> str:
     return " ".join(parts)
 
 
+@njit
+def _fill_3d_positions_numba(ids, mask, out, start_id, sep_id, end_id, nl_id):
+    B, S = ids.shape
+    for b in range(B):
+        x = 0
+        y = 0
+        z = 1
+        for t in range(S):
+            if not mask[b, t]:
+                continue
+
+            val = ids[b, t]
+
+            if val == start_id:
+                out[b, t, 0] = 0
+                out[b, t, 1] = 0
+                out[b, t, 2] = 0
+                x = 0
+                y = 0
+                z = 1
+                continue
+
+            if val == sep_id:
+                out[b, t, 0] = 0
+                out[b, t, 1] = 0
+                out[b, t, 2] = 2
+                x = 0
+                y = 0
+                z = 3
+                continue
+
+            if val == end_id:
+                out[b, t, 0] = 0
+                out[b, t, 1] = 0
+                out[b, t, 2] = 4
+                continue
+
+            px = x
+            if px < 0:
+                px = 0
+            if px > 30:
+                px = 30
+
+            py = y
+            if py < 0:
+                py = 0
+            if py > 29:
+                py = 29
+
+            out[b, t, 0] = px
+            out[b, t, 1] = py
+            out[b, t, 2] = z
+
+            if val == nl_id:
+                x = 0
+                y += 1
+            else:
+                x += 1
+
+
 def compute_positions_3d(
     input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    """Compute per-token 3D grid coordinates on CPU.
+    """Compute per-token 3D grid coordinates on CPU. (using numba)
 
     Expects 2D input tensors shaped [batch, seq_len]; padding should be
     indicated via `attention_mask`.
@@ -130,60 +191,32 @@ def compute_positions_3d(
     if input_ids.dim() != 2:
         raise ValueError("input_ids must have shape [batch, seq_len].")
 
-    if attention_mask is None:
-        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-    else:
-        attention_mask = attention_mask.to(dtype=torch.bool, device=input_ids.device)
-
+    # Convert inputs to numpy for Numba
     ids_cpu = input_ids.detach().cpu()
-    mask_cpu = attention_mask.detach().cpu()
-    B, S = ids_cpu.shape
-    pos = torch.zeros((B, S, 3), dtype=torch.long)
+    ids_np = ids_cpu.numpy()
 
-    for b in range(B):
-        x = 0
-        y = 0
-        z = 1
-        for t in range(S):
-            if not mask_cpu[b, t]:
-                continue
-            tok = int(ids_cpu[b, t].item())
-            if tok == START_TOKEN_ID:
-                pos[b, t, 0] = 0
-                pos[b, t, 1] = 0
-                pos[b, t, 2] = 0
-                x = 0
-                y = 0
-                z = 1
-                continue
+    if attention_mask is None:
+        mask_np = np.ones_like(ids_np, dtype=bool)
+    else:
+        mask_np = attention_mask.detach().cpu().numpy().astype(bool)
 
-            if tok == IO_SEPARATOR_TOKEN_ID:
-                pos[b, t, 0] = 0
-                pos[b, t, 1] = 0
-                pos[b, t, 2] = 2
-                x, y = 0, 0
-                z = 3
-                continue
+    B, S = ids_np.shape
+    # Pre-allocate output array
+    pos_np = np.zeros((B, S, 3), dtype=np.int64)
 
-            if tok == END_TOKEN_ID:
-                pos[b, t, 0] = 0
-                pos[b, t, 1] = 0
-                pos[b, t, 2] = 4
-                continue
+    # Call the JIT-compiled helper
+    _fill_3d_positions_numba(
+        ids_np,
+        mask_np,
+        pos_np,
+        START_TOKEN_ID,
+        IO_SEPARATOR_TOKEN_ID,
+        END_TOKEN_ID,
+        NEXT_LINE_TOKEN_ID,
+    )
 
-            px = min(max(x, 0), 30)
-            py = min(max(y, 0), 29)
-            pos[b, t, 0] = px
-            pos[b, t, 1] = py
-            pos[b, t, 2] = z
-
-            if tok == NEXT_LINE_TOKEN_ID:
-                x = 0
-                y += 1
-            else:
-                x += 1
-
-    return pos
+    # Convert back to torch tensor and move to original device
+    return torch.from_numpy(pos_np).to(device=input_ids.device)
 
 
 def split_grids_from_tokens(tokens: Sequence[int]) -> List[List[List[int]]]:
