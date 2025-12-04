@@ -363,7 +363,6 @@ def validate_one_epoch(
     """Calculates validation loss (Output Loss) on the test set."""
     model.eval()
     total_output_loss = 0.0
-    num_batches = 0
 
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
@@ -388,9 +387,8 @@ def validate_one_epoch(
 
         if out_loss is not None:
             total_output_loss += out_loss.item()
-            num_batches += 1
 
-    return total_output_loss / max(1, num_batches)
+    return total_output_loss
 
 
 def train_model(
@@ -405,6 +403,9 @@ def train_model(
     """Run the training loop only (no evaluation)."""
     if checkpoint is None:
         checkpoint = getattr(model, "_loaded_checkpoint", None)
+
+    val_batch_size = getattr(args, "val_batch_size", args.batch_size)
+    print(f"Building validation dataloader (batch_size={val_batch_size})...")
 
     # Create a separate Validation Dataset/Loader that accesses solutions.json
     # We only include the 'test' split here to calculate validation loss.
@@ -421,7 +422,7 @@ def train_model(
 
     val_dataloader = create_dataloader(
         dataset=val_dataset,
-        batch_size=args.batch_size,
+        batch_size=val_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
     )
