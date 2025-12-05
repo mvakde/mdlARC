@@ -123,7 +123,8 @@ class MultiHeadSelfAttention(nn.Module):
             queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
 
         if attention_mask is not None:
-            attention_mask = attention_mask.to(device=queries.device, dtype=torch.bool)
+            if attention_mask.device != queries.device or attention_mask.dtype != torch.bool:
+                attention_mask = attention_mask.to(device=queries.device, dtype=torch.bool)
 
         # Incremental decoding branch: concatenate cached K/V and attend
         # from the new tokens only. No causal mask is needed because there
@@ -326,7 +327,8 @@ class TinyTransformer(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=device)
         else:
-            attention_mask = attention_mask.to(device=device, dtype=torch.bool)
+            if attention_mask.device != device or attention_mask.dtype != torch.bool:
+                attention_mask = attention_mask.to(device=device, dtype=torch.bool)
 
         if positions_3d is not None and positions_3d.shape[:2] != input_ids.shape:
             raise ValueError("positions_3d must match [batch, seq_len] of input_ids.")
@@ -423,6 +425,7 @@ class TinyTransformer(nn.Module):
         positions_3d: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         cache_position: Optional[int] = None,
+        example_embeds: Optional[torch.Tensor] = None,
     ) -> dict:
         """Forward used for autoregressive generation with a KV cache.
 
@@ -445,10 +448,16 @@ class TinyTransformer(nn.Module):
 
         device = input_ids.device
         if attention_mask is not None:
-            attention_mask = attention_mask.to(device=device, dtype=torch.bool)
+            if attention_mask.device != device or attention_mask.dtype != torch.bool:
+                attention_mask = attention_mask.to(device=device, dtype=torch.bool)
+
+        if example_embeds is not None:
+            if example_embeds.shape[0] != input_ids.size(0):
+                raise ValueError("example_embeds must have batch dimension matching input_ids.")
+        else:
+            example_embeds = self.example_embedding(example_ids)
 
         token_embeds = self.token_embedding(input_ids)
-        example_embeds = self.example_embedding(example_ids)
 
         # During generation, also broadcast the example embedding across
         # all tokens in the (prompt or incremental) sequence.

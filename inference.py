@@ -148,7 +148,7 @@ def _derive_initial_state_from_prompt(
     return initial_state, finished
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def batched_greedy_generate(
     model: TinyTransformer,
     prompts: Sequence[Sequence[int]],
@@ -192,29 +192,34 @@ def batched_greedy_generate(
             device=device, dtype=torch.long
         )
 
+    example_embeds = model.example_embedding(example_ids_tensor)
     initial_state, finished = _derive_initial_state_from_prompt(
         input_ids, prompt_positions, attention_mask
     )
     grid_state = BatchGridState(initial_state)
+    current_len = input_ids.size(1)
+    max_len = model.config.max_seq_len
 
     # 1. Initial Prompt Pass
-    running_attention_mask = attention_mask.clone()
+    running_attention_mask = torch.zeros(
+        (batch_size, max_len), dtype=torch.bool, device=device
+    )
+    running_attention_mask[:, :current_len] = attention_mask
+    prompt_attention_mask = running_attention_mask[:, :current_len]
     outputs = model.forward_generate(
         input_ids=input_ids,
         example_ids=example_ids_tensor,
         past_key_values=None,
         positions_3d=prompt_positions,
-        attention_mask=running_attention_mask,
+        attention_mask=prompt_attention_mask,
+        example_embeds=example_embeds,
     )
     logits = outputs["logits"]
     prompt_past_key_values = outputs["past_key_values"]
 
     # 2. Pre-allocate KV Cache
     # We create a buffer of (Batch, Heads, MaxSeqLen, Dim) and copy the prompt KV into it.
-    max_len = model.config.max_seq_len
     past_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
-
-    current_len = input_ids.size(1)
 
     for k, v in prompt_past_key_values:
         # k, v are [Batch, Heads, PromptLen, Dim]
@@ -257,16 +262,17 @@ def batched_greedy_generate(
 
         finished = finished | (next_token == END_TOKEN_ID)
 
-        step_mask = should_append.unsqueeze(1)
-        running_attention_mask = torch.cat([running_attention_mask, step_mask], dim=1)
+        running_attention_mask[:, cache_position] = should_append
+        attn_mask_view = running_attention_mask[:, : cache_position + 1]
 
         outputs = model.forward_generate(
             input_ids=next_token.unsqueeze(1),
             example_ids=example_ids_tensor,
             past_key_values=past_key_values,
             positions_3d=token_positions,
-            attention_mask=running_attention_mask,
+            attention_mask=attn_mask_view,
             cache_position=cache_position,
+            example_embeds=example_embeds,
         )
         logits = outputs["logits"]
         # past_key_values = outputs["past_key_values"]
@@ -546,7 +552,7 @@ def _gather_examples_for_split(
     return examples
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def run_split_inference(
     model: TinyTransformer,
     dataset,
@@ -571,9 +577,14 @@ def run_split_inference(
     if not examples:
         return []
 
-    results: List[Dict[str, object]] = []
-    for start in range(0, len(examples), batch_size):
-        batch_examples = examples[start : start + batch_size]
+    # Sort by sequence length to keep padding overhead low, then restore order.
+    indexed_examples = list(enumerate(examples))
+    indexed_examples.sort(key=lambda pair: pair[1].seq_len, reverse=True)
+    results_buffer: List[Optional[Dict[str, object]]] = [None] * len(examples)
+
+    for start in range(0, len(indexed_examples), batch_size):
+        chunk = indexed_examples[start : start + batch_size]
+        batch_indices, batch_examples = zip(*chunk)
         (prompts, example_ids, metadata, cached_positions, target_output_tokens) = (
             _prepare_examples_for_inference(
                 batch_examples, include_targets=include_targets, solutions=solutions
@@ -599,8 +610,10 @@ def run_split_inference(
             max_new_tokens=max_new_tokens,
             target_output_tokens=target_output_tokens if include_targets else None,
         )
-        results.extend(batch_results)
-    return results
+        for idx, res in zip(batch_indices, batch_results):
+            results_buffer[idx] = res
+
+    return [res for res in results_buffer if res is not None]
 
 
 def _has_correct_shape(
@@ -764,7 +777,7 @@ def run_inference(
             print(f"Plotting failed: {e}")
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def greedy_generate(
     model: TinyTransformer,
     prompt_tokens: torch.LongTensor,
