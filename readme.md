@@ -21,4 +21,6 @@ Total compute cost - **$0.709**
 
 This is early performance. Haven't run all ablations yet
 
-I should be able to push to 30% on ARC-1 and 8% on ARC-2 
+I should be able to push to 30% on ARC-1 and 8% on ARC-2  
+
+For the reasoining behind the approach, read **[My Blog](https://mvakde.github.io/blog/why-all-ARC-solvers-fail-today/)**
