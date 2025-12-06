@@ -42,19 +42,33 @@ IGNORE_INDEX = -100
 def generate_color_permutations(
     max_permutations: int, seed: int
 ) -> List[Tuple[int, ...]]:
-    """Return up to `max_permutations` unique shuffles of colors 1-9."""
+    """Return up to `max_permutations` unique shuffles of colors 1-9.
+
+    Identity permutation is always included first (index 0 / permutation 1).
+    """
     if max_permutations <= 0:
         return []
     rng = random.Random(seed)
     digits = list(range(1, 10))
-    permutations: List[Tuple[int, ...]] = []
-    seen = set()
+    identity = tuple(digits)
+    permutations: List[Tuple[int, ...]] = [identity]
+    seen = {identity}
     limit = math.factorial(9)
     target = min(max_permutations, limit)
-    if target == limit:
-        permutations = list(itertools.permutations(digits))
-        rng.shuffle(permutations)
+    if target == 1:
         return permutations
+
+    if target == limit:
+        # Generate all, shuffle, then force identity to stay first.
+        all_perms = list(itertools.permutations(digits))
+        rng.shuffle(all_perms)
+        deduped = [identity]
+        for perm in all_perms:
+            if perm == identity:
+                continue
+            deduped.append(perm)
+        return deduped[:target]
+
     while len(permutations) < target:
         perm = tuple(rng.sample(digits, len(digits)))
         if perm in seen:
