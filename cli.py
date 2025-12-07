@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
-
-from inference import run_inference
+from inference import run_split_inference
+from utils import tokens_to_string, split_grids_from_tokens, plot_grids
 from train import build_model_and_data, load_checkpoint, train_model
 
 
@@ -109,15 +109,57 @@ def run(args: argparse.Namespace) -> None:
         )
     else:
         if args.inference_task_id:
-            run_inference(
+            # 1. CALCULATE: Use the generic batch runner
+            results = run_split_inference(
                 model=model,
                 dataset=dataset,
-                task_id=args.inference_task_id,
-                pair_index=args.inference_pair_index,
+                split="test",
                 device=device,
-                log_prompt=args.log_inference_prompt,
-                plot_grids_flag=args.plot_inference_grids,
+                task_ids=[args.inference_task_id],
+                pair_index=args.inference_pair_index,
+                log_prompts=args.log_inference_prompt,
+                include_targets=True,  # Optional: enables checking against ground truth
             )
+
+            # 2. PRESENT: Handle printing and plotting here in the CLI
+            if not results:
+                print("No results found.")
+                return
+
+            result = results[0]  # We only asked for one task/pair
+            full_sequence = result["sequence"]
+            output_tokens = result["output_tokens"]
+            predicted_grid = result["output_grid"]
+
+            print(
+                f"\nInference results for task {args.inference_task_id} pair {args.inference_pair_index}"
+            )
+            print("Generated (string):", tokens_to_string(output_tokens))
+
+            if predicted_grid:
+                print("Decoded grid:")
+                for row in predicted_grid:
+                    print(row)
+            else:
+                print("Decoded grid: <empty>")
+
+            # 3. PLOT: Optional visualization
+            if args.plot_inference_grids:
+                try:
+                    prompt_tokens = result.get("prompt_tokens", [])
+                    # Reconstruct grid lists for plotting
+                    prompt_grids = split_grids_from_tokens(prompt_tokens)
+                    input_grid = prompt_grids[0] if prompt_grids else []
+
+                    # Prepare list of grids to plot: [Input, Predicted]
+                    to_plot = [input_grid, predicted_grid]
+
+                    plot_grids(
+                        to_plot,
+                        title=f"Task {args.inference_task_id} Pair {args.inference_pair_index}",
+                    )
+                except Exception as e:
+                    print(f"Plotting failed: {e}")
         else:
             raise ValueError(
                 "In eval_only mode, you must provide --inference-task-id "

@@ -1,5 +1,4 @@
 import json
-import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import torch
@@ -15,8 +14,6 @@ from utils import (
     compute_positions_3d,
     extract_output_tokens,
     grid_to_tokens,
-    plot_grids,
-    split_grids_from_tokens,
     tokens_to_grid,
     tokens_to_string,
 )
@@ -427,100 +424,6 @@ def _run_generation_batch(
     )
 
 
-def _select_inference_examples(
-    dataset,
-    task_ids: Sequence[str],
-    split: str = "test",
-    pair_index: Optional[int] = 0,
-    require_outputs: bool = False,
-    solutions: Optional[Dict[Tuple[str, int], List[List[int]]]] = None,
-) -> Tuple[
-    List[List[int]],
-    List[int],
-    List[Dict[str, object]],
-    List[Optional[torch.Tensor]],
-    List[List[int]],
-]:
-    selected = []
-    for task_id in task_ids:
-        candidate = None
-        for example in dataset.iter_examples(split=split):
-            if example.task_id != task_id:
-                continue
-            if pair_index is not None and example.pair_index != pair_index:
-                continue
-            has_solution = solutions is not None and (
-                (example.task_id, example.pair_index) in solutions
-            )
-            if require_outputs and not example.has_output and not has_solution:
-                continue
-            candidate = example
-            break
-        if candidate is None:
-            raise ValueError(
-                f"No {split} example found for task_id={task_id} pair_index={pair_index}."
-            )
-        selected.append(candidate)
-
-    prompts, example_ids, metadata, cached_positions, targets = (
-        _prepare_examples_for_inference(
-            selected, include_targets=require_outputs, solutions=solutions
-        )
-    )
-    return prompts, example_ids, metadata, cached_positions, targets
-
-
-@torch.no_grad()
-def run_batched_inference(
-    model: TinyTransformer,
-    dataset,
-    task_ids: Sequence[str],
-    device: torch.device,
-    split: str = "test",
-    pair_index: int = 0,
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
-    log_prompts: bool = False,
-    include_targets: bool = False,
-) -> List[Dict[str, object]]:
-    solutions = _load_solutions_for_dataset(dataset) if include_targets else None
-    (prompts, example_ids, metadata, cached_positions, target_output_tokens) = (
-        _select_inference_examples(
-            dataset,
-            task_ids,
-            split=split,
-            pair_index=pair_index,
-            require_outputs=include_targets,
-            solutions=solutions,
-        )
-    )
-    if log_prompts:
-        for meta, prompt in zip(metadata, prompts):
-            print(
-                "[prompt]",
-                f"task={meta['task_id']}",
-                f"pair={meta['pair_index']}",
-                "::",
-                tokens_to_string(prompt),
-            )
-
-    sequences = batched_greedy_generate(
-        model=model,
-        prompts=prompts,
-        example_ids=example_ids,
-        device=device,
-        max_new_tokens=max_new_tokens,
-        cached_positions=cached_positions,
-    )
-    return _build_generation_results(
-        sequences=sequences,
-        metadata=metadata,
-        prompts=prompts,
-        target_output_tokens=target_output_tokens
-        if include_targets
-        else [[] for _ in prompts],
-    )
-
-
 def _load_solutions_for_dataset(dataset) -> Dict[Tuple[str, int], List[List[int]]]:
     """Load solutions.json located next to the dataset (used only for evaluation).
 
@@ -611,18 +514,14 @@ def run_split_inference(
         for start in range(0, len(indexed_examples), batch_size):
             chunk = indexed_examples[start : start + batch_size]
             batch_indices, batch_examples = zip(*chunk)
-            (
-                prompts,
-                example_ids,
-                metadata,
-                cached_positions,
-                target_output_tokens,
-            ) = _prepare_examples_for_inference(
-                batch_examples,
-                include_targets=include_targets,
-                solutions=solutions,
-                color_mapping=color_mapping,
-                color_apply_fn=color_apply_fn,
+            (prompts, example_ids, metadata, cached_positions, target_output_tokens) = (
+                _prepare_examples_for_inference(
+                    batch_examples,
+                    include_targets=include_targets,
+                    solutions=solutions,
+                    color_mapping=color_mapping,
+                    color_apply_fn=color_apply_fn,
+                )
             )
             if log_prompts:
                 for meta, prompt in zip(metadata, prompts):
@@ -753,152 +652,3 @@ def evaluate_model_on_dataset(
         summary = summarize_split_results(split_results)
         evaluation[split] = {"results": split_results, "summary": summary}
     return evaluation
-
-
-def run_inference(
-    model: TinyTransformer,
-    dataset,
-    task_id: str,
-    pair_index: int,
-    device: torch.device,
-    split: str = "test",
-    log_prompt: bool = False,
-    plot_grids_flag: bool = False,
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
-) -> None:
-    start_time = time.perf_counter()
-    results = run_batched_inference(
-        model=model,
-        dataset=dataset,
-        task_ids=[task_id],
-        device=device,
-        split=split,
-        pair_index=pair_index,
-        max_new_tokens=max_new_tokens,
-        log_prompts=log_prompt,
-    )
-    if not results:
-        print("No inference results were produced.")
-        return
-
-    result = results[0]
-    full_sequence = result["sequence"]
-    output_tokens = result["output_tokens"]
-    predicted_grid = result["output_grid"]
-    elapsed = time.perf_counter() - start_time
-
-    print(f"\nInference results for task {task_id} pair {pair_index} ({split} split)")
-    print(
-        f"Generation time: {elapsed:.3f}s for "
-        f"{len(full_sequence) - len(result.get('prompt_tokens', []))} new tokens "
-        f"(total length {len(full_sequence)})"
-    )
-    print("Generated raw (string):", tokens_to_string(full_sequence))
-    print("Generated (string):", tokens_to_string(output_tokens))
-    if predicted_grid:
-        print("Decoded grid:")
-        for row in predicted_grid:
-            print(row)
-    else:
-        print("Decoded grid: <empty>")
-
-    if plot_grids_flag:
-        try:
-            prompt_tokens = result.get("prompt_tokens", [])
-            prompt_grids = split_grids_from_tokens(prompt_tokens)
-            gen_grids = split_grids_from_tokens(
-                [*prompt_tokens, *output_tokens, END_TOKEN_ID]
-            )
-            input_grid = prompt_grids[0] if prompt_grids else []
-            output_grid = (
-                gen_grids[1] if len(gen_grids) > 1 else tokens_to_grid(output_tokens)
-            )
-            to_plot = [input_grid, output_grid]
-            plot_grids(to_plot, title=f"task {task_id} pair {pair_index}")
-        except Exception as e:
-            print(f"Plotting failed: {e}")
-
-
-@torch.inference_mode()
-def greedy_generate(
-    model: TinyTransformer,
-    prompt_tokens: torch.LongTensor,
-    example_id: int,
-    device: torch.device,
-    cached_positions: Optional[torch.LongTensor] = None,
-    log_time: bool = False,
-) -> torch.LongTensor:
-    prompts = [prompt_tokens.tolist()]
-    cached = [cached_positions] if cached_positions is not None else None
-    start_time = time.perf_counter() if log_time else None
-
-    sequences = batched_greedy_generate(
-        model=model,
-        prompts=prompts,
-        example_ids=[example_id],
-        device=device,
-        cached_positions=cached,
-    )
-
-    if start_time is not None:
-        elapsed = time.perf_counter() - start_time
-        print(
-            f"Generation time: {elapsed:.3f}s for "
-            f"{len(sequences[0]) - len(prompts[0])} new tokens"
-        )
-
-    return torch.tensor(sequences[0], dtype=torch.long)
-
-
-def group_eval_sequences_by_task(
-    evaluation: Dict[str, Dict[str, object]],
-) -> Dict[str, Dict[str, List[List[int]]]]:
-    """
-    Restructures evaluation results into a format optimized for export:
-    {
-      "split_name": {
-        "task_id": [ <sequence_pair_0>, <sequence_pair_1>, ... ]
-      }
-    }
-    """
-    output = {}
-    for split, split_data in evaluation.items():
-        results = split_data.get("results", [])
-
-        # 1. Group by task_id -> pair_index -> sequence
-        # We use a dict first to handle potential out-of-order processing
-        task_map: Dict[str, Dict[int, List[int]]] = {}
-
-        for res in results:
-            task_id = res.get("task_id")
-            pair_index = res.get("pair_index")
-            sequence = res.get("sequence")
-
-            # Basic validation
-            if task_id is None or pair_index is None or sequence is None:
-                continue
-
-            if task_id not in task_map:
-                task_map[task_id] = {}
-            task_map[task_id][pair_index] = sequence
-
-        # 2. Convert pair-maps to sorted lists
-        output[split] = {}
-        for task_id, pairs_dict in task_map.items():
-            if not pairs_dict:
-                output[split][task_id] = []
-                continue
-
-            # Determine list size based on the highest pair index found
-            max_idx = max(pairs_dict.keys())
-
-            # Pre-fill with empty lists to handle potential non-contiguous indices safely
-            # (Though ARC data is usually contiguous 0..N)
-            seq_list = [[] for _ in range(max_idx + 1)]
-
-            for idx, seq in pairs_dict.items():
-                seq_list[idx] = seq
-
-            output[split][task_id] = seq_list
-
-    return output
