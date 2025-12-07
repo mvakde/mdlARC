@@ -138,30 +138,13 @@ class MultiHeadSelfAttention(nn.Module):
         if past_key_value is not None:
             past_keys, past_values = past_key_value
             if cache_position is not None:
-                # Optimized Path: In-place update
-                # We use .index_copy_ or simple indexing with the tensor position
-                # Note: cache_position should be a tensor of shape (1,) or scalar tensor
-
-                # Update the buffer at the specific position
-                # We must use proper indexing for the specific token slot
-                # keys is [B, H, 1, D] during generation
-                # past_keys.index_put_((torch.arange(batch_size, device=keys.device), slice(None), cache_position), keys.squeeze(2))
-                # past_values.index_put_((torch.arange(batch_size, device=values.device), slice(None), cache_position), values.squeeze(2))
-
-                # Ensure cache_position is 1D for index_copy_
-                if cache_position.dim() == 0:
-                    idx = cache_position.view(1)
-                else:
-                    idx = cache_position
-
-                past_keys.index_copy_(2, idx, keys)
-                past_values.index_copy_(2, idx, values)
-
-                # CRITICAL FIX: Do NOT slice past_keys/values.
-                # Use the FULL buffer [B, H, MaxLen, D].
-                # The attention_mask will hide the garbage data in future slots.
-                keys = past_keys
-                values = past_values
+                # Avoid in-place mutation of graph inputs to keep torch.compile/cudagraphs happy.
+                idx = cache_position.view(-1, 1) + torch.arange(
+                    seq_len, device=cache_position.device
+                ).view(1, -1)
+                idx = idx.view(-1).clamp(max=past_keys.size(2) - 1)
+                keys = torch.index_copy(past_keys, 2, idx, keys)
+                values = torch.index_copy(past_values, 2, idx, values)
             else:
                 # Legacy path (should not be hit in optimized inference)
                 keys = torch.cat([past_keys, keys], dim=2)
@@ -297,7 +280,21 @@ class TransformerBlock(nn.Module):
         hidden_states = hidden_states + ff_output
 
         if attention_mask is not None:
-            token_mask = attention_mask[:, -hidden_states.size(1) :]
+            seq_len = hidden_states.size(1)
+            if cache_position is not None:
+                # Build positions for the currently generated tokens so we mask the right slot
+                positions = cache_position.view(1, -1) + torch.arange(
+                    seq_len, device=cache_position.device
+                ).view(1, -1)
+                positions = positions.clamp(max=attention_mask.size(1) - 1)
+                positions = positions.expand(attention_mask.size(0), -1)
+            else:
+                positions = torch.arange(
+                    attention_mask.size(1) - seq_len, attention_mask.size(1), device=hidden_states.device
+                ).view(1, -1)
+                positions = positions.expand(attention_mask.size(0), -1)
+
+            token_mask = attention_mask.gather(1, positions)
             hidden_states = hidden_states * token_mask.unsqueeze(-1)
         return hidden_states, present_key_value
 

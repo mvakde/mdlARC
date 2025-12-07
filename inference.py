@@ -75,7 +75,9 @@ class BatchGridState:
             END_TOKEN_ID,
             NEXT_LINE_TOKEN_ID,
         )
-        return positions
+        # Clone to break potential cudagraph output reuse between steps
+        self.state = self.state.clone()
+        return positions.clone()
 
 
 @torch.inference_mode()
@@ -170,6 +172,9 @@ def batched_greedy_generate(
         if finished.all():
             break
 
+        # Mark a new cudagraph step to avoid reusing outputs as inputs
+        torch.compiler.cudagraph_mark_step_begin()
+
         # Greedy decode
         next_token = torch.argmax(logits[:, -1, :], dim=-1)
         next_token = torch.where(
@@ -209,6 +214,15 @@ def batched_greedy_generate(
             example_embeds=example_embeds,
         )
         logits = outputs["logits"]
+
+        # Update static KV buffers with only the new position to avoid reusing cudagraph outputs
+        new_kvs = outputs["past_key_values"]
+        pos = int(cache_position.item())
+        pos_slice = slice(pos, pos + 1)
+        for layer_idx, (k_new, v_new) in enumerate(new_kvs):
+            k_buf, v_buf = past_key_values[layer_idx]
+            k_buf[:, :, pos_slice, :] = k_new[:, :, pos_slice, :]
+            v_buf[:, :, pos_slice, :] = v_new[:, :, pos_slice, :]
 
         # Increment position
         cache_position.add_(1)
