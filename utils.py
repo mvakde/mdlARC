@@ -108,15 +108,24 @@ def apply_color_permutation_to_grid(
     ]
 
 
+# In utils.py
+
+
 class ColorAugmentor:
     """Holds a deterministic list of color mappings and exposes epoch-based selection."""
 
     def __init__(
-        self, mappings: Sequence[torch.Tensor], apply_to_test_split: bool = False
+        self,
+        mappings: Sequence[torch.Tensor],
+        apply_to_test_split: bool = False,
+        seed: int = 42,
     ) -> None:
         self.mappings = list(mappings)
         self.apply_to_test_split = apply_to_test_split
-        self._index = 0
+        self.seed = seed
+        self._epoch = 0
+        self._cached_index = 0
+        self._compute_index()  # Initialize for epoch 0
 
     @property
     def num_permutations(self) -> int:
@@ -124,22 +133,51 @@ class ColorAugmentor:
 
     @property
     def current_index(self) -> int:
-        if self.num_permutations == 0:
-            return 0
-        return self._index % self.num_permutations
+        # O(1) lookup during the hot loop - zero overhead
+        return self._cached_index
 
     def set_index(self, index: int) -> None:
         if self.num_permutations == 0:
             return
-        self._index = max(0, int(index))
+        self._epoch = max(0, int(index))
+        # Compute the randomization only once when the epoch changes
+        self._compute_index()
+
+    def _compute_index(self) -> None:
+        N = self.num_permutations
+        if N == 0:
+            self._cached_index = 0
+            return
+
+        cycle = self._epoch // N
+        step = self._epoch % N
+
+        # 1. First step of any cycle is Identity
+        if step == 0 or N <= 1:
+            self._cached_index = 0
+            return
+
+        # 2. Randomize the remaining steps
+        # We seed the generator with the cycle ID so the order is fixed for this chunk of epochs
+        g = torch.Generator()
+        g.manual_seed(self.seed + cycle)
+
+        # Permute indices [1...N-1]
+        perm = torch.randperm(N - 1, generator=g)
+
+        # Map step 1 -> perm[0], step 2 -> perm[1], etc.
+        random_offset = perm[step - 1].item()
+
+        # +1 because we skipped index 0 (Identity)
+        self._cached_index = random_offset + 1
 
     def mapping_for_split(self, split: str) -> Optional[torch.Tensor]:
         if not self.mappings:
             return None
         if split == "test" and not self.apply_to_test_split:
             return None
-        idx = self._index % self.num_permutations
-        return self.mappings[idx]
+        # Uses the cached integer directly
+        return self.mappings[self.current_index]
 
 
 def _value_to_token_id(value: int) -> int:

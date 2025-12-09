@@ -120,7 +120,7 @@ def _build_color_augmentor(
     if not mappings:
         return None
     return ColorAugmentor(
-        mappings=mappings, apply_to_test_split=True if is_eval else False
+        mappings=mappings, apply_to_test_split=True if is_eval else False, seed=seed
     )
 
 
