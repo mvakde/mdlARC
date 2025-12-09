@@ -579,6 +579,10 @@ def run_split_inference(
             target_output_tokens=target_output_tokens if include_targets else None,
         )
 
+        print(
+            f"[{split}] Finished batch {start // batch_size + 1} / {(len(work_items) + batch_size - 1) // batch_size}"
+        )
+
         # Attach the correct color index to each result and collect
         for res, c_idx in zip(batch_results, batch_c_indices):
             if color_mappings is not None:
