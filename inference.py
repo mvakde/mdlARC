@@ -85,6 +85,8 @@ def batched_greedy_generate(
     model, prompts, example_ids, device, max_new_tokens=931, cached_positions=None
 ):
     model.eval()
+    model.to(dtype=torch.bfloat16)
+
     batch_size = len(prompts)
     max_model_len = model.config.max_seq_len
 
@@ -112,7 +114,9 @@ def batched_greedy_generate(
     )
     grid_state = BatchGridState(initial_state)
 
-    example_embeds = model.example_embedding(example_ids_tensor)
+    example_embeds = model.example_embedding(example_ids_tensor).to(
+        dtype=torch.bfloat16
+    )
     current_len = input_ids.size(1)
 
     # --- 1. PROMPT PASS (Fill Cache) ---
@@ -135,14 +139,27 @@ def batched_greedy_generate(
     logits = outputs["logits"]
     prompt_kvs = outputs["past_key_values"]
 
+    # We need a static [B, MaxLen] mask for the compiled graph.
+    full_attention_mask = torch.zeros(
+        (batch_size, max_model_len), dtype=torch.bool, device=device
+    )
+    # Copy the prompt mask into the static buffer
+    full_attention_mask[:, :current_len] = attention_mask
+
     # --- 2. SETUP STATIC KV CACHE ---
     # Convert the prompt KVs into a fixed size buffer [B, H, MaxLen, D]
     past_key_values = []
     for k, v in prompt_kvs:
         # k, v are [B, H, PromptLen, D]
         B, H, L, D = k.shape
-        k_buf = torch.zeros((B, H, max_model_len, D), dtype=k.dtype, device=device)
-        v_buf = torch.zeros((B, H, max_model_len, D), dtype=v.dtype, device=device)
+        # Create full-sized buffer
+        k_buf = torch.zeros(
+            (B, H, max_model_len, D), dtype=torch.bfloat16, device=device
+        )
+        v_buf = torch.zeros(
+            (B, H, max_model_len, D), dtype=torch.bfloat16, device=device
+        )
+        # Copy prompt history into buffer
         k_buf[:, :, :L, :] = k
         v_buf[:, :, :L, :] = v
         past_key_values.append((k_buf, v_buf))
@@ -207,22 +224,13 @@ def batched_greedy_generate(
         outputs = model._compiled_decode(
             input_ids=next_token.unsqueeze(1),
             example_ids=example_ids_tensor,
-            past_key_values=past_key_values,  # Fixed tuple of fixed buffers
+            past_key_values=past_key_values,  # Passing the fixed buffers
             positions_3d=token_positions,
             attention_mask=full_attention_mask,  # Full [B, MaxLen]
             cache_position=cache_position,  # Tensor(1)
             example_embeds=example_embeds,
         )
         logits = outputs["logits"]
-
-        # Update static KV buffers with only the new position to avoid reusing cudagraph outputs
-        new_kvs = outputs["past_key_values"]
-        pos = int(cache_position.item())
-        pos_slice = slice(pos, pos + 1)
-        for layer_idx, (k_new, v_new) in enumerate(new_kvs):
-            k_buf, v_buf = past_key_values[layer_idx]
-            k_buf[:, :, pos_slice, :] = k_new[:, :, pos_slice, :]
-            v_buf[:, :, pos_slice, :] = v_new[:, :, pos_slice, :]
 
         # Increment position
         cache_position.add_(1)
