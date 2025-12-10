@@ -1,6 +1,7 @@
 import argparse
 from dataclasses import asdict
 import random
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -134,6 +135,7 @@ def train_one_epoch(
     log_train_strings: bool = False,
     log_train_limit: int = 0,
     log_file: Optional[Path] = None,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 ) -> int:
     model.train()
     step = start_step
@@ -143,6 +145,10 @@ def train_one_epoch(
     logged = 0
     color_augmentor = getattr(dataloader, "color_augmentor", None)
     color_aug_in_collate = bool(getattr(dataloader, "color_aug_in_collate", False))
+
+    # Enable BF16 autocast only if on CUDA
+    use_amp = device.type == "cuda"
+
     for batch in dataloader:
         step += 1
         # print(f"DEBUG: Step {step} sequence index: {batch['example_ids'][0].item()}")
@@ -170,21 +176,29 @@ def train_one_epoch(
                     seq_len = int(attention_mask[i].sum().item())
                     input_ids[i, :seq_len] = mapping[input_ids[i, :seq_len]]
 
-        outputs = model(
-            input_ids,
-            example_ids,
-            attention_mask=attention_mask,
-            positions_3d=positions_3d,
-        )
-        loss = outputs["loss"]
-        inp_loss = outputs.get("input_loss")
-        out_loss = outputs.get("output_loss")
+        # (set_to_none is slightly faster)
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
+        ):
+            outputs = model(
+                input_ids,
+                example_ids,
+                attention_mask=attention_mask,
+                positions_3d=positions_3d,
+            )
+            loss = outputs["loss"]
+            inp_loss = outputs.get("input_loss")
+            out_loss = outputs.get("output_loss")
 
         optimizer.zero_grad()
         loss.backward()
         if grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += loss.item()
         total_input_loss += inp_loss.item() if inp_loss is not None else 0.0
@@ -215,7 +229,13 @@ def train_one_epoch(
             avg_inp = total_input_loss / 10
             avg_out = total_output_loss / 10
 
-            log_msg = f"step={step} losses: avg={avg_loss:.4f} inp={avg_inp:.4f} out={avg_out:.4f}"
+            current_lr = (
+                scheduler.get_last_lr()[0]
+                if scheduler
+                else optimizer.param_groups[0]["lr"]
+            )
+
+            log_msg = f"step={step} lr={current_lr:.2e} losses: avg={avg_loss:.4f} inp={avg_inp:.4f} out={avg_out:.4f}"
             print(log_msg)
 
             if log_file:
@@ -265,6 +285,7 @@ def maybe_save_model(
     optimizer: Optional[torch.optim.Optimizer] = None,
     global_step: Optional[int] = None,
     rng_state: Optional[Dict[str, Any]] = None,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 ) -> None:
     if save_path is None:
         return
@@ -277,6 +298,8 @@ def maybe_save_model(
     }
     if optimizer is not None:
         checkpoint["optimizer_state"] = optimizer.state_dict()
+    if scheduler is not None:  # <--- SAVE SCHEDULER
+        checkpoint["scheduler_state"] = scheduler.state_dict()
     if global_step is not None:
         checkpoint["global_step"] = int(global_step)
     if rng_state is not None:
@@ -505,7 +528,11 @@ def train_model(
     log_file = getattr(args, "train_log_file", None)
 
     param_groups = _build_weight_decay_param_groups(model, args.weight_decay)
-    optimizer = AdamW(param_groups, lr=args.lr)
+
+    # Fused AdamW is significantly faster on CUDA.
+    use_fused = device.type == "cuda"
+    optimizer = AdamW(param_groups, lr=args.lr, fused=use_fused)
+
     step = int(checkpoint.get("global_step", 0)) if checkpoint else 0
 
     if checkpoint and step > 0:
@@ -521,6 +548,29 @@ def train_model(
         print("Restored optimizer state from checkpoint.")
 
     # print(f"DEBUG CHECK: Optimizer state size = {len(optimizer.state)} (0 = Fresh/Reset, >0 = Restored)")
+
+    # Linear Warmup (5%) + Cosine Decay
+    total_steps = len(dataloader) * args.epochs
+    warmup_steps = int(total_steps * 0.05)
+
+    def lr_lambda(current_step: int):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(
+            max(1, total_steps - warmup_steps)
+        )
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # Restore scheduler if resuming
+    if checkpoint and "scheduler_state" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler_state"])
+        print("Restored scheduler state from checkpoint.")
+    elif step > 0:
+        # If we didn't save scheduler state but have steps, fast-forward
+        for _ in range(step):
+            scheduler.step()
 
     # Compile a specific reference for training execution only.
     # We do this AFTER optimizer loading to ensure parameter consistency.
@@ -552,7 +602,8 @@ def train_model(
             start_step=step,
             log_train_strings=args.log_train_strings,
             log_train_limit=args.log_train_limit,
-            log_file=log_file,  # <--- Pass it down
+            log_file=log_file,
+            scheduler=scheduler,
         )
 
         # Run Validation
@@ -578,6 +629,7 @@ def train_model(
         optimizer=optimizer,
         global_step=step,
         rng_state=rng_state,
+        scheduler=scheduler,
     )
 
 
