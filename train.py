@@ -433,7 +433,19 @@ def build_model_and_data(
         config = TinyTransformerConfig(**checkpoint["config"])
     else:
         num_examples = checkpoint_num_examples or max(1, dataset.num_examples)
-        config = TinyTransformerConfig(num_examples=num_examples)
+        d_model = getattr(args, "d_model", 128)
+        n_heads = getattr(args, "n_heads", 4)
+        d_ff = getattr(args, "d_ff", 512)
+        n_layers = getattr(args, "n_layers", 4)
+        dropout = getattr(args, "dropout", 0.1)
+        config = TinyTransformerConfig(
+            num_examples=num_examples,
+            d_model=d_model,
+            n_heads=n_heads,
+            d_ff=d_ff,
+            n_layers=n_layers,
+            dropout=dropout,
+        )
 
     if dataset.num_examples != config.num_examples:
         raise ValueError(
