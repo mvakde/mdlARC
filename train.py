@@ -525,29 +525,35 @@ def train_model(
     if checkpoint is None:
         checkpoint = getattr(model, "_loaded_checkpoint", None)
 
-    val_batch_size = getattr(args, "val_batch_size", args.batch_size)
-    print(f"Building validation dataloader (batch_size={val_batch_size})...")
+    do_validate = getattr(args, "do_validate", True)
+    val_dataloader = None
 
-    # Create a separate Validation Dataset/Loader that accesses solutions.json
-    # We only include the 'test' split here to calculate validation loss.
-    # STRICT SEPARATION: This is the ONLY place load_test_solutions=True is used.
-    print("Building validation dataloader (reading hidden solutions)...")
-    val_dataset = ARCExampleDataset(
-        json_path=data_path,
-        splits=("test",),  # Only test split for validation
-        include_outputs=True,  # We need outputs to calculate loss
-        load_test_solutions=True,  # <--- Loads solutions.json
-        max_seq_len=MAX_SEQ_LEN,
-        task_whitelist=dataset.task_ids,  # Keep ID mapping consistent
-    )
+    if do_validate:
+        val_batch_size = getattr(args, "val_batch_size", args.batch_size)
+        print(f"Building validation dataloader (batch_size={val_batch_size})...")
 
-    val_dataloader = create_dataloader(
-        dataset=val_dataset,
-        batch_size=val_batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-    )
-    print(f"Validation dataset size: {len(val_dataset)}")
+        # Create a separate Validation Dataset/Loader that accesses solutions.json
+        # We only include the 'test' split here to calculate validation loss.
+        # STRICT SEPARATION: This is the ONLY place load_test_solutions=True is used.
+        print("Building validation dataloader (reading hidden solutions)...")
+        val_dataset = ARCExampleDataset(
+            json_path=data_path,
+            splits=("test",),  # Only test split for validation
+            include_outputs=True,  # We need outputs to calculate loss
+            load_test_solutions=True,  # <--- Loads solutions.json
+            max_seq_len=MAX_SEQ_LEN,
+            task_whitelist=dataset.task_ids,  # Keep ID mapping consistent
+        )
+
+        val_dataloader = create_dataloader(
+            dataset=val_dataset,
+            batch_size=val_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+        )
+        print(f"Validation dataset size: {len(val_dataset)}")
+    else:
+        print("Validation disabled (skipping solutions.json load).")
 
     # Extract log file from args if it exists
     log_file = getattr(args, "train_log_file", None)
@@ -632,18 +638,21 @@ def train_model(
         )
 
         # Run Validation
-        val_loss = validate_one_epoch(
-            model=model,  # Use the base model (not compiled) or compiled one, usually base is safer for eval switch
-            dataloader=val_dataloader,
-            device=device,
-        )
+        if val_dataloader is not None:
+            val_loss = validate_one_epoch(
+                model=model,  # Use the base model (not compiled) or compiled one, usually base is safer for eval switch
+                dataloader=val_dataloader,
+                device=device,
+            )
 
-        val_msg = f"Epoch {epoch + 1} finished. Validation Output Loss: {val_loss:.4f}"
-        print(val_msg)
+            val_msg = (
+                f"Epoch {epoch + 1} finished. Validation Output Loss: {val_loss:.4f}"
+            )
+            print(val_msg)
 
-        if log_file:
-            with open(log_file, "a") as f:
-                f.write(val_msg + "\n")
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(val_msg + "\n")
 
     rng_state = _capture_rng_state(device)
     maybe_save_model(
