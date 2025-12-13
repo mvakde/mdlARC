@@ -1,5 +1,6 @@
-***Update: 20% right now***
-***(In progress, I expect improvements till 30%)***
+Update 13 dec: ***27.5%*** now. Looking at the output grids, I expect 50% with scaling. Also gonna run this on ARC-2 today
+~~***Update: 20% right now***~~
+~~***(In progress, I expect improvements till 30%)***~~
 # 10% on ARC-1 for less than a dollar using a 1M transformer
 
 This already beats the pareto frontier btw
