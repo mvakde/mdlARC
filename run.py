@@ -74,6 +74,9 @@ class TeeLogger(object):
 
 def build_config():
     """Build and return the configuration namespace."""
+    # Use mount_folder for logs to ensure they're persisted to the Modal volume
+    runs_dir = Path(mount_folder) / "runs" if mount_folder != "." else Path("runs")
+
     args = {
         # run config
         "num_workers": 0,
@@ -82,8 +85,8 @@ def build_config():
         "name": "arc1-30M-vvwide-bs32-101ep-100color-ccdb-18dec0430",  # download file name
         "GPU": "A100-noaugreg",
         # paths - must pass as Path("<path_to_dir>")
-        "train_log_file": Path("runs/training_log.txt"),
-        "save_path": Path("runs/tiny.pt"),
+        "train_log_file": runs_dir / "training_log.txt",
+        "save_path": runs_dir / "tiny.pt",
         "checkpoint_path": None,  # Path("runs/tiny.pt"),  # or None to start from scratch
         # "data_path": Path("assets/script-tests/grouped-tasks-00576224/challenges.json"),
         # "data_path": Path("assets/ARC-2/grouped-tasks/concept_plus_combined_dihedral_train/challenges.json"),  # this dataset has dihedral augments only on the train sequences (use this for training)
@@ -119,7 +122,8 @@ def build_config():
 
 def setup_directories(args):
     """Create necessary directories and save config."""
-    runs_dir = Path("runs")
+    # Use mount_folder for persistence on Modal volume
+    runs_dir = Path(mount_folder) / "runs" if mount_folder != "." else Path("runs")
     runs_dir.mkdir(parents=True, exist_ok=True)
     with (runs_dir / "config.txt").open("w") as f:
         for k, v in args.items():
@@ -155,7 +159,9 @@ def run_training(cfg, model, dataset, dataloader, device, data_path):
     t_duration = perf_counter() - t_start
     print(f"Training took {t_duration:.2f}s")
 
-    with open(Path("runs/timing.txt"), "w") as f:
+    # Write timing to Modal volume
+    runs_dir = Path(mount_folder) / "runs" if mount_folder != "." else Path("runs")
+    with open(runs_dir / "timing.txt", "w") as f:
         f.write(f"Training: {t_duration:.4f} s\n")
 
 
@@ -234,8 +240,9 @@ def run_evaluation_pipeline(
     print(f"STARTING PIPELINE: {run_name} (Color Augs: {max_color_augments})")
     print(f"{'=' * 60}\n")
 
-    # 1. Setup Directories
-    base_run_dir = Path("runs") / run_name
+    # 1. Setup Directories - use mount_folder for Modal volume persistence
+    runs_dir = Path(mount_folder) / "runs" if mount_folder != "." else Path("runs")
+    base_run_dir = runs_dir / run_name
     base_run_dir.mkdir(parents=True, exist_ok=True)
 
     eval_log_path = base_run_dir / "eval_log.txt"
@@ -453,16 +460,17 @@ def run_all_evaluations(cfg, args, device):
         # ("eval_0color_train", 0, PATH_TRAIN) # <--- Uses TRAIN path (No Geom TTA on Test)
     ]
 
-    # Global settings shared across runs
+    # Global settings shared across runs - use mount_folder for Modal volume persistence
+    runs_dir = Path(mount_folder) / "runs" if mount_folder != "." else Path("runs")
     EVAL_BATCH_SIZE = 1300
     SPLITS = ["test"]
-    CHECKPOINT_PATH = Path("runs/tiny.pt")
+    CHECKPOINT_PATH = runs_dir / "tiny.pt"
     SOLUTIONS_PRESENT = True
     EVAL_TASK_IDS = None  # Set to None to evaluate full dataset, or ["00576224", ...] for specific tasks
     LOG_CORRECT_GRIDS = False  # Print the actual grid, IDs, and augmentation indices for fully correct grids
 
     # --- Execute the Loop (Modified with Timing) ---
-    timing_path = Path("runs/timing.txt")
+    timing_path = runs_dir / "timing.txt"
     model = None
 
     for name, aug_count, d_path in EVAL_CONFIGS:  # <--- Unpack 3 items
