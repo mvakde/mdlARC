@@ -457,6 +457,10 @@ def build_model_and_data(
 
     model = TinyTransformer(config).to(device)
 
+    # Print model size when created
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model size: {trainable_params:,} (trainable)")
+
     if checkpoint:
         state_dict = checkpoint["model_state"]
         model.load_state_dict(state_dict, strict=False)
