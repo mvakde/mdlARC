@@ -438,6 +438,7 @@ def build_model_and_data(
         d_ff = getattr(args, "d_ff", 512)
         n_layers = getattr(args, "n_layers", 4)
         dropout = getattr(args, "dropout", 0.1)
+        mask_input_loss = getattr(args, "mask_input_loss", False)
         config = TinyTransformerConfig(
             num_examples=num_examples,
             d_model=d_model,
@@ -445,6 +446,7 @@ def build_model_and_data(
             d_ff=d_ff,
             n_layers=n_layers,
             dropout=dropout,
+            mask_input_loss=mask_input_loss,
         )
 
     if dataset.num_examples != config.num_examples:

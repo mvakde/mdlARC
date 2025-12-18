@@ -24,6 +24,7 @@ class TinyTransformerConfig:
     n_layers: int = 4
     dropout: float = 0.1
     num_examples: int = 1280
+    mask_input_loss: bool = False  # If True, only compute loss on output tokens
 
     def __post_init__(self) -> None:
         if self.d_model % self.n_heads != 0:
@@ -420,10 +421,6 @@ class TinyTransformer(nn.Module):
             valid_mask = shift_targets != IGNORE_INDEX
             total_valid = valid_mask.sum()
 
-            # 3. Standard total loss (for backprop)
-            # Use clamp(min=1) to avoid division by zero if a batch is entirely padding
-            loss = raw_losses.sum() / total_valid.clamp(min=1)
-
             # 4. Separate Input vs Output portions
             # The input sequence (shift_logits input) is input_ids[:, :-1]
             shift_input_ids = input_ids[:, :-1]
@@ -449,6 +446,14 @@ class TinyTransformer(nn.Module):
             output_loss = (raw_losses * valid_output).sum() / num_output_tokens.clamp(
                 min=1
             )
+
+            # 5. Compute final loss for backprop based on config
+            # If mask_input_loss is True, only use output_loss for training
+            if self.config.mask_input_loss:
+                loss = output_loss
+            else:
+                # Standard total loss over all valid tokens
+                loss = raw_losses.sum() / total_valid.clamp(min=1)
 
         return {
             "logits": logits,
