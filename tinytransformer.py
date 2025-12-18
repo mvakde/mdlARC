@@ -18,10 +18,10 @@ from utils import (
 class TinyTransformerConfig:
     vocab_size: int = VOCAB_SIZE
     max_seq_len: int = MAX_SEQ_LEN
-    d_model: int = 128
+    d_model: int = 256
     n_heads: int = 4
     d_ff: int = 512
-    n_layers: int = 4
+    n_layers: int = 6
     dropout: float = 0.1
     num_examples: int = 1280
     mask_input_loss: bool = False  # If True, only compute loss on output tokens
