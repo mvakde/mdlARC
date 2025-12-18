@@ -49,9 +49,9 @@ import train
 import inference
 
 
-# root_folder, mount_folder = "app", "mnt/transformer-arc"  # for modal
 # root_folder, mount_folder = "content", "content/drive/MyDrive"  # for colab
-root_folder, mount_folder = ".", "."  # for local
+# root_folder, mount_folder = ".", "."  # for local
+root_folder, mount_folder = "/app", "/mnt/mdlarc-runs"  # for modal
 
 
 # Helper class for logging to file and console
@@ -103,10 +103,10 @@ def build_config():
         "dropout": 0.1,
         "seed": 42,
         # Model Architecture
-        "d_model": 768,  # 128, 256, 512, 768 | 128, 384, 640
+        "d_model": 1024,  # 128, 256, 512, 768 | 128, 384, 640
         "n_heads": 12,  # 4, 8, 8/16, 12 | 4, 12, 10
-        "d_ff": 3072,  # 512, 1024, 2048, 3072 | 512, 1536, 2560
-        "n_layers": 4,  # 4, 6, 16, 16 | 24, 28, 24
+        "d_ff": 4096,  # 512, 1024, 2048, 3072 | 512, 1536, 2560
+        "n_layers": 6,  # 4, 6, 16, 16 | 24, 28, 24
         # Loss masking
         "mask_input_loss": False,  # If True, only compute loss on output tokens (mask input loss)
         # Visibility toggles
@@ -659,7 +659,9 @@ def modal_add_dep(img: modal.Image, local, remote, sync=False):
 
 img = modal.Image.debian_slim()
 img = modal_add_dep(img, ".", ".", sync=True)
-vol = {"/assets": modal.Volume.from_name("mdlarc-assets")}
+vol = {
+    "/mnt/mdlarc-runs": modal.Volume.from_name("mdlarc-runs"),  # For saving run outputs
+}
 app = modal.App("arc-agi", image=img, volumes=vol, include_source=False)
 
 
