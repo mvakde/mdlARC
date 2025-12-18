@@ -1,0 +1,12 @@
+[project]
+name = "mdlarc"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "modal>=1.2.6",
+    "numba>=0.63.1",
+    "numpy>=2.3.5",
+    "torch>=2.9.1",
+]
