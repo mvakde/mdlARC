@@ -643,5 +643,30 @@ def main():
     print("=" * 60)
 
 
-if __name__ == "__main__":
+# --- Modal App Configuration ---
+import modal
+
+
+def modal_add_dep(img: modal.Image, local, remote, sync=False):
+    remote = f"/app/{remote}"
+
+    for d in ["pyproject.toml", "uv.lock"]:
+        img = img.add_local_file(f"{local}/{d}", f"{remote}/{d}", copy=True)
+    if sync:
+        img = img.run_commands(f"cd {remote} && uv sync")
+    return img.add_local_dir(local, remote, ignore=["*.venv"], copy=True)
+
+
+img = modal.Image.debian_slim()
+img = modal_add_dep(img, ".", ".", sync=True)
+vol = {"/assets": modal.Volume.from_name("mdlarc-assets")}
+app = modal.App("arc-agi", image=img, volumes=vol, include_source=False)
+
+
+@app.function(gpu="H100")
+def main_modal():
     main()
+
+
+if __name__ == "__main__":
+    main_modal.local()
