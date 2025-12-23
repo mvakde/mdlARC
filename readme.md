@@ -6,14 +6,18 @@
 
 There are three runnable notebooks in the repo root. Each notebook is self-contained: it clones the repo into the runtime, downloads/builds the datasets, then trains + runs inference to produce a `submission.json`.
 
+It works directly on the standard colab/modal environments
+
 - `run-script.ipynb`: main reproduction notebook (tuned for A100); optionally mount Drive/Modal Volume to persist `runs/` checkpoints and logs.
 - `sanitised-env-run-script.ipynb`: “no Kaggle” reproduction; downloads ARC datasets from GitHub and never downloads eval solutions.
 - `ultra-sanitised-env-run-script.ipynb`: strongest leakage check; uses the official ARC Prize 2024 public Kaggle dataset (requires a Kaggle legacy API key), deletes eval solutions before training/inference, and only re-downloads them at the end for scoring (tested on Colab).
 
 Deploy:
-- Colab: upload one of the notebooks → select GPU runtime (A100 if available) → “Run all”.
+- Colab: upload one of the notebooks → select GPU runtime (A100 if available) → (optional) mount google drive to save runs -> “Run all”.
 - Modal: upload the notebook to a Modal Notebook → select an A100 → (optional) attach a Volume and update the first cell’s `mount_folder`/volume name → “Run all”.
 - If you’re running from a fork/branch, edit the `git clone ...` cell in the notebook.
+
+---
 
 Update:  
 Wow this blew up. Pressure is on.  
