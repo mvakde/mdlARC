@@ -1,6 +1,8 @@
 # 27.5% on ARC-AGI in just $2 using a 28M transformer
-<!-- Pareto frontier literally off the charts
-<a href="https://mvakde.github.io/blog/new-pareto-frontier-arc-agi/"><img src="img/arc-prize-leaderboard.png"></a> -->
+
+For verification, run `sanitised-env-run-script.ipynb` on modal/colab or `ultra-sanitised-env-run-script.ipynb` on colab  
+The latter requires a kaggle account to download the official dataset  
+(You can skip this by manually downloading the dataset [here](https://www.kaggle.com/competitions/arc-prize-2024/data).
 
 ## Run scripts (Colab/Modal)
 
@@ -9,7 +11,7 @@ There are three runnable notebooks in the repo root. Each notebook is self-conta
 It works directly on the standard colab/modal environments
 
 - `run-script.ipynb`: main reproduction notebook (tuned for A100); optionally mount Drive/Modal Volume to persist `runs/` checkpoints and logs.
-- `sanitised-env-run-script.ipynb`: “no Kaggle” reproduction; downloads ARC datasets from GitHub and never downloads eval solutions.
+- `sanitised-env-run-script.ipynb`: “no Kaggle” reproduction; downloads ARC datasets from GitHub and deletes eval solutions before starting.
 - `ultra-sanitised-env-run-script.ipynb`: strongest leakage check; uses the official ARC Prize 2024 public Kaggle dataset (requires a Kaggle legacy API key), deletes eval solutions before training/inference, and only re-downloads them at the end for scoring (tested on Colab).
 
 Deploy:
