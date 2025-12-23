@@ -1,16 +1,23 @@
 # 27.5% on ARC-AGI in just $2 using a 28M transformer
-Pareto frontier literally off the charts
-<a href="https://mvakde.github.io/blog/new-pareto-frontier-arc-agi/"><img src="img/arc-prize-leaderboard.png"></a>
+<!-- Pareto frontier literally off the charts
+<a href="https://mvakde.github.io/blog/new-pareto-frontier-arc-agi/"><img src="img/arc-prize-leaderboard.png"></a> -->
+
+## Run scripts (Colab/Modal)
+
+There are three runnable notebooks in the repo root. Each notebook is self-contained: it clones the repo into the runtime, downloads/builds the datasets, then trains + runs inference to produce a `submission.json`.
+
+- `run-script.ipynb`: main reproduction notebook (tuned for A100); optionally mount Drive/Modal Volume to persist `runs/` checkpoints and logs.
+- `sanitised-env-run-script.ipynb`: “no Kaggle” reproduction; downloads ARC datasets from GitHub and never downloads eval solutions.
+- `ultra-sanitised-env-run-script.ipynb`: strongest leakage check; uses the official ARC Prize 2024 public Kaggle dataset (requires a Kaggle legacy API key), deletes eval solutions before training/inference, and only re-downloads them at the end for scoring (tested on Colab).
+
+Deploy:
+- Colab: upload one of the notebooks → select GPU runtime (A100 if available) → “Run all”.
+- Modal: upload the notebook to a Modal Notebook → select an A100 → (optional) attach a Volume and update the first cell’s `mount_folder`/volume name → “Run all”.
+- If you’re running from a fork/branch, edit the `git clone ...` cell in the notebook.
 
 Update:  
 Wow this blew up. Pressure is on.  
 Please bear with me as I want to do careful ablations.
-
-## How to run
-- upload the `run-script.ipynb` file to google colab or modal
-    - (optional) if you want to save results, mount your drive/volume. If you don't, then comment out the 2 cells that save save a checkpoint to drive.
-- choose A100
-- Hit run all
 
 ## Self supervised compression on ARC
 
