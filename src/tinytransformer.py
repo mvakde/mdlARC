@@ -580,7 +580,7 @@ class TinyTransformer(nn.Module):
 class RotaryEmbedding3D(nn.Module):
     """3D Rotary Positional Embedding applied to Q/K using precomputed lookups.
 
-    Splits head_dim into three even slices (x,y,z). Precomputes cos/sin tables
+    Splits head_dim into in a 6:6:1 ratio since max size is (30,30,5). Precomputes cos/sin tables
     for fixed coordinate ranges (x:0-32, y:0-32, z:0-8) to speed up inference.
     """
 
@@ -591,11 +591,13 @@ class RotaryEmbedding3D(nn.Module):
         self.head_dim = head_dim
         self.base = base
 
-        # Distribute pairs across 3 axes as evenly as possible
+        # Distribute pairs across 3 axes using a 6:6:1 ratio (x:y:z).
+        # z gets ceil(1/13) of pairs; the remainder is split evenly between x/y.
         n_pairs = head_dim // 2
-        px = n_pairs // 3
-        py = n_pairs // 3
-        pz = n_pairs - px - py
+        pz = (n_pairs + 12) // 13
+        remaining = n_pairs - pz
+        px = remaining // 2
+        py = remaining - px
         self.d_x = px * 2
         self.d_y = py * 2
         self.d_z = pz * 2
