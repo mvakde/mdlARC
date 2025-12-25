@@ -34,6 +34,18 @@ class TinyTransformerConfig:
             raise ValueError("num_examples must be >= 1.")
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        rms = hidden_states.pow(2).mean(dim=-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(rms + self.eps)
+        return hidden_states * self.weight
+
+
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, config: TinyTransformerConfig) -> None:
         super().__init__()
@@ -213,24 +225,24 @@ class MultiHeadSelfAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, config: TinyTransformerConfig) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(config.d_model, config.d_ff),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.d_ff, config.d_model),
-            nn.Dropout(config.dropout),
-        )
+        self.fc_in = nn.Linear(config.d_model, config.d_ff * 2)
+        self.fc_out = nn.Linear(config.d_ff, config.d_model)
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.net(hidden_states)
+        hidden_states, gate = self.fc_in(hidden_states).chunk(2, dim=-1)
+        hidden_states = hidden_states * F.silu(gate)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.fc_out(hidden_states)
+        return self.dropout(hidden_states)
 
 
 class TransformerBlock(nn.Module):
     def __init__(self, config: TinyTransformerConfig) -> None:
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.d_model)
+        self.ln_1 = RMSNorm(config.d_model)
         self.attention = MultiHeadSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.d_model)
+        self.ln_2 = RMSNorm(config.d_model)
         self.ff = FeedForward(config)
 
     def forward(
@@ -331,7 +343,7 @@ class TinyTransformer(nn.Module):
         self.blocks = nn.ModuleList(
             [TransformerBlock(config) for _ in range(config.n_layers)]
         )
-        self.norm = nn.LayerNorm(config.d_model)
+        self.norm = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         self.apply(self._init_weights)
