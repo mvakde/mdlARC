@@ -80,9 +80,48 @@ class BatchGridState:
         return positions.clone()
 
 
+def _select_next_token(
+    logits: torch.Tensor,
+    temperature: Optional[float] = None,
+    top_k: Optional[int] = None,
+) -> torch.Tensor:
+    last_logits = logits[:, -1, :]
+
+    if (temperature is None and top_k is None) or (
+        temperature is not None and temperature <= 0
+    ):
+        return torch.argmax(last_logits, dim=-1)
+
+    if temperature is None:
+        temperature = 1.0
+
+    use_top_k = top_k is not None and top_k > 0
+    if use_top_k:
+        top_k = int(top_k)
+        if top_k == 1:
+            return torch.argmax(last_logits, dim=-1)
+        top_k = min(top_k, last_logits.size(-1))
+        top_values, top_indices = torch.topk(last_logits, top_k, dim=-1)
+        scaled = (top_values / temperature).float()
+        probs = torch.softmax(scaled, dim=-1)
+        next_index = torch.multinomial(probs, num_samples=1)
+        return top_indices.gather(-1, next_index).squeeze(-1)
+
+    scaled = (last_logits / temperature).float()
+    probs = torch.softmax(scaled, dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
 @torch.inference_mode()
 def batched_greedy_generate(
-    model, prompts, example_ids, device, max_new_tokens=931, cached_positions=None
+    model,
+    prompts,
+    example_ids,
+    device,
+    max_new_tokens=931,
+    cached_positions=None,
+    temperature: Optional[float] = None,
+    top_k: Optional[int] = None,
 ):
     model.eval()
     model.to(dtype=torch.bfloat16)
@@ -202,8 +241,10 @@ def batched_greedy_generate(
         # Mark a new cudagraph step to avoid reusing outputs as inputs
         torch.compiler.cudagraph_mark_step_begin()
 
-        # Greedy decode
-        next_token = torch.argmax(logits[:, -1, :], dim=-1)
+        # Greedy decode unless sampling is enabled via temperature/top_k
+        next_token = _select_next_token(
+            logits, temperature=temperature, top_k=top_k
+        )
         next_token = torch.where(
             finished, torch.tensor(END_TOKEN_ID, device=device), next_token
         )
@@ -447,6 +488,8 @@ def _run_generation_batch(
     cached_positions: Sequence[Optional[torch.Tensor]],
     device: torch.device,
     max_new_tokens: int,
+    temperature: Optional[float] = None,
+    top_k: Optional[int] = None,
     target_output_tokens: Optional[Sequence[Sequence[int]]] = None,
 ) -> List[Dict[str, object]]:
     sequences = batched_greedy_generate(
@@ -456,6 +499,8 @@ def _run_generation_batch(
         device=device,
         max_new_tokens=max_new_tokens,
         cached_positions=cached_positions,
+        temperature=temperature,
+        top_k=top_k,
     )
     return _build_generation_results(
         sequences=sequences,
@@ -530,6 +575,8 @@ def run_split_inference(
     include_targets: bool = True,
     color_mappings: Optional[Sequence[Sequence[int]]] = None,
     color_apply_fn: Optional[Callable[[str], bool]] = None,
+    temperature: Optional[float] = None,
+    top_k: Optional[int] = None,
 ) -> List[Dict[str, object]]:
     solutions = _load_solutions_for_dataset(dataset) if include_targets else None
     examples = _gather_examples_for_split(
@@ -594,6 +641,8 @@ def run_split_inference(
             cached_positions=cached_positions,
             device=device,
             max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
             target_output_tokens=target_output_tokens if include_targets else None,
         )
 
@@ -693,6 +742,8 @@ def evaluate_model_on_dataset(
     color_apply_fn: Optional[Callable[[str], bool]] = None,
     task_ids: Optional[Sequence[str]] = None,
     include_targets: bool = True,
+    temperature: Optional[float] = None,
+    top_k: Optional[int] = None,
 ) -> Dict[str, Dict[str, object]]:
     evaluation: Dict[str, Dict[str, object]] = {}
     # Determine if we should look for targets for this specific split
@@ -714,6 +765,8 @@ def evaluate_model_on_dataset(
             color_mappings=color_mappings,
             color_apply_fn=color_apply_fn,
             task_ids=task_ids,
+            temperature=temperature,
+            top_k=top_k,
         )
         summary = summarize_split_results(split_results)
         evaluation[split] = {"results": split_results, "summary": summary}
