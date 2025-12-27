@@ -3,7 +3,9 @@ import random
 import math
 import functools
 import itertools
+import shutil
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -453,6 +455,263 @@ def plot_grids(
         fig.suptitle(title)
     plt.tight_layout()
     plt.show()
+
+
+_RUN_ARCHIVE_STATE_KEY = "_RUN_ARCHIVE_STATE"
+
+
+@dataclass
+class RunArchiveState:
+    src_dir: Path
+    zip_base: Path
+    local_zip: Path
+    mount_dir: Path
+    last_drive_zip: Optional[Path] = None
+
+
+def _build_archive_state(
+    cfg_name: str, root_folder: str, mount_folder: str
+) -> RunArchiveState:
+    src_dir = Path(f"/{root_folder}/mdlARC/runs")
+    zip_base = Path(f"/{root_folder}/mdlARC") / f"runs-{cfg_name}"
+    local_zip = zip_base.with_suffix(".zip")
+    mount_dir = Path(f"/{mount_folder}")
+    return RunArchiveState(
+        src_dir=src_dir,
+        zip_base=zip_base,
+        local_zip=local_zip,
+        mount_dir=mount_dir,
+    )
+
+
+def _export_archive_state(state: RunArchiveState, globals_dict: Dict[str, object]) -> None:
+    globals_dict[_RUN_ARCHIVE_STATE_KEY] = state
+    globals_dict["SRC_DIR"] = state.src_dir
+    globals_dict["ZIP_BASE"] = state.zip_base
+    globals_dict["LOCAL_ZIP"] = state.local_zip
+    globals_dict["MOUNT_DIR"] = state.mount_dir
+    globals_dict["LAST_DRIVE_ZIP"] = state.last_drive_zip
+
+
+def _find_latest_drive_zip(mount_dir: Path, cfg_name: str) -> Optional[Path]:
+    pattern = f"runs-{cfg_name}-*.zip"
+    matches = sorted(
+        mount_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    return matches[0] if matches else None
+
+
+def save_run_archive(
+    cfg_name: str,
+    root_folder: str,
+    mount_folder: str,
+    globals_dict: Optional[Dict[str, object]] = None,
+) -> RunArchiveState:
+    """Zip the runs folder and copy to the mount. Mirrors the notebook save cell."""
+    state = _build_archive_state(cfg_name, root_folder, mount_folder)
+    timestamp = datetime.now().strftime("%d%m%y-%H%M%S")
+    state.last_drive_zip = state.mount_dir / f"runs-{cfg_name}-{timestamp}.zip"
+
+    state.local_zip.unlink(missing_ok=True)
+
+    print(f"Zipping {state.src_dir} ...")
+    shutil.make_archive(str(state.zip_base), "zip", str(state.src_dir))
+
+    print(f"Copying to Drive: {state.last_drive_zip}")
+    shutil.copy2(str(state.local_zip), str(state.last_drive_zip))
+
+    state.local_zip.unlink(missing_ok=True)
+
+    if globals_dict is not None:
+        _export_archive_state(state, globals_dict)
+    return state
+
+
+def update_run_archive(
+    cfg_name: str,
+    root_folder: Optional[str] = None,
+    mount_folder: Optional[str] = None,
+    globals_dict: Optional[Dict[str, object]] = None,
+) -> RunArchiveState:
+    """Refresh the runs archive on the mount, deleting the previous zip if present."""
+    state = None
+    if globals_dict is not None:
+        state = globals_dict.get(_RUN_ARCHIVE_STATE_KEY)
+
+    if state is None:
+        if root_folder is None or mount_folder is None:
+            raise ValueError(
+                "root_folder and mount_folder are required if no archive state exists."
+            )
+        state = _build_archive_state(cfg_name, root_folder, mount_folder)
+
+    if state.last_drive_zip is None:
+        if globals_dict is not None:
+            last_drive_zip = globals_dict.get("LAST_DRIVE_ZIP")
+            if last_drive_zip:
+                state.last_drive_zip = Path(last_drive_zip)
+        if state.last_drive_zip is None:
+            state.last_drive_zip = _find_latest_drive_zip(state.mount_dir, cfg_name)
+
+    if state.last_drive_zip and Path(state.last_drive_zip).exists():
+        print(f"Deleting old Drive zip: {state.last_drive_zip}")
+        Path(state.last_drive_zip).unlink()
+
+    timestamp = datetime.now().strftime("%d%m%y-%H%M%S")
+    new_drive_zip = state.mount_dir / f"runs-{cfg_name}-{timestamp}.zip"
+
+    state.local_zip.unlink(missing_ok=True)
+
+    print(f"Zipping UPDATED {state.src_dir} ...")
+    shutil.make_archive(str(state.zip_base), "zip", str(state.src_dir))
+
+    print(f"Copying NEW zip to Drive: {new_drive_zip}")
+    shutil.copy2(str(state.local_zip), str(new_drive_zip))
+
+    state.last_drive_zip = new_drive_zip
+    state.local_zip.unlink(missing_ok=True)
+
+    if globals_dict is not None:
+        _export_archive_state(state, globals_dict)
+    return state
+
+
+def cleanup_memory(
+    globals_dict: Optional[Dict[str, object]] = None,
+    names: Sequence[str] = ("model", "dataset", "dataloader", "optimizer", "scheduler"),
+) -> None:
+    """Free common training objects and clear torch caches for inference."""
+    import gc
+
+    if globals_dict is not None:
+        for name in names:
+            if name in globals_dict:
+                del globals_dict[name]
+
+    if hasattr(torch, "_dynamo"):
+        torch._dynamo.reset()
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+    print(f"GPU cleaned. Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+
+
+def visualize_submissions(
+    submission_file: Path,
+    solutions_file: Optional[Path] = None,
+    mode: str = "submission",
+) -> None:
+    """Visualize submission attempts, optionally comparing against solutions."""
+    submission_path = Path(submission_file)
+    if not submission_path.exists():
+        print(f"Error: Could not find submission file: {submission_path}")
+        return
+
+    mode_normalized = "compare" if mode == "!" else mode
+    if mode_normalized not in ("compare", "submission"):
+        print(f"Error: Unknown visualization mode '{mode}'.")
+        return
+
+    if mode_normalized == "compare":
+        if solutions_file is None:
+            print("Error: Solutions file required for compare mode.")
+            return
+        solutions_path = Path(solutions_file)
+        if not solutions_path.exists():
+            print(
+                f"Error: Could not find solutions file for compare mode:\n{solutions_path}"
+            )
+            return
+
+        with submission_path.open("r") as handle:
+            subs = json.load(handle)
+        with solutions_path.open("r") as handle:
+            sols = json.load(handle)
+
+        print(f"Visualizing comparison for {len(subs)} tasks...")
+
+        for task_id, attempts_list in subs.items():
+            if task_id not in sols:
+                print(f"Warning: Task {task_id} not found in solutions.json")
+                continue
+
+            gt_grids = sols[task_id]
+            print(gt_grids)
+            for i, attempts in enumerate(attempts_list):
+                if i >= len(gt_grids):
+                    break
+
+                gt = gt_grids[i]
+                att1 = attempts.get("attempt_1")
+                att2 = attempts.get("attempt_2")
+
+                pass1 = (att1 == gt) if att1 is not None else False
+                pass2 = (att2 == gt) if att2 is not None else False
+
+                if pass1 and pass2:
+                    status = "Pass - both"
+                elif pass1:
+                    status = "Pass - 1"
+                elif pass2:
+                    status = "Pass - 2"
+                else:
+                    status = "Fail"
+
+                grids_to_plot = [gt]
+                if att1 is not None:
+                    grids_to_plot.append(att1)
+                if att2 is not None:
+                    grids_to_plot.append(att2)
+
+                header = f"Task: {task_id} | Pair: {i} | Status: {status}"
+                print(f"Plotting {header}")
+
+                try:
+                    plot_grids(grids_to_plot, title=header)
+                except Exception as exc:
+                    print(f"Skipping plot for {task_id} due to error: {exc}")
+    else:
+        with submission_path.open("r") as handle:
+            subs = json.load(handle)
+
+        print(f"Visualizing submissions for {len(subs)} tasks (no solutions)...")
+
+        for task_id, attempts_list in subs.items():
+            for i, attempts in enumerate(attempts_list):
+                att1 = attempts.get("attempt_1")
+                att2 = attempts.get("attempt_2")
+
+                grids_to_plot = []
+                if att1 is not None:
+                    grids_to_plot.append(att1)
+                if att2 is not None:
+                    grids_to_plot.append(att2)
+
+                if not grids_to_plot:
+                    print(f"Skipping {task_id} pair {i} (no attempts)")
+                    continue
+
+                header = f"Task: {task_id} | Pair: {i} | Status: submission-only"
+                print(f"Plotting {header}")
+
+                try:
+                    plot_grids(grids_to_plot, title=header)
+                except Exception as exc:
+                    print(f"Skipping plot for {task_id} due to error: {exc}")
+
+
+def visualize_eval_submissions(
+    eval_sub_folder: str,
+    submission_base: Path = Path("runs"),
+    solutions_file: Optional[Path] = None,
+    mode: str = "submission",
+) -> None:
+    """Helper to visualize submissions from a runs/<folder>/submission.json."""
+    submission_file = Path(submission_base) / eval_sub_folder / "submission.json"
+    visualize_submissions(
+        submission_file, solutions_file=solutions_file, mode=mode
+    )
 
 
 @dataclass
