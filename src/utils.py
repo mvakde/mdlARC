@@ -714,6 +714,64 @@ def visualize_eval_submissions(
     )
 
 
+def score_arc_submission(
+    solutions_file: Path,
+    submission_file: Path,
+) -> Dict[str, object]:
+    """Score a submission.json against ARC solutions.json."""
+    solutions_path = Path(solutions_file)
+    submission_path = Path(submission_file)
+
+    if not solutions_path.exists():
+        raise FileNotFoundError(f"Solutions file not found: {solutions_path}")
+    if not submission_path.exists():
+        raise FileNotFoundError(f"Submission file not found: {submission_path}")
+
+    with solutions_path.open("r") as handle:
+        solutions = json.load(handle)
+
+    with submission_path.open("r") as handle:
+        submissions = json.load(handle)
+
+    calc_score = 0.0
+    max_total_score = len(solutions)
+    fully_solved_tasks: List[str] = []
+
+    for task_id, ground_truth_grids in solutions.items():
+        if task_id not in submissions:
+            continue
+
+        task_attempts = submissions[task_id]
+        num_pairs = len(ground_truth_grids)
+        pairs_solved = 0
+
+        for i in range(min(len(task_attempts), num_pairs)):
+            truth = ground_truth_grids[i]
+            attempts = task_attempts[i]
+            if attempts.get("attempt_1") == truth or attempts.get("attempt_2") == truth:
+                pairs_solved += 1
+
+        if num_pairs > 0:
+            calc_score += pairs_solved / num_pairs
+            if pairs_solved == num_pairs:
+                fully_solved_tasks.append(task_id)
+
+    percentage = 100 * (calc_score / max_total_score) if max_total_score > 0 else 0.0
+    print(
+        f"Official ARC style scoring: {calc_score}/{max_total_score} ({percentage}%)"
+    )
+    print(f"Fully correct tasks ({len(fully_solved_tasks)}):")
+    for task_id in fully_solved_tasks:
+        print(task_id)
+
+    return {
+        "score": calc_score,
+        "max_score": max_total_score,
+        "percentage": percentage,
+        "fully_solved_tasks": fully_solved_tasks,
+    }
+
+
 @dataclass
 class SequenceExample:
     tokens: torch.LongTensor
