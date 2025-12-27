@@ -240,9 +240,7 @@ def batched_greedy_generate(
         torch.compiler.cudagraph_mark_step_begin()
 
         # Greedy decode unless sampling is enabled via temperature/top_k
-        next_token = _select_next_token(
-            logits, temperature=temperature, top_k=top_k
-        )
+        next_token = _select_next_token(logits, temperature=temperature, top_k=top_k)
         next_token = torch.where(
             finished, torch.tensor(END_TOKEN_ID, device=device), next_token
         )
