@@ -7,7 +7,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import List, Optional
 
-# Python port of run-script.ipynb for non-notebook runs.
+# Python port of interactive-run.ipynb for non-notebook runs.
 
 # ---------------------------
 # Config (edit in-place)
@@ -41,7 +41,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 ROOT_FOLDER = str(PROJECT_ROOT.parent).lstrip("/")
 MOUNT_FOLDER = str((PROJECT_ROOT / "runs_archive").resolve()).lstrip("/")
 
-# Model + training config (mirrors run-script.ipynb).
+# Model + training config (mirrors interactive-run.ipynb).
 ARGS = {
     # run config
     "num_workers": 0,
@@ -130,9 +130,9 @@ def _build_datasets() -> None:
 
 def _sanitize_repo(project_root: Path) -> None:
     targets = [
-        project_root / "run-script.ipynb",
-        project_root / "sanitised-env-run-script.ipynb",
-        project_root / "ultra-sanitised-env-run-script.ipynb",
+        project_root / "interactive-run.ipynb",
+        project_root / "clean-env-run.ipynb",
+        project_root / "max-clean-env-run.ipynb",
         project_root / "dataset_building_scripts",
         project_root / "readme.md",
         project_root / "img",
