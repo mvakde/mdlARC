@@ -15,7 +15,7 @@ from utils import (
     END_TOKEN_ID,
     IO_SEPARATOR_TOKEN_ID,
     NEXT_LINE_TOKEN_ID,
-    generate_color_mapping_tensors,
+    generate_task_color_mappings,
 )
 
 
@@ -99,6 +99,7 @@ def evaluate_model_on_dataset(
     splits: Sequence[str] = ("train", "test"),
     log_prompts: bool = False,
     color_mappings: Optional[Sequence[Sequence[int]]] = None,
+    color_mappings_by_task: Optional[Dict[str, Sequence[Sequence[int]]]] = None,
     color_apply_fn: Optional[Callable[[str], bool]] = None,
     task_ids: Optional[Sequence[str]] = None,
     include_targets: bool = True,
@@ -123,6 +124,7 @@ def evaluate_model_on_dataset(
             log_prompts=log_prompts,
             include_targets=split_include_targets,
             color_mappings=color_mappings,
+            color_mappings_by_task=color_mappings_by_task,
             color_apply_fn=color_apply_fn,
             task_ids=task_ids,
             temperature=temperature,
@@ -278,9 +280,13 @@ def run_evaluation_pipeline(
     color_mappings_eval = None
     color_apply_fn = None
     if cfg.enable_color_aug_eval and cfg.max_color_augments_eval > 0:
-        color_seed = getattr(cfg, "color_aug_seed", None) or cfg.seed
-        color_mappings_eval = generate_color_mapping_tensors(
-            cfg.max_color_augments_eval, color_seed
+        color_seed = getattr(cfg, "color_aug_seed_eval", None)
+        if color_seed is None:
+            color_seed = getattr(cfg, "color_aug_seed", None)
+        if color_seed is None:
+            color_seed = cfg.seed
+        color_mappings_eval = generate_task_color_mappings(
+            dataset.task_input_colors, cfg.max_color_augments_eval, int(color_seed)
         )
         color_apply_fn = lambda split: True
 
@@ -293,7 +299,7 @@ def run_evaluation_pipeline(
         temperature=getattr(cfg, "inference_temperature", None),
         top_k=getattr(cfg, "inference_top_k", None),
         splits=splits,
-        color_mappings=color_mappings_eval,
+        color_mappings_by_task=color_mappings_eval,
         color_apply_fn=color_apply_fn,
         task_ids=task_ids,
         include_targets=include_targets,
@@ -352,8 +358,7 @@ def run_evaluation_pipeline(
             aaivr_results = aaivr.run_aaivr_on_results(
                 test_results,
                 is_dihedral_augmented=dataset_has_dihedral_augments,
-                color_aug_seed=getattr(cfg, "color_aug_seed", None),
-                max_color_augments=cfg.max_color_augments_eval,
+                color_mappings_by_task=color_mappings_eval,
             )
         else:
             print("No test results for AAIVR.")

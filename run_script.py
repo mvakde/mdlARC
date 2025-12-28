@@ -61,6 +61,7 @@ ARGS = {
     "enable_color_aug_train": True,
     "max_color_augments_train": 100,
     "color_aug_seed": 42,
+    "color_aug_seed_eval": None,
     "lr": 3e-4,
     "weight_decay": 0.01,
     "grad_clip": 1.0,
