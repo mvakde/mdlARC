@@ -3,7 +3,9 @@ import random
 import math
 import functools
 import itertools
+import shutil
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -411,322 +413,6 @@ def split_grids_from_tokens(tokens: Sequence[int]) -> List[List[List[int]]]:
     return grids
 
 
-_DIHEDRAL_TRANSFORM_NAMES = [
-    "identity",
-    "rot90",
-    "rot180",
-    "rot270",
-    "flip_horizontal",
-    "flip_vertical",
-    "flip_main_diagonal",
-    "flip_anti_diagonal",
-]
-
-
-def _dihedral_copy(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    return [list(row) for row in grid]
-
-
-def _dihedral_rot90(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    if not grid:
-        return []
-    return [list(row) for row in zip(*grid[::-1])]
-
-
-def _dihedral_rot180(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    return [list(reversed(row)) for row in reversed(grid)]
-
-
-def _dihedral_rot270(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    if not grid:
-        return []
-    return [list(row) for row in zip(*grid)][::-1]
-
-
-def _dihedral_flip_horizontal(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    return [list(reversed(row)) for row in grid]
-
-
-def _dihedral_flip_vertical(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    return [list(row) for row in reversed(grid)]
-
-
-def _dihedral_flip_main_diagonal(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    if not grid:
-        return []
-    return [list(row) for row in zip(*grid)]
-
-
-def _dihedral_flip_anti_diagonal(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    return _dihedral_flip_vertical(_dihedral_rot90(grid))
-
-
-_DIHEDRAL_TRANSFORMS = {
-    "identity": _dihedral_copy,
-    "rot90": _dihedral_rot90,
-    "rot180": _dihedral_rot180,
-    "rot270": _dihedral_rot270,
-    "flip_horizontal": _dihedral_flip_horizontal,
-    "flip_vertical": _dihedral_flip_vertical,
-    "flip_main_diagonal": _dihedral_flip_main_diagonal,
-    "flip_anti_diagonal": _dihedral_flip_anti_diagonal,
-}
-
-_DIHEDRAL_INVERSES = {
-    "identity": "identity",
-    "rot90": "rot270",
-    "rot180": "rot180",
-    "rot270": "rot90",
-    "flip_horizontal": "flip_horizontal",
-    "flip_vertical": "flip_vertical",
-    "flip_main_diagonal": "flip_main_diagonal",
-    "flip_anti_diagonal": "flip_anti_diagonal",
-}
-
-
-def is_rectangular_grid(grid: Sequence[Sequence[int]]) -> bool:
-    """Return True if all rows have the same non-zero length."""
-    if not grid:
-        return False
-    first_row_len = len(grid[0])
-    if first_row_len == 0:
-        return False
-    return all(len(row) == first_row_len for row in grid)
-
-
-def apply_inverse_dihedral_transform(
-    grid: Sequence[Sequence[int]], transform_index: int
-) -> List[List[int]]:
-    """Undo a dihedral transform using the known augmentation index (mod 8)."""
-    if transform_index < 0:
-        raise ValueError("transform_index must be non-negative.")
-    transform_name = _DIHEDRAL_TRANSFORM_NAMES[transform_index % 8]
-    inverse_name = _DIHEDRAL_INVERSES[transform_name]
-    return _DIHEDRAL_TRANSFORMS[inverse_name](grid)
-
-
-def _grid_to_tuple(grid: Sequence[Sequence[int]]) -> Tuple[Tuple[int, ...], ...]:
-    return tuple(tuple(int(val) for val in row) for row in grid)
-
-
-def _tuple_to_grid(grid_tuple: Tuple[Tuple[int, ...], ...]) -> List[List[int]]:
-    return [list(row) for row in grid_tuple]
-
-
-@dataclass
-class AAIVRSelection:
-    task_id: str
-    original_pair_index: int
-    selected_outputs: List[List[List[int]]]
-    ranked_candidates: List[Dict[str, object]]
-    num_generated: int
-    num_valid: int
-    discarded_non_rectangular: int
-    discarded_input_copies: int
-    target_grid: Optional[List[List[int]]] = None
-    pass_at_k: Optional[bool] = None
-
-
-def run_aaivr_on_results(
-    results: Sequence[Dict[str, object]],
-    top_k: int = 2,
-    discard_input_copies: bool = True,
-    rng: Optional[random.Random] = None,
-    is_dihedral_augmented: bool = False,
-    color_aug_seed: Optional[int] = None,
-    max_color_augments: int = 0,
-) -> List[AAIVRSelection]:
-    """Aggregate augmented predictions via AAIVR voting. (automated augmentation inverse)
-
-    The function assumes pair_index encodes augmentation order (mod 8) if is_dihedral_augmented is True.
-    It now also handles inverting color permutations if color info is provided.
-    """
-    rng = rng if rng is not None else random
-    case_map: Dict[Tuple[str, int], Dict[str, object]] = {}
-
-    # 1. Pre-calculate Inverse Color Mappings
-    inverse_color_mappings: List[List[int]] = []
-    if max_color_augments > 0:
-        seed = color_aug_seed if color_aug_seed is not None else 42
-        forward_tensors = generate_color_mapping_tensors(max_color_augments, seed)
-        for fwd in forward_tensors:
-            # Create inverse: if fwd[x] = y, then inv[y] = x
-            inv = torch.zeros_like(fwd)
-            inv[fwd] = torch.arange(len(fwd), dtype=torch.long)
-            inverse_color_mappings.append(inv.tolist())
-
-    for res in results:
-        task_id = res.get("task_id")
-        pair_index = res.get("pair_index")
-        if task_id is None or pair_index is None:
-            continue
-
-        if is_dihedral_augmented:
-            # Dataset has 8 copies per pair encoded in index
-            base_pair_index = int(pair_index) // 8
-            transform_index = int(pair_index) % 8
-        else:
-            # Standard dataset: index is just the pair index
-            base_pair_index = int(pair_index)
-            transform_index = 0
-
-        color_idx = res.get("color_permutation_index", 0)
-
-        predicted_grid = res.get("output_grid", [])
-        prompt_tokens = res.get("prompt_tokens", [])
-        input_grids = split_grids_from_tokens(prompt_tokens)
-        input_grid = input_grids[0] if input_grids else []
-
-        key = (task_id, base_pair_index)
-        if key not in case_map:
-            case_map[key] = {
-                "counts": {},
-                "generated": 0,
-                "valid": 0,
-                "dropped_rect": 0,
-                "dropped_input": 0,
-                "target_grid": None,
-            }
-        stats = case_map[key]
-        stats["generated"] += 1
-
-        # 2. Normalize Target Grid (Geometric Inverse + Color Inverse)
-        target_grid = res.get("target_grid", [])
-        if stats["target_grid"] is None and is_rectangular_grid(target_grid):
-            try:
-                # Geometric Inverse
-                norm_target = apply_inverse_dihedral_transform(
-                    target_grid, transform_index
-                )
-                # Color Inverse
-                if color_idx > 0 and color_idx < len(inverse_color_mappings):
-                    norm_target = apply_color_permutation_to_grid(
-                        norm_target, inverse_color_mappings[color_idx]
-                    )
-
-                if is_rectangular_grid(norm_target):
-                    stats["target_grid"] = norm_target
-            except Exception:
-                pass
-
-        # 3. Validation Checks
-        if not is_rectangular_grid(predicted_grid):
-            stats["dropped_rect"] += 1
-            continue
-        if discard_input_copies and input_grid and predicted_grid == input_grid:
-            stats["dropped_input"] += 1
-            continue
-
-        # 4. Normalize Predicted Grid (Geometric Inverse + Color Inverse)
-        try:
-            # Geometric Inverse
-            normalized_grid = apply_inverse_dihedral_transform(
-                predicted_grid, transform_index
-            )
-
-            # Color Inverse
-            if color_idx > 0 and color_idx < len(inverse_color_mappings):
-                normalized_grid = apply_color_permutation_to_grid(
-                    normalized_grid, inverse_color_mappings[color_idx]
-                )
-        except Exception:
-            stats["dropped_rect"] += 1
-            continue
-
-        if not is_rectangular_grid(normalized_grid):
-            stats["dropped_rect"] += 1
-            continue
-
-        stats["valid"] += 1
-        grid_key = _grid_to_tuple(normalized_grid)
-        counts: Dict[Tuple[Tuple[int, ...], ...], int] = stats["counts"]
-        counts[grid_key] = counts.get(grid_key, 0) + 1
-
-    selections: List[AAIVRSelection] = []
-    for (task_id, base_idx), stats in sorted(case_map.items()):
-        items = list(stats["counts"].items())
-        if items:
-            rng.shuffle(items)  # tie-break randomly before sorting by count
-            items.sort(key=lambda pair: pair[1], reverse=True)
-        ranked_candidates = [
-            {"grid": _tuple_to_grid(grid_key), "count": count}
-            for grid_key, count in items
-        ]
-        selected_outputs = [entry["grid"] for entry in ranked_candidates[:top_k]]
-
-        target_grid = stats.get("target_grid")
-        pass_at_k = None
-        if target_grid is not None:
-            pass_at_k = any(grid == target_grid for grid in selected_outputs)
-
-        selections.append(
-            AAIVRSelection(
-                task_id=task_id,
-                original_pair_index=base_idx,
-                selected_outputs=selected_outputs,
-                ranked_candidates=ranked_candidates,
-                num_generated=stats["generated"],
-                num_valid=stats["valid"],
-                discarded_non_rectangular=stats["dropped_rect"],
-                discarded_input_copies=stats["dropped_input"],
-                target_grid=target_grid,
-                pass_at_k=pass_at_k,
-            )
-        )
-
-    return selections
-
-
-# In utils.py
-
-
-def summarize_aaivr_pass_at_k(selections: Sequence[AAIVRSelection]) -> Dict[str, int]:
-    """Return counts for how many tasks have ALL their pairs in top-k."""
-    # Group by task_id
-    tasks: Dict[str, List[AAIVRSelection]] = {}
-    for sel in selections:
-        tasks.setdefault(sel.task_id, []).append(sel)
-
-    total_tasks = len(tasks)
-    solved_tasks = 0
-    failures = []
-
-    for task_id, pairs in tasks.items():
-        # A task is solved if ALL its pairs are solved (pass_at_k is True)
-        is_solved = True
-        pair_failures = []
-
-        for p in pairs:
-            if p.pass_at_k is None:
-                # Target missing or logic failed to find it
-                is_solved = False
-                pair_failures.append(
-                    f"Pair {p.original_pair_index}: Target missing/unknown"
-                )
-            elif not p.pass_at_k:
-                is_solved = False
-                if p.num_valid == 0:
-                    reason = f"No valid candidates generated (tried {p.num_generated})"
-                else:
-                    reason = "Top-k candidates incorrect"
-                pair_failures.append(f"Pair {p.original_pair_index}: {reason}")
-
-        if is_solved and len(pairs) > 0:
-            solved_tasks += 1
-        else:
-            failures.append(f"Task {task_id}: {', '.join(pair_failures)}")
-
-    # Print details as requested
-    if failures:
-        print(f"\nAAIVR Failures ({len(failures)}/{total_tasks} tasks):")
-        for f in failures:
-            print(f"  - {f}")
-
-    # Return structure compatible with 'hits'/'evaluated' expectations
-    # Evaluated now refers to Tasks, Hits to Solved Tasks
-    return {"evaluated": total_tasks, "hits": solved_tasks}
-
-
 DEFAULT_COLORS = [
     "#000000",  # 0 black
     "#0074D9",  # 1 blue
@@ -769,6 +455,321 @@ def plot_grids(
         fig.suptitle(title)
     plt.tight_layout()
     plt.show()
+
+
+_RUN_ARCHIVE_STATE_KEY = "_RUN_ARCHIVE_STATE"
+
+
+@dataclass
+class RunArchiveState:
+    src_dir: Path
+    zip_base: Path
+    local_zip: Path
+    mount_dir: Path
+    last_drive_zip: Optional[Path] = None
+
+
+def _build_archive_state(
+    cfg_name: str, root_folder: str, mount_folder: str
+) -> RunArchiveState:
+    src_dir = Path(f"/{root_folder}/mdlARC/runs")
+    zip_base = Path(f"/{root_folder}/mdlARC") / f"runs-{cfg_name}"
+    local_zip = zip_base.with_suffix(".zip")
+    mount_dir = Path(f"/{mount_folder}")
+    return RunArchiveState(
+        src_dir=src_dir,
+        zip_base=zip_base,
+        local_zip=local_zip,
+        mount_dir=mount_dir,
+    )
+
+
+def _export_archive_state(state: RunArchiveState, globals_dict: Dict[str, object]) -> None:
+    globals_dict[_RUN_ARCHIVE_STATE_KEY] = state
+    globals_dict["SRC_DIR"] = state.src_dir
+    globals_dict["ZIP_BASE"] = state.zip_base
+    globals_dict["LOCAL_ZIP"] = state.local_zip
+    globals_dict["MOUNT_DIR"] = state.mount_dir
+    globals_dict["LAST_DRIVE_ZIP"] = state.last_drive_zip
+
+
+def _find_latest_drive_zip(mount_dir: Path, cfg_name: str) -> Optional[Path]:
+    pattern = f"runs-{cfg_name}-*.zip"
+    matches = sorted(
+        mount_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    return matches[0] if matches else None
+
+
+def save_run_archive(
+    cfg_name: str,
+    root_folder: str,
+    mount_folder: str,
+    globals_dict: Optional[Dict[str, object]] = None,
+) -> RunArchiveState:
+    """Zip the runs folder and copy to the mount. Mirrors the notebook save cell."""
+    state = _build_archive_state(cfg_name, root_folder, mount_folder)
+    timestamp = datetime.now().strftime("%d%m%y-%H%M%S")
+    state.last_drive_zip = state.mount_dir / f"runs-{cfg_name}-{timestamp}.zip"
+
+    state.local_zip.unlink(missing_ok=True)
+
+    print(f"Zipping {state.src_dir} ...")
+    shutil.make_archive(str(state.zip_base), "zip", str(state.src_dir))
+
+    print(f"Copying to Drive: {state.last_drive_zip}")
+    shutil.copy2(str(state.local_zip), str(state.last_drive_zip))
+
+    state.local_zip.unlink(missing_ok=True)
+
+    if globals_dict is not None:
+        _export_archive_state(state, globals_dict)
+    return state
+
+
+def update_run_archive(
+    cfg_name: str,
+    root_folder: Optional[str] = None,
+    mount_folder: Optional[str] = None,
+    globals_dict: Optional[Dict[str, object]] = None,
+) -> RunArchiveState:
+    """Refresh the runs archive on the mount, deleting the previous zip if present."""
+    state = None
+    if globals_dict is not None:
+        state = globals_dict.get(_RUN_ARCHIVE_STATE_KEY)
+
+    if state is None:
+        if root_folder is None or mount_folder is None:
+            raise ValueError(
+                "root_folder and mount_folder are required if no archive state exists."
+            )
+        state = _build_archive_state(cfg_name, root_folder, mount_folder)
+
+    if state.last_drive_zip is None:
+        if globals_dict is not None:
+            last_drive_zip = globals_dict.get("LAST_DRIVE_ZIP")
+            if last_drive_zip:
+                state.last_drive_zip = Path(last_drive_zip)
+        if state.last_drive_zip is None:
+            state.last_drive_zip = _find_latest_drive_zip(state.mount_dir, cfg_name)
+
+    if state.last_drive_zip and Path(state.last_drive_zip).exists():
+        print(f"Deleting old Drive zip: {state.last_drive_zip}")
+        Path(state.last_drive_zip).unlink()
+
+    timestamp = datetime.now().strftime("%d%m%y-%H%M%S")
+    new_drive_zip = state.mount_dir / f"runs-{cfg_name}-{timestamp}.zip"
+
+    state.local_zip.unlink(missing_ok=True)
+
+    print(f"Zipping UPDATED {state.src_dir} ...")
+    shutil.make_archive(str(state.zip_base), "zip", str(state.src_dir))
+
+    print(f"Copying NEW zip to Drive: {new_drive_zip}")
+    shutil.copy2(str(state.local_zip), str(new_drive_zip))
+
+    state.last_drive_zip = new_drive_zip
+    state.local_zip.unlink(missing_ok=True)
+
+    if globals_dict is not None:
+        _export_archive_state(state, globals_dict)
+    return state
+
+
+def cleanup_memory(
+    globals_dict: Optional[Dict[str, object]] = None,
+    names: Sequence[str] = ("model", "dataset", "dataloader", "optimizer", "scheduler"),
+) -> None:
+    """Free common training objects and clear torch caches for inference."""
+    import gc
+
+    if globals_dict is not None:
+        for name in names:
+            if name in globals_dict:
+                del globals_dict[name]
+
+    if hasattr(torch, "_dynamo"):
+        torch._dynamo.reset()
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+    print(f"GPU cleaned. Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+
+
+def visualize_submissions(
+    submission_file: Path,
+    solutions_file: Optional[Path] = None,
+    mode: str = "submission",
+) -> None:
+    """Visualize submission attempts, optionally comparing against solutions."""
+    submission_path = Path(submission_file)
+    if not submission_path.exists():
+        print(f"Error: Could not find submission file: {submission_path}")
+        return
+
+    mode_normalized = "compare" if mode == "!" else mode
+    if mode_normalized not in ("compare", "submission"):
+        print(f"Error: Unknown visualization mode '{mode}'.")
+        return
+
+    if mode_normalized == "compare":
+        if solutions_file is None:
+            print("Error: Solutions file required for compare mode.")
+            return
+        solutions_path = Path(solutions_file)
+        if not solutions_path.exists():
+            print(
+                f"Error: Could not find solutions file for compare mode:\n{solutions_path}"
+            )
+            return
+
+        with submission_path.open("r") as handle:
+            subs = json.load(handle)
+        with solutions_path.open("r") as handle:
+            sols = json.load(handle)
+
+        print(f"Visualizing comparison for {len(subs)} tasks...")
+
+        for task_id, attempts_list in subs.items():
+            if task_id not in sols:
+                print(f"Warning: Task {task_id} not found in solutions.json")
+                continue
+
+            gt_grids = sols[task_id]
+            print(gt_grids)
+            for i, attempts in enumerate(attempts_list):
+                if i >= len(gt_grids):
+                    break
+
+                gt = gt_grids[i]
+                att1 = attempts.get("attempt_1")
+                att2 = attempts.get("attempt_2")
+
+                pass1 = (att1 == gt) if att1 is not None else False
+                pass2 = (att2 == gt) if att2 is not None else False
+
+                if pass1 and pass2:
+                    status = "Pass - both"
+                elif pass1:
+                    status = "Pass - 1"
+                elif pass2:
+                    status = "Pass - 2"
+                else:
+                    status = "Fail"
+
+                grids_to_plot = [gt]
+                if att1 is not None:
+                    grids_to_plot.append(att1)
+                if att2 is not None:
+                    grids_to_plot.append(att2)
+
+                header = f"Task: {task_id} | Pair: {i} | Status: {status}"
+                print(f"Plotting {header}")
+
+                try:
+                    plot_grids(grids_to_plot, title=header)
+                except Exception as exc:
+                    print(f"Skipping plot for {task_id} due to error: {exc}")
+    else:
+        with submission_path.open("r") as handle:
+            subs = json.load(handle)
+
+        print(f"Visualizing submissions for {len(subs)} tasks (no solutions)...")
+
+        for task_id, attempts_list in subs.items():
+            for i, attempts in enumerate(attempts_list):
+                att1 = attempts.get("attempt_1")
+                att2 = attempts.get("attempt_2")
+
+                grids_to_plot = []
+                if att1 is not None:
+                    grids_to_plot.append(att1)
+                if att2 is not None:
+                    grids_to_plot.append(att2)
+
+                if not grids_to_plot:
+                    print(f"Skipping {task_id} pair {i} (no attempts)")
+                    continue
+
+                header = f"Task: {task_id} | Pair: {i} | Status: submission-only"
+                print(f"Plotting {header}")
+
+                try:
+                    plot_grids(grids_to_plot, title=header)
+                except Exception as exc:
+                    print(f"Skipping plot for {task_id} due to error: {exc}")
+
+
+def visualize_eval_submissions(
+    eval_sub_folder: str,
+    submission_base: Path = Path("runs"),
+    solutions_file: Optional[Path] = None,
+    mode: str = "submission",
+) -> None:
+    """Helper to visualize submissions from a runs/<folder>/submission.json."""
+    submission_file = Path(submission_base) / eval_sub_folder / "submission.json"
+    visualize_submissions(
+        submission_file, solutions_file=solutions_file, mode=mode
+    )
+
+
+def score_arc_submission(
+    solutions_file: Path,
+    submission_file: Path,
+) -> Dict[str, object]:
+    """Score a submission.json against ARC solutions.json."""
+    solutions_path = Path(solutions_file)
+    submission_path = Path(submission_file)
+
+    if not solutions_path.exists():
+        raise FileNotFoundError(f"Solutions file not found: {solutions_path}")
+    if not submission_path.exists():
+        raise FileNotFoundError(f"Submission file not found: {submission_path}")
+
+    with solutions_path.open("r") as handle:
+        solutions = json.load(handle)
+
+    with submission_path.open("r") as handle:
+        submissions = json.load(handle)
+
+    calc_score = 0.0
+    max_total_score = len(solutions)
+    fully_solved_tasks: List[str] = []
+
+    for task_id, ground_truth_grids in solutions.items():
+        if task_id not in submissions:
+            continue
+
+        task_attempts = submissions[task_id]
+        num_pairs = len(ground_truth_grids)
+        pairs_solved = 0
+
+        for i in range(min(len(task_attempts), num_pairs)):
+            truth = ground_truth_grids[i]
+            attempts = task_attempts[i]
+            if attempts.get("attempt_1") == truth or attempts.get("attempt_2") == truth:
+                pairs_solved += 1
+
+        if num_pairs > 0:
+            calc_score += pairs_solved / num_pairs
+            if pairs_solved == num_pairs:
+                fully_solved_tasks.append(task_id)
+
+    percentage = 100 * (calc_score / max_total_score) if max_total_score > 0 else 0.0
+    print(
+        f"Official ARC style scoring: {calc_score}/{max_total_score} ({percentage}%)"
+    )
+    print(f"Fully correct tasks ({len(fully_solved_tasks)}):")
+    for task_id in fully_solved_tasks:
+        print(task_id)
+
+    return {
+        "score": calc_score,
+        "max_score": max_total_score,
+        "percentage": percentage,
+        "fully_solved_tasks": fully_solved_tasks,
+    }
 
 
 @dataclass

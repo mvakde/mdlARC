@@ -80,9 +80,48 @@ class BatchGridState:
         return positions.clone()
 
 
+def _select_next_token(
+    logits: torch.Tensor,
+    temperature: Optional[float] = None,
+    top_k: Optional[int] = None,
+) -> torch.Tensor:
+    last_logits = logits[:, -1, :]
+
+    if (temperature is None and top_k is None) or (
+        temperature is not None and temperature <= 0
+    ):
+        return torch.argmax(last_logits, dim=-1)
+
+    if temperature is None:
+        temperature = 1.0
+
+    use_top_k = top_k is not None and top_k > 0
+    if use_top_k:
+        top_k = int(top_k)
+        if top_k == 1:
+            return torch.argmax(last_logits, dim=-1)
+        top_k = min(top_k, last_logits.size(-1))
+        top_values, top_indices = torch.topk(last_logits, top_k, dim=-1)
+        scaled = (top_values / temperature).float()
+        probs = torch.softmax(scaled, dim=-1)
+        next_index = torch.multinomial(probs, num_samples=1)
+        return top_indices.gather(-1, next_index).squeeze(-1)
+
+    scaled = (last_logits / temperature).float()
+    probs = torch.softmax(scaled, dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
 @torch.inference_mode()
 def batched_greedy_generate(
-    model, prompts, example_ids, device, max_new_tokens=931, cached_positions=None
+    model,
+    prompts,
+    example_ids,
+    device,
+    max_new_tokens=931,
+    cached_positions=None,
+    temperature: Optional[float] = None,
+    top_k: Optional[int] = None,
 ):
     model.eval()
     model.to(dtype=torch.bfloat16)
@@ -118,8 +157,6 @@ def batched_greedy_generate(
         )
 
     # Calculate initial grid state
-    from inference import _derive_initial_state_from_prompt  # Import or paste logic
-
     initial_state, finished = _derive_initial_state_from_prompt(
         input_ids, prompt_positions, attention_mask
     )
@@ -202,8 +239,8 @@ def batched_greedy_generate(
         # Mark a new cudagraph step to avoid reusing outputs as inputs
         torch.compiler.cudagraph_mark_step_begin()
 
-        # Greedy decode
-        next_token = torch.argmax(logits[:, -1, :], dim=-1)
+        # Greedy decode unless sampling is enabled via temperature/top_k
+        next_token = _select_next_token(logits, temperature=temperature, top_k=top_k)
         next_token = torch.where(
             finished, torch.tensor(END_TOKEN_ID, device=device), next_token
         )
@@ -447,6 +484,8 @@ def _run_generation_batch(
     cached_positions: Sequence[Optional[torch.Tensor]],
     device: torch.device,
     max_new_tokens: int,
+    temperature: Optional[float] = None,
+    top_k: Optional[int] = None,
     target_output_tokens: Optional[Sequence[Sequence[int]]] = None,
 ) -> List[Dict[str, object]]:
     sequences = batched_greedy_generate(
@@ -456,6 +495,8 @@ def _run_generation_batch(
         device=device,
         max_new_tokens=max_new_tokens,
         cached_positions=cached_positions,
+        temperature=temperature,
+        top_k=top_k,
     )
     return _build_generation_results(
         sequences=sequences,
@@ -530,6 +571,8 @@ def run_split_inference(
     include_targets: bool = True,
     color_mappings: Optional[Sequence[Sequence[int]]] = None,
     color_apply_fn: Optional[Callable[[str], bool]] = None,
+    temperature: Optional[float] = None,
+    top_k: Optional[int] = None,
 ) -> List[Dict[str, object]]:
     solutions = _load_solutions_for_dataset(dataset) if include_targets else None
     examples = _gather_examples_for_split(
@@ -594,6 +637,8 @@ def run_split_inference(
             cached_positions=cached_positions,
             device=device,
             max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
             target_output_tokens=target_output_tokens if include_targets else None,
         )
 
@@ -608,113 +653,3 @@ def run_split_inference(
             all_results.append(res)
 
     return all_results
-
-
-def _has_correct_shape(
-    sequence: Sequence[int],
-    predicted_tokens: Sequence[int],
-    target_tokens: Sequence[int],
-) -> bool:
-    if not target_tokens:
-        return False
-    if len(predicted_tokens) != len(target_tokens):
-        return False
-
-    target_newlines = [
-        idx for idx, tok in enumerate(target_tokens) if tok == NEXT_LINE_TOKEN_ID
-    ]
-    predicted_newlines = [
-        idx for idx, tok in enumerate(predicted_tokens) if tok == NEXT_LINE_TOKEN_ID
-    ]
-    if target_newlines != predicted_newlines:
-        return False
-
-    try:
-        sep_idx = sequence.index(IO_SEPARATOR_TOKEN_ID)
-        end_idx = sequence.index(END_TOKEN_ID, sep_idx + 1)
-    except ValueError:
-        return False
-    return (end_idx - (sep_idx + 1)) == len(target_tokens)
-
-
-def _pixel_accuracy(
-    predicted_tokens: Sequence[int], target_tokens: Sequence[int]
-) -> Optional[float]:
-    predicted_digits = [tok for tok in predicted_tokens if 0 <= tok <= 9]
-    target_digits = [tok for tok in target_tokens if 0 <= tok <= 9]
-    if not target_digits or len(predicted_digits) != len(target_digits):
-        return None
-    correct = sum(1 for p, t in zip(predicted_digits, target_digits) if p == t)
-    return correct / len(target_digits)
-
-
-def summarize_split_results(results: Sequence[Dict[str, object]]) -> Dict[str, object]:
-    num_shape_correct = 0
-    num_fully_correct = 0
-    accuracies: List[float] = []
-    fully_correct_results: List[Dict[str, object]] = []
-
-    for res in results:
-        predicted_tokens = res.get("output_tokens", [])
-        target_tokens = res.get("target_output_tokens", [])
-        sequence = res.get("sequence", [])
-        shape_ok = _has_correct_shape(sequence, predicted_tokens, target_tokens)
-        res["shape_correct"] = shape_ok
-        if not shape_ok:
-            continue
-        num_shape_correct += 1
-        acc = _pixel_accuracy(predicted_tokens, target_tokens)
-        if acc is not None:
-            res["pixel_accuracy"] = acc
-            accuracies.append(acc)
-        if predicted_tokens == target_tokens:
-            num_fully_correct += 1
-            fully_correct_results.append(res)
-
-    avg_pixel_accuracy = sum(accuracies) / len(accuracies) if accuracies else 0.0
-    return {
-        "total_sequences": len(results),
-        "num_shape_correct": num_shape_correct,
-        "avg_pixel_accuracy": avg_pixel_accuracy,
-        "num_fully_correct": num_fully_correct,
-        "fully_correct_results": fully_correct_results,
-    }
-
-
-def evaluate_model_on_dataset(
-    model: TinyTransformer,
-    dataset,
-    device: torch.device,
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
-    batch_size: int = 16,
-    splits: Sequence[str] = ("train", "test"),
-    log_prompts: bool = False,
-    color_mappings: Optional[Sequence[Sequence[int]]] = None,
-    color_apply_fn: Optional[Callable[[str], bool]] = None,
-    task_ids: Optional[Sequence[str]] = None,
-    include_targets: bool = True,
-) -> Dict[str, Dict[str, object]]:
-    evaluation: Dict[str, Dict[str, object]] = {}
-    # Determine if we should look for targets for this specific split
-    # Usually we want targets for 'train' (to debug) but maybe not for 'test' if doing blind submission
-    split_include_targets = include_targets
-
-    # If the dataset split itself doesn't have outputs (like test) and we forced include_targets=True,
-    # run_split_inference will look for solutions.json. If we forced False, it won't.
-    for split in splits:
-        split_results = run_split_inference(
-            model=model,
-            dataset=dataset,
-            split=split,
-            device=device,
-            batch_size=batch_size,
-            max_new_tokens=max_new_tokens,
-            log_prompts=log_prompts,
-            include_targets=split_include_targets,
-            color_mappings=color_mappings,
-            color_apply_fn=color_apply_fn,
-            task_ids=task_ids,
-        )
-        summary = summarize_split_results(split_results)
-        evaluation[split] = {"results": split_results, "summary": summary}
-    return evaluation

@@ -34,6 +34,18 @@ class TinyTransformerConfig:
             raise ValueError("num_examples must be >= 1.")
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        rms = hidden_states.pow(2).mean(dim=-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(rms + self.eps)
+        return hidden_states * self.weight
+
+
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, config: TinyTransformerConfig) -> None:
         super().__init__()
@@ -213,24 +225,24 @@ class MultiHeadSelfAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, config: TinyTransformerConfig) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(config.d_model, config.d_ff),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.d_ff, config.d_model),
-            nn.Dropout(config.dropout),
-        )
+        self.fc_in = nn.Linear(config.d_model, config.d_ff * 2)
+        self.fc_out = nn.Linear(config.d_ff, config.d_model)
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.net(hidden_states)
+        hidden_states, gate = self.fc_in(hidden_states).chunk(2, dim=-1)
+        hidden_states = hidden_states * F.silu(gate)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.fc_out(hidden_states)
+        return self.dropout(hidden_states)
 
 
 class TransformerBlock(nn.Module):
     def __init__(self, config: TinyTransformerConfig) -> None:
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.d_model)
+        self.ln_1 = RMSNorm(config.d_model)
         self.attention = MultiHeadSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.d_model)
+        self.ln_2 = RMSNorm(config.d_model)
         self.ff = FeedForward(config)
 
     def forward(
@@ -331,7 +343,7 @@ class TinyTransformer(nn.Module):
         self.blocks = nn.ModuleList(
             [TransformerBlock(config) for _ in range(config.n_layers)]
         )
-        self.norm = nn.LayerNorm(config.d_model)
+        self.norm = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         self.apply(self._init_weights)
@@ -580,7 +592,7 @@ class TinyTransformer(nn.Module):
 class RotaryEmbedding3D(nn.Module):
     """3D Rotary Positional Embedding applied to Q/K using precomputed lookups.
 
-    Splits head_dim into in a 6:6:1 ratio since max size is (30,30,5). Precomputes cos/sin tables
+    Splits head_dim into three even slices (x,y,z). Precomputes cos/sin tables
     for fixed coordinate ranges (x:0-32, y:0-32, z:0-8) to speed up inference.
     """
 
@@ -591,13 +603,11 @@ class RotaryEmbedding3D(nn.Module):
         self.head_dim = head_dim
         self.base = base
 
-        # Distribute pairs across 3 axes using a 6:6:1 ratio (x:y:z).
-        # z gets ceil(1/13) of pairs; the remainder is split evenly between x/y.
+        # Distribute pairs across 3 axes as evenly as possible
         n_pairs = head_dim // 2
-        pz = (n_pairs + 12) // 13
-        remaining = n_pairs - pz
-        px = remaining // 2
-        py = remaining - px
+        px = n_pairs // 3
+        py = n_pairs // 3
+        pz = n_pairs - px - py
         self.d_x = px * 2
         self.d_y = py * 2
         self.d_z = pz * 2

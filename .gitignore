@@ -7,3 +7,4 @@ misc/
 newruns/
 assets_clean/
 runfolder/
+.env
