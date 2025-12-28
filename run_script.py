@@ -29,6 +29,7 @@ RUN_TRAINING = True
 CLEANUP_BEFORE_EVAL = True
 RUN_EVALUATION = True
 RUN_VISUALIZATION = False
+RUN_SCORING = True
 
 # Archive runs/ (zip + copy) for persistence.
 ENABLE_ARCHIVE = False
@@ -94,6 +95,10 @@ EVAL_LOG_CORRECT_GRIDS = False
 EVAL_SUB_FOLDER = "eval_100color_both"
 VIS_MODE = "!"  # "!" = compare vs solutions, "submission" = attempts-only
 VIS_SOLUTIONS_FILE = "assets/solutions.json"
+
+# Scoring config (mirrors final notebook cell)
+SCORE_SOLUTIONS_FILE = Path("assets/solutions.json")
+SCORE_SUBMISSION_FILE = Path(f"runs/{EVAL_SUB_FOLDER}/submission.json")
 
 
 def _run_command(cmd: List[str], cwd: Optional[Path] = None) -> None:
@@ -207,6 +212,9 @@ def main() -> None:
             task_ids=EVAL_TASK_IDS,
             log_correct_grids=EVAL_LOG_CORRECT_GRIDS,
         )
+
+    if RUN_EVALUATION and RUN_SCORING:
+        utils.score_arc_submission(SCORE_SOLUTIONS_FILE, SCORE_SUBMISSION_FILE)
 
     if ENABLE_ARCHIVE and UPDATE_ARCHIVE_AFTER_EVAL:
         Path(f"/{MOUNT_FOLDER}").mkdir(parents=True, exist_ok=True)
