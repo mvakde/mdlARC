@@ -3,7 +3,7 @@ import json
 import sys
 from pathlib import Path
 from time import perf_counter
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -215,6 +215,7 @@ def run_evaluation_pipeline(
     task_ids: Optional[Sequence[str]] = None,
     log_correct_grids: bool = False,
     state: Optional[Dict[str, object]] = None,
+    is_dihedral_augmented: Optional[bool] = None,
 ) -> Tuple[
     Dict[str, Dict[str, object]],
     List[aaivr.AAIVRSelection],
@@ -308,7 +309,11 @@ def run_evaluation_pipeline(
     epochs = getattr(cfg, "epochs", None)
     epoch_label = f"{epochs}ep" if epochs is not None else "eval"
     log_eval(f"\n-- {epoch_label} {max_color_augments}color --\n")
-    data_path_str = str(dataset_path)
+    dihedral_augmented = (
+        is_dihedral_augmented
+        if is_dihedral_augmented is not None
+        else getattr(cfg, "dihedral_augmented", False)
+    )
 
     for split in splits:
         summary = evaluation.get(split, {}).get("summary", {})
@@ -324,9 +329,7 @@ def run_evaluation_pipeline(
         if log_correct_grids and fully_correct > 0:
             log_eval(f"  [Correct Grids Details for {split}]")
 
-            is_dihedral_split = (
-                split == "train" and "dihedral" in data_path_str
-            ) or (split == "test" and "dihedral_both" in data_path_str)
+            is_dihedral_split = dihedral_augmented
 
             correct_results = summary.get("fully_correct_results", [])
             for res in correct_results:
@@ -351,7 +354,7 @@ def run_evaluation_pipeline(
 
     try:
         test_results = evaluation.get("test", {}).get("results", [])
-        dataset_has_dihedral_augments = "dihedral_both" in str(cfg.data_path)
+        dataset_has_dihedral_augments = dihedral_augmented
 
         aaivr_results: List[aaivr.AAIVRSelection] = []
         if test_results:
@@ -396,7 +399,9 @@ def run_evaluation_pipeline(
 
 def run_evaluation_configs(
     cfg: argparse.Namespace,
-    eval_configs: Sequence[Tuple[str, int, Path]],
+    eval_configs: Sequence[
+        Union[Tuple[str, int, Path], Tuple[str, int, Path, bool]]
+    ],
     *,
     eval_batch_size: int = 1300,
     splits: Sequence[str] = ("test",),
@@ -411,7 +416,17 @@ def run_evaluation_configs(
     state: Dict[str, object] = {}
     results: List[Tuple[str, Dict[str, Dict[str, object]], Path]] = []
 
-    for name, aug_count, data_path in eval_configs:
+    for config in eval_configs:
+        if len(config) == 3:
+            name, aug_count, data_path = config
+            dihedral_augmented = getattr(cfg, "dihedral_augmented", False)
+        elif len(config) == 4:
+            name, aug_count, data_path, dihedral_augmented = config
+        else:
+            raise ValueError(
+                "eval_configs entries must be (name, aug_count, data_path) or "
+                "(name, aug_count, data_path, dihedral_augmented)."
+            )
         t_start = perf_counter()
         evaluation, _, submission_path, state = run_evaluation_pipeline(
             cfg,
@@ -424,6 +439,7 @@ def run_evaluation_configs(
             include_targets=include_targets,
             task_ids=task_ids,
             log_correct_grids=log_correct_grids,
+            is_dihedral_augmented=dihedral_augmented,
             state=state,
         )
         t_duration = perf_counter() - t_start

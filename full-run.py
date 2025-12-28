@@ -54,6 +54,7 @@ ARGS = {
     "save_path": Path("runs/tiny.pt"),
     "checkpoint_path": None,  # Path("runs/tiny.pt") to resume
     "data_path": Path("assets/challenges_dihedral_both.json"),
+    "dihedral_augmented": True,
     # hyperparameters
     "epochs": 101,
     "batch_size": 32,
@@ -83,7 +84,7 @@ ARGS = {
 # Evaluation config
 PATH_BOTH = ARGS["data_path"]
 EVAL_CONFIGS = [
-    ("eval_100color_both", 100, PATH_BOTH),
+    ("eval_100color_both", 100, PATH_BOTH, True),
 ]
 EVAL_BATCH_SIZE = 1300
 EVAL_SPLITS = ["test"]

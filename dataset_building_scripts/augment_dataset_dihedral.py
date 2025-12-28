@@ -105,7 +105,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         default=None,
-        help="Output path (defaults to challenges_dihedral_both.json next to input). For now, you need dihedral_both in the name because submission construction depends on it (I am stupid, will fix)",
+        help="Output path (defaults to challenges_dihedral_both.json next to input).",
     )
     args = parser.parse_args()
 
