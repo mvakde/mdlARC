@@ -3,7 +3,7 @@ import json
 import sys
 from pathlib import Path
 from time import perf_counter
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -15,7 +15,7 @@ from utils import (
     END_TOKEN_ID,
     IO_SEPARATOR_TOKEN_ID,
     NEXT_LINE_TOKEN_ID,
-    generate_color_mapping_tensors,
+    generate_task_color_mappings,
 )
 
 
@@ -99,6 +99,7 @@ def evaluate_model_on_dataset(
     splits: Sequence[str] = ("train", "test"),
     log_prompts: bool = False,
     color_mappings: Optional[Sequence[Sequence[int]]] = None,
+    color_mappings_by_task: Optional[Dict[str, Sequence[Sequence[int]]]] = None,
     color_apply_fn: Optional[Callable[[str], bool]] = None,
     task_ids: Optional[Sequence[str]] = None,
     include_targets: bool = True,
@@ -123,6 +124,7 @@ def evaluate_model_on_dataset(
             log_prompts=log_prompts,
             include_targets=split_include_targets,
             color_mappings=color_mappings,
+            color_mappings_by_task=color_mappings_by_task,
             color_apply_fn=color_apply_fn,
             task_ids=task_ids,
             temperature=temperature,
@@ -213,6 +215,7 @@ def run_evaluation_pipeline(
     task_ids: Optional[Sequence[str]] = None,
     log_correct_grids: bool = False,
     state: Optional[Dict[str, object]] = None,
+    is_dihedral_augmented: Optional[bool] = None,
 ) -> Tuple[
     Dict[str, Dict[str, object]],
     List[aaivr.AAIVRSelection],
@@ -278,9 +281,13 @@ def run_evaluation_pipeline(
     color_mappings_eval = None
     color_apply_fn = None
     if cfg.enable_color_aug_eval and cfg.max_color_augments_eval > 0:
-        color_seed = getattr(cfg, "color_aug_seed", None) or cfg.seed
-        color_mappings_eval = generate_color_mapping_tensors(
-            cfg.max_color_augments_eval, color_seed
+        color_seed = getattr(cfg, "color_aug_seed_eval", None)
+        if color_seed is None:
+            color_seed = getattr(cfg, "color_aug_seed", None)
+        if color_seed is None:
+            color_seed = cfg.seed
+        color_mappings_eval = generate_task_color_mappings(
+            dataset.task_input_colors, cfg.max_color_augments_eval, int(color_seed)
         )
         color_apply_fn = lambda split: True
 
@@ -293,7 +300,7 @@ def run_evaluation_pipeline(
         temperature=getattr(cfg, "inference_temperature", None),
         top_k=getattr(cfg, "inference_top_k", None),
         splits=splits,
-        color_mappings=color_mappings_eval,
+        color_mappings_by_task=color_mappings_eval,
         color_apply_fn=color_apply_fn,
         task_ids=task_ids,
         include_targets=include_targets,
@@ -302,7 +309,11 @@ def run_evaluation_pipeline(
     epochs = getattr(cfg, "epochs", None)
     epoch_label = f"{epochs}ep" if epochs is not None else "eval"
     log_eval(f"\n-- {epoch_label} {max_color_augments}color --\n")
-    data_path_str = str(dataset_path)
+    dihedral_augmented = (
+        is_dihedral_augmented
+        if is_dihedral_augmented is not None
+        else getattr(cfg, "dihedral_augmented", False)
+    )
 
     for split in splits:
         summary = evaluation.get(split, {}).get("summary", {})
@@ -318,9 +329,7 @@ def run_evaluation_pipeline(
         if log_correct_grids and fully_correct > 0:
             log_eval(f"  [Correct Grids Details for {split}]")
 
-            is_dihedral_split = (
-                split == "train" and "dihedral" in data_path_str
-            ) or (split == "test" and "dihedral_both" in data_path_str)
+            is_dihedral_split = dihedral_augmented
 
             correct_results = summary.get("fully_correct_results", [])
             for res in correct_results:
@@ -345,15 +354,14 @@ def run_evaluation_pipeline(
 
     try:
         test_results = evaluation.get("test", {}).get("results", [])
-        dataset_has_dihedral_augments = "dihedral_both" in str(cfg.data_path)
+        dataset_has_dihedral_augments = dihedral_augmented
 
         aaivr_results: List[aaivr.AAIVRSelection] = []
         if test_results:
             aaivr_results = aaivr.run_aaivr_on_results(
                 test_results,
                 is_dihedral_augmented=dataset_has_dihedral_augments,
-                color_aug_seed=getattr(cfg, "color_aug_seed", None),
-                max_color_augments=cfg.max_color_augments_eval,
+                color_mappings_by_task=color_mappings_eval,
             )
         else:
             print("No test results for AAIVR.")
@@ -391,7 +399,9 @@ def run_evaluation_pipeline(
 
 def run_evaluation_configs(
     cfg: argparse.Namespace,
-    eval_configs: Sequence[Tuple[str, int, Path]],
+    eval_configs: Sequence[
+        Union[Tuple[str, int, Path], Tuple[str, int, Path, bool]]
+    ],
     *,
     eval_batch_size: int = 1300,
     splits: Sequence[str] = ("test",),
@@ -406,7 +416,17 @@ def run_evaluation_configs(
     state: Dict[str, object] = {}
     results: List[Tuple[str, Dict[str, Dict[str, object]], Path]] = []
 
-    for name, aug_count, data_path in eval_configs:
+    for config in eval_configs:
+        if len(config) == 3:
+            name, aug_count, data_path = config
+            dihedral_augmented = getattr(cfg, "dihedral_augmented", False)
+        elif len(config) == 4:
+            name, aug_count, data_path, dihedral_augmented = config
+        else:
+            raise ValueError(
+                "eval_configs entries must be (name, aug_count, data_path) or "
+                "(name, aug_count, data_path, dihedral_augmented)."
+            )
         t_start = perf_counter()
         evaluation, _, submission_path, state = run_evaluation_pipeline(
             cfg,
@@ -419,6 +439,7 @@ def run_evaluation_configs(
             include_targets=include_targets,
             task_ids=task_ids,
             log_correct_grids=log_correct_grids,
+            is_dihedral_augmented=dihedral_augmented,
             state=state,
         )
         t_duration = perf_counter() - t_start

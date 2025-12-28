@@ -570,6 +570,7 @@ def run_split_inference(
     log_prompts: bool = False,
     include_targets: bool = True,
     color_mappings: Optional[Sequence[Sequence[int]]] = None,
+    color_mappings_by_task: Optional[Dict[str, Sequence[Sequence[int]]]] = None,
     color_apply_fn: Optional[Callable[[str], bool]] = None,
     temperature: Optional[float] = None,
     top_k: Optional[int] = None,
@@ -586,14 +587,18 @@ def run_split_inference(
     if not examples:
         return []
 
-    color_variants: List[Optional[Sequence[int]]] = (
-        list(color_mappings) if color_mappings is not None else [None]
-    )
-
     # Flatten the workload: Create a job for every (Example, ColorMapping) pair
     work_items = []
-    for c_idx, mapping in enumerate(color_variants):
-        for ex in examples:
+    global_mappings = list(color_mappings) if color_mappings is not None else None
+    for ex in examples:
+        task_mappings = None
+        if color_mappings_by_task is not None:
+            task_mappings = color_mappings_by_task.get(getattr(ex, "task_id", None))
+        elif global_mappings is not None:
+            task_mappings = global_mappings
+        if not task_mappings:
+            task_mappings = [None]
+        for c_idx, mapping in enumerate(task_mappings):
             work_items.append((ex, c_idx, mapping))
 
     # Sort ALL work items by sequence length (descending) to minimize padding.
@@ -648,7 +653,7 @@ def run_split_inference(
 
         # Attach the correct color index to each result and collect
         for res, c_idx in zip(batch_results, batch_c_indices):
-            if color_mappings is not None:
+            if color_mappings_by_task is not None or color_mappings is not None:
                 res["color_permutation_index"] = c_idx
             all_results.append(res)
 

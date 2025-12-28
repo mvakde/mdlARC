@@ -134,6 +134,7 @@ def run_aaivr_on_results(
     discard_input_copies: bool = True,
     rng: Optional[random.Random] = None,
     is_dihedral_augmented: bool = False,
+    color_mappings_by_task: Optional[Dict[str, Sequence[Sequence[int]]]] = None,
     color_aug_seed: Optional[int] = None,
     max_color_augments: int = 0,
 ) -> List[AAIVRSelection]:
@@ -146,15 +147,28 @@ def run_aaivr_on_results(
     case_map: Dict[Tuple[str, int], Dict[str, object]] = {}
 
     # 1. Pre-calculate Inverse Color Mappings
-    inverse_color_mappings: List[List[int]] = []
-    if max_color_augments > 0:
+    inverse_color_mappings_by_task: Dict[str, List[List[int]]] = {}
+    inverse_color_mappings_global: List[List[int]] = []
+    if color_mappings_by_task is not None:
+        for task_id, mappings in color_mappings_by_task.items():
+            inv_list: List[List[int]] = []
+            for mapping in mappings:
+                fwd = (
+                    mapping
+                    if isinstance(mapping, torch.Tensor)
+                    else torch.tensor(mapping, dtype=torch.long)
+                )
+                inv = torch.zeros_like(fwd)
+                inv[fwd] = torch.arange(len(fwd), dtype=torch.long, device=fwd.device)
+                inv_list.append(inv.tolist())
+            inverse_color_mappings_by_task[task_id] = inv_list
+    elif max_color_augments > 0:
         seed = color_aug_seed if color_aug_seed is not None else 42
         forward_tensors = generate_color_mapping_tensors(max_color_augments, seed)
         for fwd in forward_tensors:
-            # Create inverse: if fwd[x] = y, then inv[y] = x
             inv = torch.zeros_like(fwd)
-            inv[fwd] = torch.arange(len(fwd), dtype=torch.long)
-            inverse_color_mappings.append(inv.tolist())
+            inv[fwd] = torch.arange(len(fwd), dtype=torch.long, device=fwd.device)
+            inverse_color_mappings_global.append(inv.tolist())
 
     for res in results:
         task_id = res.get("task_id")
@@ -200,9 +214,13 @@ def run_aaivr_on_results(
                     target_grid, transform_index
                 )
                 # Color Inverse
-                if color_idx > 0 and color_idx < len(inverse_color_mappings):
+                if color_mappings_by_task is not None:
+                    inv_list = inverse_color_mappings_by_task.get(task_id, [])
+                else:
+                    inv_list = inverse_color_mappings_global
+                if inv_list and color_idx > 0 and color_idx < len(inv_list):
                     norm_target = apply_color_permutation_to_grid(
-                        norm_target, inverse_color_mappings[color_idx]
+                        norm_target, inv_list[color_idx]
                     )
 
                 if is_rectangular_grid(norm_target):
@@ -226,9 +244,13 @@ def run_aaivr_on_results(
             )
 
             # Color Inverse
-            if color_idx > 0 and color_idx < len(inverse_color_mappings):
+            if color_mappings_by_task is not None:
+                inv_list = inverse_color_mappings_by_task.get(task_id, [])
+            else:
+                inv_list = inverse_color_mappings_global
+            if inv_list and color_idx > 0 and color_idx < len(inv_list):
                 normalized_grid = apply_color_permutation_to_grid(
-                    normalized_grid, inverse_color_mappings[color_idx]
+                    normalized_grid, inv_list[color_idx]
                 )
         except Exception:
             stats["dropped_rect"] += 1

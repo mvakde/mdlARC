@@ -14,9 +14,9 @@ from tinytransformer import TinyTransformer, TinyTransformerConfig
 from utils import (
     ARCExampleDataset,
     MAX_SEQ_LEN,
-    ColorAugmentor,
     create_dataloader,
-    generate_color_mapping_tensors,
+    generate_task_color_mappings,
+    TaskColorAugmentor,
     tokens_to_string,
 )
 
@@ -104,24 +104,36 @@ def _restore_rng_state(state: Optional[Dict[str, Any]], device: torch.device) ->
             pass
 
 
+def _select_color_aug_seed(args: argparse.Namespace, is_eval: bool) -> int:
+    if is_eval:
+        seed = getattr(args, "color_aug_seed_eval", None)
+        if seed is None:
+            seed = getattr(args, "color_aug_seed", None)
+    else:
+        seed = getattr(args, "color_aug_seed", None)
+    if seed is None:
+        seed = args.seed
+    return int(seed)
+
+
 def _build_color_augmentor(
-    args: argparse.Namespace, is_eval: bool
-) -> Optional[ColorAugmentor]:
+    args: argparse.Namespace, dataset: ARCExampleDataset, is_eval: bool
+) -> Optional[TaskColorAugmentor]:
     flag_name = "enable_color_aug_eval" if is_eval else "enable_color_aug_train"
     max_name = "max_color_augments_eval" if is_eval else "max_color_augments_train"
     enabled = bool(getattr(args, flag_name, False))
     max_augments = int(getattr(args, max_name, 0) or 0)
     if not enabled or max_augments <= 0:
         return None
-    seed = getattr(args, "color_aug_seed", None)
-    if seed is None:
-        seed = args.seed
-    seed = int(seed)
-    mappings = generate_color_mapping_tensors(max_augments, seed)
-    if not mappings:
+    seed = _select_color_aug_seed(args, is_eval)
+    mappings_by_task = generate_task_color_mappings(
+        dataset.task_input_colors, max_augments, seed
+    )
+    if not mappings_by_task:
         return None
-    return ColorAugmentor(
-        mappings=mappings, apply_to_test_split=True if is_eval else False, seed=seed
+    return TaskColorAugmentor(
+        mappings_by_task=mappings_by_task,
+        apply_to_test_split=True if is_eval else False,
     )
 
 
@@ -159,32 +171,22 @@ def train_one_epoch(
         if (
             color_augmentor is not None
             and not color_aug_in_collate
-            and color_augmentor.num_permutations > 0
+            and color_augmentor.max_permutations > 0
         ):
             splits = batch.get("splits")
-            if splits:
-                # Vectorized color augmentation
-                # 1. Retrieve the active augmentation map for this epoch (V,)
-                aug_map = color_augmentor.mappings[color_augmentor.current_index].to(
-                    device
-                )
-                vocab_size = aug_map.size(0)
-
-                # 2. Determine which examples in the batch should be augmented
-                # This creates a boolean mask (B, 1) to select maps
-                should_aug = torch.tensor(
-                    [
-                        (color_augmentor.mapping_for_split(s) is not None)
-                        for s in splits
-                    ],
-                    device=device,
-                ).reshape(-1, 1)
-
-                if should_aug.any():
-                    # 3. Construct batch maps (B, V) and gather
-                    # If augment: use aug_map; Else: use identity
-                    identity = torch.arange(vocab_size, device=device)
-                    batch_maps = torch.where(should_aug, aug_map, identity)
+            task_ids = batch.get("task_ids")
+            if splits and task_ids:
+                mappings = [
+                    color_augmentor.mapping_for_task(task_id, split)
+                    for task_id, split in zip(task_ids, splits)
+                ]
+                active_mapping = next((m for m in mappings if m is not None), None)
+                if active_mapping is not None:
+                    vocab_size = active_mapping.size(0)
+                    identity = torch.arange(vocab_size, dtype=torch.long)
+                    batch_maps = torch.stack(
+                        [m if m is not None else identity for m in mappings]
+                    ).to(device)
 
                     # Apply map to all tokens: input_ids[b, t] = batch_maps[b, input_ids[b, t]]
                     input_ids = torch.gather(batch_maps, 1, input_ids)
@@ -397,14 +399,14 @@ def build_model_and_data(
             task_whitelist=task_whitelist,
         )
 
-    color_augmentor = _build_color_augmentor(args, is_eval=is_eval)
+    color_augmentor = _build_color_augmentor(args, dataset, is_eval=is_eval)
     if color_augmentor is not None:
-        dataset.color_permutation_mappings = color_augmentor.mappings
+        dataset.color_task_mappings = color_augmentor.mappings_by_task
         dataset.color_aug_apply_to_test = color_augmentor.apply_to_test_split
 
     # We always recreate the dataloader because batch_size might have changed in args
     collate_color_mapper = (
-        color_augmentor.mapping_for_split
+        color_augmentor.mapping_for_example
         if color_augmentor is not None and getattr(args, "num_workers", 0) == 0
         else None
     )
@@ -616,11 +618,10 @@ def train_model(
 
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
-        if color_augmentor is not None and color_augmentor.num_permutations > 0:
-            color_augmentor.set_index(epoch)
+        if color_augmentor is not None and color_augmentor.max_permutations > 0:
+            color_augmentor.set_epoch(epoch)
             print(
-                f"Using color permutation {color_augmentor.current_index + 1}"
-                f"/{color_augmentor.num_permutations} for this epoch."
+                f"Using per-task color permutations (max {color_augmentor.max_permutations})."
             )
 
         # Run Training

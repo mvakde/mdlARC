@@ -7,7 +7,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import List, Optional
 
-# Python port of run-script.ipynb for non-notebook runs.
+# Python port of interactive-run.ipynb for non-notebook runs.
 
 # ---------------------------
 # Config (edit in-place)
@@ -41,7 +41,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 ROOT_FOLDER = str(PROJECT_ROOT.parent).lstrip("/")
 MOUNT_FOLDER = str((PROJECT_ROOT / "runs_archive").resolve()).lstrip("/")
 
-# Model + training config (mirrors run-script.ipynb).
+# Model + training config (mirrors interactive-run.ipynb).
 ARGS = {
     # run config
     "num_workers": 0,
@@ -54,6 +54,7 @@ ARGS = {
     "save_path": Path("runs/tiny.pt"),
     "checkpoint_path": None,  # Path("runs/tiny.pt") to resume
     "data_path": Path("assets/challenges_dihedral_both.json"),
+    "dihedral_augmented": True,
     # hyperparameters
     "epochs": 101,
     "batch_size": 32,
@@ -61,6 +62,7 @@ ARGS = {
     "enable_color_aug_train": True,
     "max_color_augments_train": 100,
     "color_aug_seed": 42,
+    "color_aug_seed_eval": None,
     "lr": 3e-4,
     "weight_decay": 0.01,
     "grad_clip": 1.0,
@@ -82,7 +84,7 @@ ARGS = {
 # Evaluation config
 PATH_BOTH = ARGS["data_path"]
 EVAL_CONFIGS = [
-    ("eval_100color_both", 100, PATH_BOTH),
+    ("eval_100color_both", 100, PATH_BOTH, True),
 ]
 EVAL_BATCH_SIZE = 1300
 EVAL_SPLITS = ["test"]
@@ -129,9 +131,9 @@ def _build_datasets() -> None:
 
 def _sanitize_repo(project_root: Path) -> None:
     targets = [
-        project_root / "run-script.ipynb",
-        project_root / "sanitised-env-run-script.ipynb",
-        project_root / "ultra-sanitised-env-run-script.ipynb",
+        project_root / "interactive-run.ipynb",
+        project_root / "clean-env-run.ipynb",
+        project_root / "max-clean-env-run.ipynb",
         project_root / "dataset_building_scripts",
         project_root / "readme.md",
         project_root / "img",

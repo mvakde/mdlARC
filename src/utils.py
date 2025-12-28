@@ -1,4 +1,5 @@
 import json
+import hashlib
 import random
 import math
 import functools
@@ -7,7 +8,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Set
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
@@ -92,6 +93,108 @@ def generate_color_mapping_tensors(
 ) -> List[torch.Tensor]:
     perms = generate_color_permutations(max_permutations, seed)
     return [color_permutation_to_mapping(perm) for perm in perms]
+
+
+def _normalize_input_colors(colors: Iterable[int]) -> List[int]:
+    return sorted({int(c) for c in colors if 1 <= int(c) <= 9})
+
+
+def extract_task_input_colors(task: Dict[str, object]) -> List[int]:
+    """Return sorted unique colors (1-9) present in ANY input grid for a task."""
+    colors: Set[int] = set()
+    for split in ("train", "test"):
+        pairs = task.get(split, [])
+        for pair in pairs:
+            grid = pair.get("input", [])
+            for row in grid:
+                for val in row:
+                    val_i = int(val)
+                    if 1 <= val_i <= 9:
+                        colors.add(val_i)
+    return sorted(colors)
+
+
+def _stable_hash(text: str) -> int:
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "little")
+
+
+def _derive_task_seed(base_seed: int, task_id: str) -> int:
+    return (int(base_seed) + _stable_hash(task_id)) % (2**32)
+
+
+def generate_color_permutations_for_subset(
+    colors: Sequence[int], max_permutations: int, seed: int
+) -> List[Tuple[int, ...]]:
+    """Return up to `max_permutations` unique shuffles of the given color subset."""
+    if max_permutations <= 0:
+        return []
+    colors = _normalize_input_colors(colors)
+    if not colors:
+        return [tuple()]
+    rng = random.Random(seed)
+    identity = tuple(colors)
+    permutations: List[Tuple[int, ...]] = [identity]
+    seen = {identity}
+    limit = math.factorial(len(colors))
+    target = min(max_permutations, limit)
+    if target == 1:
+        return permutations
+
+    if target == limit:
+        all_perms = list(itertools.permutations(colors))
+        rng.shuffle(all_perms)
+        deduped = [identity]
+        for perm in all_perms:
+            if perm == identity:
+                continue
+            deduped.append(perm)
+        return deduped[:target]
+
+    while len(permutations) < target:
+        perm = tuple(rng.sample(colors, len(colors)))
+        if perm in seen:
+            continue
+        seen.add(perm)
+        permutations.append(perm)
+    return permutations
+
+
+def color_subset_permutation_to_mapping(
+    colors: Sequence[int], perm: Sequence[int]
+) -> torch.Tensor:
+    """Build a token-id mapping tensor for a specific subset permutation."""
+    mapping = torch.arange(VOCAB_SIZE, dtype=torch.long)
+    for src, dst in zip(colors, perm):
+        mapping[int(src)] = int(dst)
+    return mapping
+
+
+def generate_task_color_mapping_tensors(
+    input_colors: Sequence[int], max_permutations: int, seed: int
+) -> List[torch.Tensor]:
+    if max_permutations <= 0:
+        return []
+    colors = _normalize_input_colors(input_colors)
+    perms = generate_color_permutations_for_subset(colors, max_permutations, seed)
+    return [color_subset_permutation_to_mapping(colors, perm) for perm in perms]
+
+
+def generate_task_color_mappings(
+    task_input_colors: Dict[str, Sequence[int]],
+    max_permutations: int,
+    seed: int,
+) -> Dict[str, List[torch.Tensor]]:
+    if max_permutations <= 0:
+        return {}
+    mappings_by_task: Dict[str, List[torch.Tensor]] = {}
+    for task_id, colors in task_input_colors.items():
+        task_seed = _derive_task_seed(seed, task_id)
+        mappings = generate_task_color_mapping_tensors(
+            colors, max_permutations, task_seed
+        )
+        mappings_by_task[task_id] = mappings
+    return mappings_by_task
 
 
 def apply_color_permutation_to_tokens(
@@ -180,6 +283,51 @@ class ColorAugmentor:
             return None
         # Uses the cached integer directly
         return self.mappings[self.current_index]
+
+
+class TaskColorAugmentor:
+    """Per-task color augmentation with epoch-based indexing."""
+
+    def __init__(
+        self,
+        mappings_by_task: Dict[str, Sequence[torch.Tensor]],
+        apply_to_test_split: bool = False,
+    ) -> None:
+        self.mappings_by_task = {
+            task_id: list(mappings) for task_id, mappings in mappings_by_task.items()
+        }
+        self.apply_to_test_split = apply_to_test_split
+        self._epoch = 0
+        self._max_permutations = max(
+            (len(mappings) for mappings in self.mappings_by_task.values()), default=0
+        )
+
+    @property
+    def max_permutations(self) -> int:
+        return self._max_permutations
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = max(0, int(epoch))
+
+    def _index_for_task(self, task_id: str) -> int:
+        mappings = self.mappings_by_task.get(task_id)
+        if not mappings:
+            return 0
+        return self._epoch % len(mappings)
+
+    def mapping_for_task(self, task_id: str, split: str) -> Optional[torch.Tensor]:
+        if split == "test" and not self.apply_to_test_split:
+            return None
+        mappings = self.mappings_by_task.get(task_id)
+        if not mappings:
+            return None
+        return mappings[self._index_for_task(task_id)]
+
+    def mapping_for_example(self, example: "SequenceExample") -> Optional[torch.Tensor]:
+        return self.mapping_for_task(example.task_id, example.split)
+
+    def mappings_for_task(self, task_id: str) -> Sequence[torch.Tensor]:
+        return self.mappings_by_task.get(task_id, [])
 
 
 def _value_to_token_id(value: int) -> int:
@@ -831,10 +979,12 @@ class ARCExampleDataset(Dataset):
         self.indices_by_split: Dict[str, List[int]] = {split: [] for split in splits}
         self.task_ids = task_ids
         self.sequence_lengths: List[int] = []
+        self.task_input_colors: Dict[str, List[int]] = {}
 
         for example_id, task_id in enumerate(task_ids):
             self.task_id_to_example_id[task_id] = example_id
             task = challenges[task_id]
+            self.task_input_colors[task_id] = extract_task_input_colors(task)
             for split in splits:
                 pairs = task.get(split, [])
                 for pair_index, pair in enumerate(pairs):
@@ -986,7 +1136,7 @@ class LengthBucketBatchSampler(Sampler[List[int]]):
 def collate_examples(
     batch: List[SequenceExample],
     pad_token_id: int = END_TOKEN_ID,
-    color_mapper: Optional[Callable[[str], Optional[torch.Tensor]]] = None,
+    color_mapper: Optional[Callable[[SequenceExample], Optional[torch.Tensor]]] = None,
 ) -> Dict[str, torch.Tensor]:
     if not batch:
         raise ValueError("Empty batch encountered during collation.")
@@ -1003,7 +1153,7 @@ def collate_examples(
         seq_len = example.seq_len
         tokens = example.tokens
         if color_mapper is not None:
-            mapping = color_mapper(example.split)
+            mapping = color_mapper(example)
             if mapping is not None:
                 tokens = mapping[tokens]
         input_ids[idx, :seq_len] = tokens
@@ -1030,7 +1180,7 @@ def create_dataloader(
     shuffle: bool = True,
     num_workers: int = 0,
     bucket_size_multiplier: int = 4,
-    color_mapper: Optional[Callable[[str], Optional[torch.Tensor]]] = None,
+    color_mapper: Optional[Callable[[SequenceExample], Optional[torch.Tensor]]] = None,
 ) -> DataLoader:
     lengths = getattr(dataset, "sequence_lengths", None)
     if lengths is None:
