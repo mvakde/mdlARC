@@ -586,9 +586,10 @@ def train_model(
 
     # print(f"DEBUG CHECK: Optimizer state size = {len(optimizer.state)} (0 = Fresh/Reset, >0 = Restored)")
 
-    # Linear Warmup (5%) + Cosine Decay
+    # Linear Warmup (1%) + Cosine Decay to 10% of peak LR
     total_steps = len(dataloader) * args.epochs
-    warmup_steps = int(total_steps * 0.05)
+    warmup_steps = int(total_steps * 0.01)
+    min_lr_factor = 0.1
 
     def lr_lambda(current_step: int):
         if current_step < warmup_steps:
@@ -596,7 +597,8 @@ def train_model(
         progress = float(current_step - warmup_steps) / float(
             max(1, total_steps - warmup_steps)
         )
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_factor + (1.0 - min_lr_factor) * cosine
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
