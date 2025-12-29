@@ -127,7 +127,7 @@ def _build_color_augmentor(
         return None
     seed = _select_color_aug_seed(args, is_eval)
     mappings_by_task = generate_task_color_mappings(
-        dataset.task_permutable_colors, max_augments, seed
+        dataset.task_input_colors, max_augments, seed
     )
     if not mappings_by_task:
         return None
