@@ -64,6 +64,7 @@ ARGS = {
     "enable_color_aug_train": True,
     "enable_color_on_aug_test_split_during_training": True,
     "max_color_augments_train": 100,
+    "disable_color_aug_last_epochs": 0,
     "color_aug_seed": 42,
     "color_aug_seed_eval": None,
     "lr": 3e-4,

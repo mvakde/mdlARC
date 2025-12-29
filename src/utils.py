@@ -298,13 +298,19 @@ class TaskColorAugmentor:
         }
         self.apply_to_test_split = apply_to_test_split
         self._epoch = 0
+        self._enabled = True
         self._max_permutations = max(
             (len(mappings) for mappings in self.mappings_by_task.values()), default=0
         )
 
     @property
     def max_permutations(self) -> int:
+        if not self._enabled:
+            return 0
         return self._max_permutations
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = bool(enabled)
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = max(0, int(epoch))
@@ -316,6 +322,8 @@ class TaskColorAugmentor:
         return self._epoch % len(mappings)
 
     def mapping_for_task(self, task_id: str, split: str) -> Optional[torch.Tensor]:
+        if not self._enabled:
+            return None
         if split == "test" and not self.apply_to_test_split:
             return None
         mappings = self.mappings_by_task.get(task_id)
