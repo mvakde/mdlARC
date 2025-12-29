@@ -287,7 +287,7 @@ def run_evaluation_pipeline(
         if color_seed is None:
             color_seed = cfg.seed
         color_mappings_eval = generate_task_color_mappings(
-            dataset.task_input_colors, cfg.max_color_augments_eval, int(color_seed)
+            dataset.task_permutable_colors, cfg.max_color_augments_eval, int(color_seed)
         )
         color_apply_fn = lambda split: True
 

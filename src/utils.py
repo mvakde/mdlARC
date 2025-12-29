@@ -99,6 +99,16 @@ def _normalize_input_colors(colors: Iterable[int]) -> List[int]:
     return sorted({int(c) for c in colors if 1 <= int(c) <= 9})
 
 
+def _collect_grid_colors(
+    grid: Sequence[Sequence[int]], colors: Set[int]
+) -> None:
+    for row in grid:
+        for val in row:
+            val_i = int(val)
+            if 1 <= val_i <= 9:
+                colors.add(val_i)
+
+
 def extract_task_input_colors(task: Dict[str, object]) -> List[int]:
     """Return sorted unique colors (1-9) present in ANY input grid for a task."""
     colors: Set[int] = set()
@@ -106,11 +116,27 @@ def extract_task_input_colors(task: Dict[str, object]) -> List[int]:
         pairs = task.get(split, [])
         for pair in pairs:
             grid = pair.get("input", [])
-            for row in grid:
-                for val in row:
-                    val_i = int(val)
-                    if 1 <= val_i <= 9:
-                        colors.add(val_i)
+            _collect_grid_colors(grid, colors)
+    return sorted(colors)
+
+
+def extract_task_output_colors(
+    task: Dict[str, object],
+    test_solutions: Optional[Sequence[Sequence[Sequence[int]]]] = None,
+) -> List[int]:
+    """Return sorted unique colors (1-9) present in ANY output grid for a task."""
+    colors: Set[int] = set()
+    for pair in task.get("train", []):
+        grid = pair.get("output")
+        if grid is not None:
+            _collect_grid_colors(grid, colors)
+    test_pairs = task.get("test", [])
+    for idx, pair in enumerate(test_pairs):
+        grid = pair.get("output")
+        if grid is None and test_solutions is not None and idx < len(test_solutions):
+            grid = test_solutions[idx]
+        if grid is not None:
+            _collect_grid_colors(grid, colors)
     return sorted(colors)
 
 
@@ -171,24 +197,24 @@ def color_subset_permutation_to_mapping(
 
 
 def generate_task_color_mapping_tensors(
-    input_colors: Sequence[int], max_permutations: int, seed: int
+    permutable_colors: Sequence[int], max_permutations: int, seed: int
 ) -> List[torch.Tensor]:
     if max_permutations <= 0:
         return []
-    colors = _normalize_input_colors(input_colors)
+    colors = _normalize_input_colors(permutable_colors)
     perms = generate_color_permutations_for_subset(colors, max_permutations, seed)
     return [color_subset_permutation_to_mapping(colors, perm) for perm in perms]
 
 
 def generate_task_color_mappings(
-    task_input_colors: Dict[str, Sequence[int]],
+    task_permutable_colors: Dict[str, Sequence[int]],
     max_permutations: int,
     seed: int,
 ) -> Dict[str, List[torch.Tensor]]:
     if max_permutations <= 0:
         return {}
     mappings_by_task: Dict[str, List[torch.Tensor]] = {}
-    for task_id, colors in task_input_colors.items():
+    for task_id, colors in task_permutable_colors.items():
         task_seed = _derive_task_seed(seed, task_id)
         mappings = generate_task_color_mapping_tensors(
             colors, max_permutations, task_seed
@@ -980,11 +1006,19 @@ class ARCExampleDataset(Dataset):
         self.task_ids = task_ids
         self.sequence_lengths: List[int] = []
         self.task_input_colors: Dict[str, List[int]] = {}
+        self.task_permutable_colors: Dict[str, List[int]] = {}
 
         for example_id, task_id in enumerate(task_ids):
             self.task_id_to_example_id[task_id] = example_id
             task = challenges[task_id]
-            self.task_input_colors[task_id] = extract_task_input_colors(task)
+            input_colors = extract_task_input_colors(task)
+            self.task_input_colors[task_id] = input_colors
+            task_solutions = solutions_map.get(task_id) if load_test_solutions else None
+            output_colors = extract_task_output_colors(task, task_solutions)
+            output_only_colors = set(output_colors) - set(input_colors)
+            self.task_permutable_colors[task_id] = [
+                color for color in range(1, 10) if color not in output_only_colors
+            ]
             for split in splits:
                 pairs = task.get(split, [])
                 for pair_index, pair in enumerate(pairs):
