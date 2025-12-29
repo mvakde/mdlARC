@@ -19,7 +19,9 @@ AUGMENT_DIHEDRAL = True
 DATASET_NAMES = ["arc1", "conceptarc"]
 DATASET_SPLITS = ["train", "eval"]
 WITH_SOLUTIONS = True
-DATASET_CLEANUP = "none"  # "none" | "solutions" | other options supported by build_datasets.py
+DATASET_CLEANUP = (
+    "none"  # "none" | "solutions" | other options supported by build_datasets.py
+)
 
 # Optional cleanup to mirror the notebook's sanitised environment step.
 SANITIZE_ENV = False
@@ -47,8 +49,8 @@ ARGS = {
     "num_workers": 0,
     "device": "cuda",  # "cuda" | "mps" | "cpu"
     "do_validate": False,
-    "name": "arc1-cleanenv-30M-vvwide-bs32-101ep-100color-ccdb-18dec0430",
-    "GPU": "A100-noaugreg",  # logging only
+    "name": "arc1-37M-bs32-101ep-100color-ccdb",
+    "GPU": "A100",  # logging only
     # paths
     "train_log_file": Path("runs/training_log.txt"),
     "save_path": Path("runs/tiny.pt"),
@@ -60,6 +62,7 @@ ARGS = {
     "batch_size": 32,
     "val_batch_size": 300,
     "enable_color_aug_train": True,
+    "enable_color_on_aug_test_split_during_training": True,
     "max_color_augments_train": 100,
     "color_aug_seed": 42,
     "color_aug_seed_eval": None,
@@ -83,9 +86,7 @@ ARGS = {
 
 # Evaluation config
 PATH_BOTH = ARGS["data_path"]
-EVAL_CONFIGS = [
-    ("eval_100color_both", 100, PATH_BOTH, True),
-]
+EVAL_CONFIGS = [("eval_100color_both", 100, PATH_BOTH, True)]
 EVAL_BATCH_SIZE = 1300
 EVAL_SPLITS = ["test"]
 EVAL_CHECKPOINT_PATH = ARGS["save_path"]

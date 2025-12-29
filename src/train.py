@@ -131,9 +131,13 @@ def _build_color_augmentor(
     )
     if not mappings_by_task:
         return None
+    apply_to_test_split = True
+    if not is_eval:
+        apply_to_test_split = bool(
+            getattr(args, "enable_color_on_aug_test_split_during_training", False)
+        )
     return TaskColorAugmentor(
-        mappings_by_task=mappings_by_task,
-        apply_to_test_split=True if is_eval else False,
+        mappings_by_task=mappings_by_task, apply_to_test_split=apply_to_test_split
     )
 
 
