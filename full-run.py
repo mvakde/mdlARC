@@ -43,17 +43,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 # Calculate ROOT_FOLDER dynamically.
 # utils.py expects: /{root_folder}/mdlARC/runs
-# If path is /home/ubuntu/mdlARC, root_folder must be "home/ubuntu"
-# We assume the repo name is "mdlARC".
+# This requires the current folder to be named "mdlARC".
 try:
-    # Get the path up to the repo name
     _repo_index = PROJECT_ROOT.parts.index("mdlARC")
-    # Join parts before mdlARC and strip leading slash
     ROOT_FOLDER = str(Path(*PROJECT_ROOT.parts[:_repo_index])).lstrip("/")
 except ValueError:
-    # Fallback if folder isn't named mdlARC, defaulting to user's home structure or root
-    print("Warning: Folder not named 'mdlARC'. Archiving paths in utils.py might fail.")
-    ROOT_FOLDER = str(PROJECT_ROOT.parent).lstrip("/")
+    raise ValueError("The project folder must be named 'mdlARC' for archiving to work.")
 
 # Use a local archive folder instead of system /mnt
 # When you move to Modal, you will change this back to "mnt/mithil-arc"
@@ -64,7 +59,7 @@ ARGS = {
     # run config
     "num_workers": 0,
     "device": "cuda",  # "cuda" | "mps" | "cpu"
-    "do_validate": False,
+    "do_validate": True,
     "name": "arc1-37M-bs32-101ep-100color-ccdb",
     "GPU": "A100",  # logging only
     # paths
@@ -80,10 +75,12 @@ ARGS = {
     "enable_color_aug_train": True,
     "enable_color_on_aug_test_split_during_training": True,
     "max_color_augments_train": 100,
-    "disable_color_aug_last_epochs": 0,
+    "disable_color_aug_last_epochs": 1,
     "color_aug_seed": 42,
     "color_aug_seed_eval": None,
     "lr": 3e-4,
+    "warmup_pct": 0.02,
+    "lr_floor": 0.01,
     "weight_decay": 0.01,
     "grad_clip": 1.0,
     "dropout": 0.1,
@@ -104,7 +101,7 @@ ARGS = {
 # Evaluation config
 PATH_BOTH = ARGS["data_path"]
 EVAL_CONFIGS = [("eval_100color_both", 100, PATH_BOTH, True)]
-EVAL_BATCH_SIZE = 1300
+EVAL_BATCH_SIZE = 900
 EVAL_SPLITS = ["test"]
 EVAL_CHECKPOINT_PATH = ARGS["save_path"]
 EVAL_SOLUTIONS_PRESENT = False

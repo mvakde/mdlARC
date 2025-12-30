@@ -586,10 +586,13 @@ def train_model(
 
     # print(f"DEBUG CHECK: Optimizer state size = {len(optimizer.state)} (0 = Fresh/Reset, >0 = Restored)")
 
-    # Linear Warmup (1%) + Cosine Decay to 10% of peak LR
+    # Linear Warmup (% configurable) + Cosine Decay to lr_floor of peak LR
     total_steps = len(dataloader) * args.epochs
-    warmup_steps = int(total_steps * 0.01)
-    min_lr_factor = 0.1
+    warmup_pct = float(getattr(args, "warmup_pct", 0.02))
+    warmup_pct = max(0.0, min(1.0, warmup_pct))
+    warmup_steps = int(total_steps * warmup_pct)
+    min_lr_factor = float(getattr(args, "lr_floor", 0.01))
+    min_lr_factor = max(0.0, min(1.0, min_lr_factor))
 
     def lr_lambda(current_step: int):
         if current_step < warmup_steps:
@@ -635,9 +638,7 @@ def train_model(
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
         aug_enabled = (
-            True
-            if disable_color_aug_start is None
-            else epoch < disable_color_aug_start
+            True if disable_color_aug_start is None else epoch < disable_color_aug_start
         )
         if color_augmentor is not None and hasattr(color_augmentor, "set_enabled"):
             if prev_aug_enabled is None or aug_enabled != prev_aug_enabled:
