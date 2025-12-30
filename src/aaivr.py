@@ -106,19 +106,6 @@ def apply_inverse_dihedral_transform(
     return _DIHEDRAL_TRANSFORMS[inverse_name](grid)
 
 
-def _tiebreak_preference_rank(color_idx: int, transform_index: int) -> int:
-    """Lower rank is preferred for tie-breaking among equal vote counts."""
-    no_color = int(color_idx) == 0
-    no_dihedral = int(transform_index) == 0
-    if no_color and no_dihedral:
-        return 0
-    if no_color:
-        return 1
-    if no_dihedral:
-        return 2
-    return 3
-
-
 def _grid_to_tuple(grid: Sequence[Sequence[int]]) -> Tuple[Tuple[int, ...], ...]:
     return tuple(tuple(int(val) for val in row) for row in grid)
 
@@ -209,7 +196,6 @@ def run_aaivr_on_results(
         if key not in case_map:
             case_map[key] = {
                 "counts": {},
-                "pref_rank": {},
                 "generated": 0,
                 "valid": 0,
                 "dropped_rect": 0,
@@ -278,21 +264,13 @@ def run_aaivr_on_results(
         grid_key = _grid_to_tuple(normalized_grid)
         counts: Dict[Tuple[Tuple[int, ...], ...], int] = stats["counts"]
         counts[grid_key] = counts.get(grid_key, 0) + 1
-        pref_ranks: Dict[Tuple[Tuple[int, ...], ...], int] = stats["pref_rank"]
-        pref_rank = _tiebreak_preference_rank(color_idx, transform_index)
-        existing_rank = pref_ranks.get(grid_key)
-        if existing_rank is None or pref_rank < existing_rank:
-            pref_ranks[grid_key] = pref_rank
 
     selections: List[AAIVRSelection] = []
     for (task_id, base_idx), stats in sorted(case_map.items()):
         items = list(stats["counts"].items())
         if items:
-            pref_ranks = stats.get("pref_rank", {})
-            rng.shuffle(items)  # tie-break randomly for equal count + preference
-            items.sort(
-                key=lambda pair: (-pair[1], pref_ranks.get(pair[0], 3))
-            )
+            rng.shuffle(items)  # tie-break randomly before sorting by count
+            items.sort(key=lambda pair: pair[1], reverse=True)
         ranked_candidates = [
             {"grid": _tuple_to_grid(grid_key), "count": count}
             for grid_key, count in items
