@@ -34,14 +34,30 @@ RUN_VISUALIZATION = False
 RUN_SCORING = True
 
 # Archive runs/ (zip + copy) for persistence.
-ENABLE_ARCHIVE = False
+ENABLE_ARCHIVE = True
 SAVE_ARCHIVE_BEFORE_EVAL = True
 UPDATE_ARCHIVE_AFTER_EVAL = True
 
 # Archive paths (used only if ENABLE_ARCHIVE=True).
 PROJECT_ROOT = Path(__file__).resolve().parent
-ROOT_FOLDER = str(PROJECT_ROOT.parent).lstrip("/")
-MOUNT_FOLDER = str((PROJECT_ROOT / "runs_archive").resolve()).lstrip("/")
+
+# Calculate ROOT_FOLDER dynamically.
+# utils.py expects: /{root_folder}/mdlARC/runs
+# If path is /home/ubuntu/mdlARC, root_folder must be "home/ubuntu"
+# We assume the repo name is "mdlARC".
+try:
+    # Get the path up to the repo name
+    _repo_index = PROJECT_ROOT.parts.index("mdlARC")
+    # Join parts before mdlARC and strip leading slash
+    ROOT_FOLDER = str(Path(*PROJECT_ROOT.parts[:_repo_index])).lstrip("/")
+except ValueError:
+    # Fallback if folder isn't named mdlARC, defaulting to user's home structure or root
+    print("Warning: Folder not named 'mdlARC'. Archiving paths in utils.py might fail.")
+    ROOT_FOLDER = str(PROJECT_ROOT.parent).lstrip("/")
+
+# Use a local archive folder instead of system /mnt
+# When you move to Modal, you will change this back to "mnt/mithil-arc"
+MOUNT_FOLDER = str(PROJECT_ROOT / "archives").lstrip("/")
 
 # Model + training config (mirrors interactive-run.ipynb).
 ARGS = {
@@ -96,7 +112,7 @@ EVAL_TASK_IDS = None  # None = full dataset
 EVAL_LOG_CORRECT_GRIDS = False
 
 # Visualization config
-EVAL_SUB_FOLDER = "eval_100color_both"
+EVAL_SUB_FOLDER = EVAL_CONFIGS[0][0]
 VIS_MODE = "!"  # "!" = compare vs solutions, "submission" = attempts-only
 VIS_SOLUTIONS_FILE = "assets/solutions.json"
 
@@ -136,7 +152,6 @@ def _sanitize_repo(project_root: Path) -> None:
         project_root / "interactive-run.ipynb",
         project_root / "clean-env-run.ipynb",
         project_root / "max-clean-env-run.ipynb",
-        project_root / "dataset_building_scripts",
         project_root / "readme.md",
         project_root / "img",
     ]
@@ -201,6 +216,7 @@ def main() -> None:
     archive_state = None
     if ENABLE_ARCHIVE and SAVE_ARCHIVE_BEFORE_EVAL:
         Path(f"/{MOUNT_FOLDER}").mkdir(parents=True, exist_ok=True)
+        print(f"Archiving to local folder: /{MOUNT_FOLDER}")
         archive_state = utils.save_run_archive(
             cfg.name, ROOT_FOLDER, MOUNT_FOLDER, globals_dict=globals()
         )
