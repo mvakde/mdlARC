@@ -19,7 +19,9 @@ AUGMENT_DIHEDRAL = True
 DATASET_NAMES = ["arc1", "conceptarc"]
 DATASET_SPLITS = ["train", "eval"]
 WITH_SOLUTIONS = True
-DATASET_CLEANUP = "none"  # "none" | "solutions" | other options supported by build_datasets.py
+DATASET_CLEANUP = (
+    "none"  # "none" | "solutions" | other options supported by build_datasets.py
+)
 
 # Optional cleanup to mirror the notebook's sanitised environment step.
 SANITIZE_ENV = False
@@ -32,23 +34,34 @@ RUN_VISUALIZATION = False
 RUN_SCORING = True
 
 # Archive runs/ (zip + copy) for persistence.
-ENABLE_ARCHIVE = False
+ENABLE_ARCHIVE = True
 SAVE_ARCHIVE_BEFORE_EVAL = True
 UPDATE_ARCHIVE_AFTER_EVAL = True
 
 # Archive paths (used only if ENABLE_ARCHIVE=True).
 PROJECT_ROOT = Path(__file__).resolve().parent
-ROOT_FOLDER = str(PROJECT_ROOT.parent).lstrip("/")
-MOUNT_FOLDER = str((PROJECT_ROOT / "runs_archive").resolve()).lstrip("/")
+
+# Calculate ROOT_FOLDER dynamically.
+# utils.py expects: /{root_folder}/mdlARC/runs
+# This requires the current folder to be named "mdlARC".
+try:
+    _repo_index = PROJECT_ROOT.parts.index("mdlARC")
+    ROOT_FOLDER = str(Path(*PROJECT_ROOT.parts[:_repo_index])).lstrip("/")
+except ValueError:
+    raise ValueError("The project folder must be named 'mdlARC' for archiving to work.")
+
+# Use a local archive folder instead of system /mnt
+# When you move to Modal, you will change this back to "mnt/mithil-arc"
+MOUNT_FOLDER = str(PROJECT_ROOT / "archives").lstrip("/")
 
 # Model + training config (mirrors interactive-run.ipynb).
 ARGS = {
     # run config
     "num_workers": 0,
     "device": "cuda",  # "cuda" | "mps" | "cpu"
-    "do_validate": False,
-    "name": "arc1-cleanenv-30M-vvwide-bs32-101ep-100color-ccdb-18dec0430",
-    "GPU": "A100-noaugreg",  # logging only
+    "do_validate": True,
+    "name": "arc1-37M-bs32-101ep-100color-ccdb",
+    "GPU": "A100",  # logging only
     # paths
     "train_log_file": Path("runs/training_log.txt"),
     "save_path": Path("runs/tiny.pt"),
@@ -60,10 +73,14 @@ ARGS = {
     "batch_size": 32,
     "val_batch_size": 300,
     "enable_color_aug_train": True,
+    "enable_color_on_aug_test_split_during_training": True,
     "max_color_augments_train": 100,
+    "disable_color_aug_last_epochs": 1,
     "color_aug_seed": 42,
     "color_aug_seed_eval": None,
     "lr": 3e-4,
+    "warmup_pct": 0.02,
+    "lr_floor": 0.01,
     "weight_decay": 0.01,
     "grad_clip": 1.0,
     "dropout": 0.1,
@@ -83,10 +100,8 @@ ARGS = {
 
 # Evaluation config
 PATH_BOTH = ARGS["data_path"]
-EVAL_CONFIGS = [
-    ("eval_100color_both", 100, PATH_BOTH, True),
-]
-EVAL_BATCH_SIZE = 1300
+EVAL_CONFIGS = [("eval_100color_both", 100, PATH_BOTH, True)]
+EVAL_BATCH_SIZE = 900
 EVAL_SPLITS = ["test"]
 EVAL_CHECKPOINT_PATH = ARGS["save_path"]
 EVAL_SOLUTIONS_PRESENT = False
@@ -94,7 +109,7 @@ EVAL_TASK_IDS = None  # None = full dataset
 EVAL_LOG_CORRECT_GRIDS = False
 
 # Visualization config
-EVAL_SUB_FOLDER = "eval_100color_both"
+EVAL_SUB_FOLDER = EVAL_CONFIGS[0][0]
 VIS_MODE = "!"  # "!" = compare vs solutions, "submission" = attempts-only
 VIS_SOLUTIONS_FILE = "assets/solutions.json"
 
@@ -134,7 +149,6 @@ def _sanitize_repo(project_root: Path) -> None:
         project_root / "interactive-run.ipynb",
         project_root / "clean-env-run.ipynb",
         project_root / "max-clean-env-run.ipynb",
-        project_root / "dataset_building_scripts",
         project_root / "readme.md",
         project_root / "img",
     ]
@@ -199,6 +213,7 @@ def main() -> None:
     archive_state = None
     if ENABLE_ARCHIVE and SAVE_ARCHIVE_BEFORE_EVAL:
         Path(f"/{MOUNT_FOLDER}").mkdir(parents=True, exist_ok=True)
+        print(f"Archiving to local folder: /{MOUNT_FOLDER}")
         archive_state = utils.save_run_archive(
             cfg.name, ROOT_FOLDER, MOUNT_FOLDER, globals_dict=globals()
         )

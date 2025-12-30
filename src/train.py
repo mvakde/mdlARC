@@ -131,9 +131,13 @@ def _build_color_augmentor(
     )
     if not mappings_by_task:
         return None
+    apply_to_test_split = True
+    if not is_eval:
+        apply_to_test_split = bool(
+            getattr(args, "enable_color_on_aug_test_split_during_training", False)
+        )
     return TaskColorAugmentor(
-        mappings_by_task=mappings_by_task,
-        apply_to_test_split=True if is_eval else False,
+        mappings_by_task=mappings_by_task, apply_to_test_split=apply_to_test_split
     )
 
 
@@ -582,9 +586,13 @@ def train_model(
 
     # print(f"DEBUG CHECK: Optimizer state size = {len(optimizer.state)} (0 = Fresh/Reset, >0 = Restored)")
 
-    # Linear Warmup (5%) + Cosine Decay
+    # Linear Warmup (% configurable) + Cosine Decay to lr_floor of peak LR
     total_steps = len(dataloader) * args.epochs
-    warmup_steps = int(total_steps * 0.05)
+    warmup_pct = float(getattr(args, "warmup_pct", 0.02))
+    warmup_pct = max(0.0, min(1.0, warmup_pct))
+    warmup_steps = int(total_steps * warmup_pct)
+    min_lr_factor = float(getattr(args, "lr_floor", 0.01))
+    min_lr_factor = max(0.0, min(1.0, min_lr_factor))
 
     def lr_lambda(current_step: int):
         if current_step < warmup_steps:
@@ -592,7 +600,8 @@ def train_model(
         progress = float(current_step - warmup_steps) / float(
             max(1, total_steps - warmup_steps)
         )
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_factor + (1.0 - min_lr_factor) * cosine
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -615,9 +624,29 @@ def train_model(
         training_model = model
 
     color_augmentor = getattr(dataloader, "color_augmentor", None)
+    disable_color_aug_last_epochs = int(
+        getattr(args, "disable_color_aug_last_epochs", 0) or 0
+    )
+    disable_color_aug_last_epochs = max(0, disable_color_aug_last_epochs)
+    disable_color_aug_start = (
+        max(0, args.epochs - disable_color_aug_last_epochs)
+        if disable_color_aug_last_epochs > 0
+        else None
+    )
+    prev_aug_enabled = None
 
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
+        aug_enabled = (
+            True if disable_color_aug_start is None else epoch < disable_color_aug_start
+        )
+        if color_augmentor is not None and hasattr(color_augmentor, "set_enabled"):
+            if prev_aug_enabled is None or aug_enabled != prev_aug_enabled:
+                color_augmentor.set_enabled(aug_enabled)
+                if prev_aug_enabled is not None or not aug_enabled:
+                    state = "enabled" if aug_enabled else "disabled"
+                    print(f"Color augmentation {state} for epoch {epoch + 1}.")
+                prev_aug_enabled = aug_enabled
         if color_augmentor is not None and color_augmentor.max_permutations > 0:
             color_augmentor.set_epoch(epoch)
             print(
