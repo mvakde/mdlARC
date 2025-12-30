@@ -80,6 +80,7 @@ ARGS = {
     "color_aug_seed_eval": None,
     "lr": 3e-4,
     "warmup_pct": 0.02,
+    "wsd_decay_start_pct": 0.8,  # 1.0 = no decay (start at last epoch)
     "lr_floor": 0.01,
     "weight_decay": 0.01,
     "grad_clip": 1.0,
