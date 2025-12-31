@@ -32,6 +32,7 @@ CLEANUP_BEFORE_EVAL = True
 RUN_EVALUATION = True
 RUN_VISUALIZATION = False
 RUN_SCORING = True
+RUN_AAIVR_FLOW_VIS = False
 
 # Archive runs/ (zip + copy) for persistence.
 ENABLE_ARCHIVE = True
@@ -113,6 +114,12 @@ EVAL_LOG_CORRECT_GRIDS = False
 EVAL_SUB_FOLDER = EVAL_CONFIGS[0][0]
 VIS_MODE = "!"  # "!" = compare vs solutions, "submission" = attempts-only
 VIS_SOLUTIONS_FILE = "assets/solutions.json"
+
+# AAIVR flow visualization config (disabled by default)
+AAIVR_FLOW_CONFIG_INDEX = 0
+AAIVR_FLOW_TASK_ID = None  # e.g., "00576224"
+AAIVR_FLOW_TASK_INDEX = 0  # 0-based index in evaluation pipeline order
+AAIVR_FLOW_INPUT_INDEX = 0  # base pair index before dihedral aug
 
 # Scoring config (mirrors final notebook cell)
 SCORE_SOLUTIONS_FILE = Path("assets/solutions.json")
@@ -219,8 +226,9 @@ def main() -> None:
             cfg.name, ROOT_FOLDER, MOUNT_FOLDER, globals_dict=globals()
         )
 
+    eval_results = None
     if RUN_EVALUATION:
-        evaluations.run_evaluation_configs(
+        eval_results = evaluations.run_evaluation_configs(
             cfg,
             EVAL_CONFIGS,
             eval_batch_size=EVAL_BATCH_SIZE,
@@ -233,6 +241,44 @@ def main() -> None:
 
     if RUN_EVALUATION and RUN_SCORING:
         utils.score_arc_submission(SCORE_SOLUTIONS_FILE, SCORE_SUBMISSION_FILE)
+
+    if RUN_AAIVR_FLOW_VIS:
+        if not eval_results:
+            print("AAIVR flow visualization requires eval_results; enable RUN_EVALUATION.")
+        else:
+            import aaivr
+
+            cfg_idx = AAIVR_FLOW_CONFIG_INDEX
+            if cfg_idx < 0 or cfg_idx >= len(eval_results):
+                raise ValueError(
+                    f"AAIVR_FLOW_CONFIG_INDEX {cfg_idx} is out of range."
+                )
+            eval_data = eval_results[cfg_idx][1]
+            test_results = eval_data.get("test", {}).get("results", [])
+            eval_config = EVAL_CONFIGS[cfg_idx]
+            max_color_aug = eval_config[1]
+            dataset_path = eval_config[2]
+            if len(eval_config) > 3:
+                dihedral_augmented = bool(eval_config[3])
+            else:
+                dihedral_augmented = bool(getattr(cfg, "dihedral_augmented", False))
+
+            color_seed = getattr(cfg, "color_aug_seed_eval", None)
+            if color_seed is None:
+                color_seed = getattr(cfg, "color_aug_seed", None)
+            if color_seed is None:
+                color_seed = getattr(cfg, "seed", 42)
+
+            aaivr.visualize_aaivr_flow(
+                test_results,
+                dataset_path=dataset_path,
+                input_index=AAIVR_FLOW_INPUT_INDEX,
+                task_id=AAIVR_FLOW_TASK_ID,
+                task_index=AAIVR_FLOW_TASK_INDEX,
+                is_dihedral_augmented=dihedral_augmented,
+                max_color_augments=max_color_aug,
+                color_aug_seed=color_seed,
+            )
 
     if ENABLE_ARCHIVE and UPDATE_ARCHIVE_AFTER_EVAL:
         Path(f"/{MOUNT_FOLDER}").mkdir(parents=True, exist_ok=True)
