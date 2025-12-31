@@ -586,22 +586,29 @@ def train_model(
 
     # print(f"DEBUG CHECK: Optimizer state size = {len(optimizer.state)} (0 = Fresh/Reset, >0 = Restored)")
 
-    # Linear Warmup (% configurable) + Cosine Decay to lr_floor of peak LR
+    # Linear warmup + WSD (warmup, stable, decay) schedule with linear decay tail.
     total_steps = len(dataloader) * args.epochs
     warmup_pct = float(getattr(args, "warmup_pct", 0.02))
     warmup_pct = max(0.0, min(1.0, warmup_pct))
     warmup_steps = int(total_steps * warmup_pct)
     min_lr_factor = float(getattr(args, "lr_floor", 0.01))
     min_lr_factor = max(0.0, min(1.0, min_lr_factor))
+    decay_start_pct = float(getattr(args, "wsd_decay_start_pct", 0.8))
+    decay_start_pct = max(0.0, min(1.0, decay_start_pct))
+    decay_start_step = int(total_steps * decay_start_pct)
+    decay_start_step = max(decay_start_step, warmup_steps)
+    decay_start_step = min(decay_start_step, total_steps)
+    decay_steps = max(1, total_steps - decay_start_step)
 
     def lr_lambda(current_step: int):
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
-        progress = float(current_step - warmup_steps) / float(
-            max(1, total_steps - warmup_steps)
-        )
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_lr_factor + (1.0 - min_lr_factor) * cosine
+        if decay_start_step >= total_steps or current_step < decay_start_step:
+            return 1.0
+        progress = float(current_step - decay_start_step) / float(decay_steps)
+        progress = max(0.0, min(1.0, progress))
+        linear = 1.0 - progress
+        return min_lr_factor + (1.0 - min_lr_factor) * linear
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
