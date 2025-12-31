@@ -1,7 +1,6 @@
 import argparse
 from dataclasses import asdict
 import random
-import math
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -211,7 +210,6 @@ def train_one_epoch(
             inp_loss = outputs.get("input_loss")
             out_loss = outputs.get("output_loss")
 
-        optimizer.zero_grad()
         loss.backward()
         if grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)

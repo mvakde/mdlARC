@@ -181,9 +181,7 @@ def generate_task_color_mapping_tensors(
 
 
 def generate_task_color_mappings(
-    task_input_colors: Dict[str, Sequence[int]],
-    max_permutations: int,
-    seed: int,
+    task_input_colors: Dict[str, Sequence[int]], max_permutations: int, seed: int
 ) -> Dict[str, List[torch.Tensor]]:
     if max_permutations <= 0:
         return {}
@@ -211,78 +209,6 @@ def apply_color_permutation_to_grid(
         [int(mapping[val] if 0 <= val < len(mapping) else val) for val in row]
         for row in grid
     ]
-
-
-# In utils.py
-
-
-class ColorAugmentor:
-    """Holds a deterministic list of color mappings and exposes epoch-based selection."""
-
-    def __init__(
-        self,
-        mappings: Sequence[torch.Tensor],
-        apply_to_test_split: bool = False,
-        seed: int = 42,
-    ) -> None:
-        self.mappings = list(mappings)
-        self.apply_to_test_split = apply_to_test_split
-        self.seed = seed
-        self._epoch = 0
-        self._cached_index = 0
-        self._compute_index()  # Initialize for epoch 0
-
-    @property
-    def num_permutations(self) -> int:
-        return len(self.mappings)
-
-    @property
-    def current_index(self) -> int:
-        # O(1) lookup during the hot loop - zero overhead
-        return self._cached_index
-
-    def set_index(self, index: int) -> None:
-        if self.num_permutations == 0:
-            return
-        self._epoch = max(0, int(index))
-        # Compute the randomization only once when the epoch changes
-        self._compute_index()
-
-    def _compute_index(self) -> None:
-        N = self.num_permutations
-        if N == 0:
-            self._cached_index = 0
-            return
-
-        cycle = self._epoch // N
-        step = self._epoch % N
-
-        # 1. First step of any cycle is Identity
-        if step == 0 or N <= 1:
-            self._cached_index = 0
-            return
-
-        # 2. Randomize the remaining steps
-        # We seed the generator with the cycle ID so the order is fixed for this chunk of epochs
-        g = torch.Generator()
-        g.manual_seed(self.seed + cycle)
-
-        # Permute indices [1...N-1]
-        perm = torch.randperm(N - 1, generator=g)
-
-        # Map step 1 -> perm[0], step 2 -> perm[1], etc.
-        random_offset = perm[step - 1].item()
-
-        # +1 because we skipped index 0 (Identity)
-        self._cached_index = random_offset + 1
-
-    def mapping_for_split(self, split: str) -> Optional[torch.Tensor]:
-        if not self.mappings:
-            return None
-        if split == "test" and not self.apply_to_test_split:
-            return None
-        # Uses the cached integer directly
-        return self.mappings[self.current_index]
 
 
 class TaskColorAugmentor:
@@ -633,14 +559,13 @@ def _build_archive_state(
     local_zip = zip_base.with_suffix(".zip")
     mount_dir = Path(f"/{mount_folder}")
     return RunArchiveState(
-        src_dir=src_dir,
-        zip_base=zip_base,
-        local_zip=local_zip,
-        mount_dir=mount_dir,
+        src_dir=src_dir, zip_base=zip_base, local_zip=local_zip, mount_dir=mount_dir
     )
 
 
-def _export_archive_state(state: RunArchiveState, globals_dict: Dict[str, object]) -> None:
+def _export_archive_state(
+    state: RunArchiveState, globals_dict: Dict[str, object]
+) -> None:
     globals_dict[_RUN_ARCHIVE_STATE_KEY] = state
     globals_dict["SRC_DIR"] = state.src_dir
     globals_dict["ZIP_BASE"] = state.zip_base
@@ -865,14 +790,11 @@ def visualize_eval_submissions(
 ) -> None:
     """Helper to visualize submissions from a runs/<folder>/submission.json."""
     submission_file = Path(submission_base) / eval_sub_folder / "submission.json"
-    visualize_submissions(
-        submission_file, solutions_file=solutions_file, mode=mode
-    )
+    visualize_submissions(submission_file, solutions_file=solutions_file, mode=mode)
 
 
 def score_arc_submission(
-    solutions_file: Path,
-    submission_file: Path,
+    solutions_file: Path, submission_file: Path
 ) -> Dict[str, object]:
     """Score a submission.json against ARC solutions.json."""
     solutions_path = Path(solutions_file)
@@ -913,9 +835,7 @@ def score_arc_submission(
                 fully_solved_tasks.append(task_id)
 
     percentage = 100 * (calc_score / max_total_score) if max_total_score > 0 else 0.0
-    print(
-        f"Official ARC style scoring: {calc_score}/{max_total_score} ({percentage}%)"
-    )
+    print(f"Official ARC style scoring: {calc_score}/{max_total_score} ({percentage}%)")
     print(f"Fully correct tasks ({len(fully_solved_tasks)}):")
     for task_id in fully_solved_tasks:
         print(task_id)
