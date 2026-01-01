@@ -158,7 +158,7 @@ def batched_greedy_generate(
 
     # Calculate initial grid state
     initial_state, finished = _derive_initial_state_from_prompt(
-        input_ids, prompt_positions, attention_mask
+        input_ids, prompt_positions
     )
     grid_state = BatchGridState(initial_state)
 
@@ -186,13 +186,6 @@ def batched_greedy_generate(
     )
     logits = outputs["logits"]
     prompt_kvs = outputs["past_key_values"]
-
-    # We need a static [B, MaxLen] mask for the compiled graph.
-    full_attention_mask = torch.zeros(
-        (batch_size, max_model_len), dtype=torch.bool, device=device
-    )
-    # Copy the prompt mask into the static buffer
-    full_attention_mask[:, :current_len] = attention_mask
 
     # --- 2. SETUP STATIC KV CACHE ---
     # Convert the prompt KVs into a fixed size buffer [B, H, MaxLen, D]
@@ -327,7 +320,7 @@ def _pad_cached_positions(
 
 
 def _derive_initial_state_from_prompt(
-    input_ids: torch.Tensor, positions_3d: torch.Tensor, attention_mask: torch.Tensor
+    input_ids: torch.Tensor, positions_3d: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Since input_ids are left-padded by _left_pad_sequences, the last valid token
     # (the one determining the start state for generation) is always at the very end.
