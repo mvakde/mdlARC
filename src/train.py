@@ -685,25 +685,55 @@ def train_model(
         if disable_color_aug_last_epochs > 0
         else None
     )
-    prev_aug_enabled = None
+    disable_dihedral_aug_last_epochs = int(
+        getattr(args, "disable_dihedral_aug_last_epochs", 0) or 0
+    )
+    disable_dihedral_aug_last_epochs = max(0, disable_dihedral_aug_last_epochs)
+    disable_dihedral_aug_start = (
+        max(0, args.epochs - disable_dihedral_aug_last_epochs)
+        if disable_dihedral_aug_last_epochs > 0
+        else None
+    )
+    prev_color_aug_enabled = None
+    prev_dihedral_aug_enabled = None
 
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
-        aug_enabled = (
+        color_aug_enabled = (
             True if disable_color_aug_start is None else epoch < disable_color_aug_start
         )
         if color_augmentor is not None and hasattr(color_augmentor, "set_enabled"):
-            if prev_aug_enabled is None or aug_enabled != prev_aug_enabled:
-                color_augmentor.set_enabled(aug_enabled)
-                if prev_aug_enabled is not None or not aug_enabled:
-                    state = "enabled" if aug_enabled else "disabled"
+            if (
+                prev_color_aug_enabled is None
+                or color_aug_enabled != prev_color_aug_enabled
+            ):
+                color_augmentor.set_enabled(color_aug_enabled)
+                if prev_color_aug_enabled is not None or not color_aug_enabled:
+                    state = "enabled" if color_aug_enabled else "disabled"
                     print(f"Color augmentation {state} for epoch {epoch + 1}.")
-                prev_aug_enabled = aug_enabled
+                prev_color_aug_enabled = color_aug_enabled
         if color_augmentor is not None and color_augmentor.max_permutations > 0:
             color_augmentor.set_epoch(epoch)
             print(
                 f"Using per-task color permutations (max {color_augmentor.max_permutations})."
             )
+        dihedral_aug_enabled = (
+            True
+            if disable_dihedral_aug_start is None
+            else epoch < disable_dihedral_aug_start
+        )
+        if dihedral_augmentor is not None and hasattr(
+            dihedral_augmentor, "set_enabled"
+        ):
+            if (
+                prev_dihedral_aug_enabled is None
+                or dihedral_aug_enabled != prev_dihedral_aug_enabled
+            ):
+                dihedral_augmentor.set_enabled(dihedral_aug_enabled)
+                if prev_dihedral_aug_enabled is not None or not dihedral_aug_enabled:
+                    state = "enabled" if dihedral_aug_enabled else "disabled"
+                    print(f"Dihedral augmentation {state} for epoch {epoch + 1}.")
+                prev_dihedral_aug_enabled = dihedral_aug_enabled
         if dihedral_augmentor is not None and dihedral_augmentor.max_transforms > 0:
             dihedral_augmentor.set_epoch(epoch)
             print(

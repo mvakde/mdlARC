@@ -112,6 +112,7 @@ ARGS = {
     "disable_color_aug_last_epochs": 1,
     "color_aug_seed": 42,
     "color_aug_seed_eval": None,
+    "disable_dihedral_aug_last_epochs": 0,
     "enable_dihedral_aug_train": True,
     "enable_dihedral_on_aug_test_split_during_training": True,
     "enable_dihedral_aug_eval": True,
