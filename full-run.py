@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -8,6 +9,39 @@ from time import perf_counter
 from typing import List, Optional
 
 # Python port of interactive-run.ipynb for non-notebook runs.
+
+
+def _serialize_eval_configs(eval_configs):
+    serialized = []
+    for config in eval_configs:
+        if len(config) == 3:
+            name, aug_count, data_path = config
+            dihedral = None
+        else:
+            name, aug_count, data_path, dihedral = config
+        serialized.append(
+            [
+                name,
+                aug_count,
+                str(data_path),
+                bool(dihedral) if dihedral is not None else None,
+            ]
+        )
+    return serialized
+
+
+def _build_eval_results_payload(eval_results, eval_configs):
+    return {
+        "configs": _serialize_eval_configs(eval_configs),
+        "results": [
+            {
+                "name": name,
+                "evaluation": evaluation,
+                "submission_path": str(submission_path),
+            }
+            for name, evaluation, submission_path in eval_results
+        ],
+    }
 
 # ---------------------------
 # Config (edit in-place)
@@ -238,6 +272,12 @@ def main() -> None:
             task_ids=EVAL_TASK_IDS,
             log_correct_grids=EVAL_LOG_CORRECT_GRIDS,
         )
+        if eval_results:
+            eval_results_path = runs_dir / "eval_results.json"
+            eval_results_path.write_text(
+                json.dumps(_build_eval_results_payload(eval_results, EVAL_CONFIGS))
+            )
+            print(f"Saved eval_results to {eval_results_path}")
 
     if RUN_EVALUATION and RUN_SCORING:
         utils.score_arc_submission(SCORE_SOLUTIONS_FILE, SCORE_SUBMISSION_FILE)
