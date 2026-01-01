@@ -101,6 +101,7 @@ ARGS = {
     "train_log_file": Path("runs/training_log.txt"),
     "save_path": Path("runs/tiny.pt"),
     "checkpoint_path": None,  # Path("runs/tiny.pt") to resume
+    "checkpoint_epochs": None,  # int N for every N epochs, or list [5, 10, 25]
     "data_path": Path("assets/challenges.json"),
     # hyperparameters
     "epochs": 101,

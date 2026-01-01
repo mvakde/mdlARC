@@ -2,7 +2,7 @@ import argparse
 from dataclasses import asdict
 import random
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Set, Tuple
 
 import torch
 from torch import nn
@@ -331,6 +331,7 @@ def maybe_save_model(
     save_path: Optional[Path],
     optimizer: Optional[torch.optim.Optimizer] = None,
     global_step: Optional[int] = None,
+    epoch: Optional[int] = None,
     rng_state: Optional[Dict[str, Any]] = None,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 ) -> None:
@@ -349,10 +350,59 @@ def maybe_save_model(
         checkpoint["scheduler_state"] = scheduler.state_dict()
     if global_step is not None:
         checkpoint["global_step"] = int(global_step)
+    if epoch is not None:
+        checkpoint["epoch"] = int(epoch)
     if rng_state is not None:
         checkpoint["rng_state"] = rng_state
     torch.save(checkpoint, save_path)
     print(f"Saved checkpoint to {save_path}")
+
+
+def _normalize_checkpoint_epochs(
+    checkpoint_epochs: Optional[object],
+    total_epochs: int,
+) -> Optional[Set[int]]:
+    if checkpoint_epochs is None:
+        return None
+    if isinstance(checkpoint_epochs, bool):
+        raise TypeError("checkpoint_epochs must be an int or list of ints, not bool.")
+    if isinstance(checkpoint_epochs, int):
+        interval = int(checkpoint_epochs)
+        if interval <= 0:
+            return None
+        return set(range(interval, total_epochs + 1, interval))
+    if isinstance(checkpoint_epochs, Sequence) and not isinstance(
+        checkpoint_epochs, (str, bytes)
+    ):
+        epochs: Set[int] = set()
+        for item in checkpoint_epochs:
+            if isinstance(item, bool):
+                raise TypeError(
+                    "checkpoint_epochs must be an int or list of ints, not bool."
+                )
+            try:
+                epoch = int(item)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "checkpoint_epochs must be an int or list of ints."
+                ) from exc
+            if epoch <= 0:
+                raise ValueError("checkpoint_epochs entries must be positive.")
+            if epoch <= total_epochs:
+                epochs.add(epoch)
+        return epochs or None
+    raise TypeError("checkpoint_epochs must be an int or list of ints.")
+
+
+def _checkpoint_path_for_epoch(
+    save_path: Path,
+    epoch: int,
+    total_epochs: int,
+) -> Path:
+    width = max(2, len(str(total_epochs)))
+    suffix = save_path.suffix
+    stem = save_path.stem
+    return save_path.with_name(f"{stem}.epoch{epoch:0{width}d}{suffix}")
 
 
 def load_checkpoint(checkpoint_path: Optional[Path]) -> Optional[Dict[str, Any]]:
@@ -608,6 +658,13 @@ def train_model(
     # Extract log file from args if it exists
     log_file = getattr(args, "train_log_file", None)
 
+    save_path = getattr(args, "save_path", None)
+    if save_path is not None and not isinstance(save_path, Path):
+        save_path = Path(save_path)
+    checkpoint_schedule = _normalize_checkpoint_epochs(
+        getattr(args, "checkpoint_epochs", None), args.epochs
+    )
+
     param_groups = _build_weight_decay_param_groups(model, args.weight_decay)
 
     # Fused AdamW is significantly faster on CUDA.
@@ -616,8 +673,28 @@ def train_model(
 
     step = int(checkpoint.get("global_step", 0)) if checkpoint else 0
 
+    start_epoch = 0
+    if checkpoint:
+        saved_epoch = checkpoint.get("epoch")
+        if saved_epoch is None:
+            saved_epoch = checkpoint.get("epochs_completed")
+        if saved_epoch is not None:
+            start_epoch = int(saved_epoch)
+        elif step > 0:
+            steps_per_epoch = len(dataloader)
+            if steps_per_epoch > 0:
+                start_epoch = step // steps_per_epoch
+        if start_epoch > args.epochs:
+            print(
+                f"Checkpoint has {start_epoch} epochs completed; "
+                f"configured epochs={args.epochs}. Nothing left to train."
+            )
+            start_epoch = args.epochs
+
     if checkpoint and step > 0:
         print(f"Resuming training from global_step={step}.")
+    if checkpoint and start_epoch > 0:
+        print(f"Resuming training from epoch {start_epoch + 1}/{args.epochs}.")
 
     # Restore optimizer state if available so momentum/adam moments resume.
     if checkpoint and "optimizer_state" in checkpoint:
@@ -697,7 +774,7 @@ def train_model(
     prev_color_aug_enabled = None
     prev_dihedral_aug_enabled = None
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
         color_aug_enabled = (
             True if disable_color_aug_start is None else epoch < disable_color_aug_start
@@ -771,14 +848,34 @@ def train_model(
                 with open(log_file, "a") as f:
                     f.write(val_msg + "\n")
 
+        if checkpoint_schedule and save_path is not None:
+            epoch_num = epoch + 1
+            if epoch_num in checkpoint_schedule:
+                rng_state = _capture_rng_state(device)
+                epoch_save_path = _checkpoint_path_for_epoch(
+                    save_path, epoch_num, args.epochs
+                )
+                maybe_save_model(
+                    model,
+                    dataset,
+                    data_path,
+                    epoch_save_path,
+                    optimizer=optimizer,
+                    global_step=step,
+                    epoch=epoch_num,
+                    rng_state=rng_state,
+                    scheduler=scheduler,
+                )
+
     rng_state = _capture_rng_state(device)
     maybe_save_model(
         model,
         dataset,
         data_path,
-        args.save_path,
+        save_path,
         optimizer=optimizer,
         global_step=step,
+        epoch=args.epochs,
         rng_state=rng_state,
         scheduler=scheduler,
     )
