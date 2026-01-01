@@ -11,6 +11,7 @@ from utils import (
     START_TOKEN_ID,
     apply_color_permutation_to_grid,
     apply_color_permutation_to_tokens,
+    apply_dihedral_transform,
     compute_positions_3d,
     extract_output_tokens,
     grid_to_tokens,
@@ -372,12 +373,67 @@ def _build_prompt_from_tokens(tokens: Sequence[int]) -> List[int]:
     return list(tokens[: sep_idx + 1])
 
 
+def _resolve_dihedral_transform_index(
+    task_id: Optional[str],
+    dihedral_index: Optional[int],
+    dihedral_orders_by_task: Optional[Dict[str, Sequence[int]]],
+) -> Optional[int]:
+    if dihedral_index is None:
+        return None
+    if dihedral_orders_by_task is None or task_id is None:
+        return int(dihedral_index)
+    order = dihedral_orders_by_task.get(task_id)
+    if not order:
+        return int(dihedral_index)
+    if dihedral_index < 0 or dihedral_index >= len(order):
+        raise ValueError(
+            f"Invalid dihedral index {dihedral_index} for task {task_id}."
+        )
+    return int(order[dihedral_index])
+
+
+def _select_tokens_for_example(
+    example: object, transform_index: Optional[int]
+) -> Tuple[List[int], Optional[torch.Tensor]]:
+    tokens = getattr(example, "tokens")
+    cached_positions = getattr(example, "cached_positions", None)
+    if transform_index is not None:
+        tokens_by_dihedral = getattr(example, "tokens_by_dihedral", None)
+        if tokens_by_dihedral:
+            if transform_index < 0 or transform_index >= len(tokens_by_dihedral):
+                raise ValueError(
+                    f"Invalid dihedral transform index {transform_index} for example {getattr(example, 'task_id', None)}."
+                )
+            tokens = tokens_by_dihedral[transform_index]
+            cached_by_dihedral = getattr(example, "cached_positions_by_dihedral", None)
+            if cached_by_dihedral:
+                cached_positions = cached_by_dihedral[transform_index]
+    token_list = tokens.tolist() if isinstance(tokens, torch.Tensor) else list(tokens)
+    return token_list, cached_positions
+
+
+def _sequence_length_for_example(
+    example: object, transform_index: Optional[int]
+) -> int:
+    if transform_index is not None:
+        tokens_by_dihedral = getattr(example, "tokens_by_dihedral", None)
+        if tokens_by_dihedral:
+            return int(tokens_by_dihedral[transform_index].size(0))
+    seq_len = getattr(example, "seq_len", None)
+    if seq_len is not None:
+        return int(seq_len)
+    tokens = getattr(example, "tokens")
+    return int(tokens.size(0) if isinstance(tokens, torch.Tensor) else len(tokens))
+
+
 def _prepare_examples_for_inference(
     examples: Sequence[object],
     include_targets: bool = False,
     solutions: Optional[Dict[Tuple[str, int], List[List[int]]]] = None,
     color_mappings: Optional[Sequence[Optional[Sequence[int]]]] = None,
     color_apply_fn: Optional[Callable[[str], bool]] = None,
+    dihedral_transform_indices: Optional[Sequence[Optional[int]]] = None,
+    pair_indices: Optional[Sequence[int]] = None,
 ) -> Tuple[
     List[List[int]],
     List[int],
@@ -394,7 +450,12 @@ def _prepare_examples_for_inference(
     for idx, ex in enumerate(examples):
         if not hasattr(ex, "tokens"):
             raise ValueError("Examples must provide a 'tokens' attribute.")
-        raw_tokens = ex.tokens.tolist()
+        transform_index = (
+            dihedral_transform_indices[idx]
+            if dihedral_transform_indices is not None
+            else None
+        )
+        raw_tokens, cached = _select_tokens_for_example(ex, transform_index)
         split = getattr(ex, "split", None)
 
         # Select the specific mapping for this example
@@ -411,7 +472,6 @@ def _prepare_examples_for_inference(
         prompt_tokens = _build_prompt_from_tokens(tokens)
         prompts.append(prompt_tokens)
         example_ids.append(int(getattr(ex, "example_id", 0)))
-        cached = getattr(ex, "cached_positions", None)
         if cached is not None:
             cached_positions.append(cached[: len(prompt_tokens)])
         else:
@@ -424,14 +484,23 @@ def _prepare_examples_for_inference(
             key = (getattr(ex, "task_id", None), getattr(ex, "pair_index", None))
             if key in solutions and solutions[key] is not None:
                 target_grid = solutions[key]
+                if transform_index is not None:
+                    target_grid = apply_dihedral_transform(
+                        target_grid, transform_index
+                    )
                 if should_color:
                     target_grid = apply_color_permutation_to_grid(target_grid, mapping)
                 targets = grid_to_tokens(target_grid)
         target_tokens.append(targets)
+        pair_index = (
+            pair_indices[idx]
+            if pair_indices is not None
+            else getattr(ex, "pair_index", None)
+        )
         metadata.append(
             {
                 "task_id": getattr(ex, "task_id", None),
-                "pair_index": getattr(ex, "pair_index", None),
+                "pair_index": pair_index,
                 "example_id": getattr(ex, "example_id", None),
                 "split": getattr(ex, "split", None),
             }
@@ -565,6 +634,7 @@ def run_split_inference(
     color_mappings: Optional[Sequence[Sequence[int]]] = None,
     color_mappings_by_task: Optional[Dict[str, Sequence[Sequence[int]]]] = None,
     color_apply_fn: Optional[Callable[[str], bool]] = None,
+    dihedral_orders_by_task: Optional[Dict[str, Sequence[int]]] = None,
     temperature: Optional[float] = None,
     top_k: Optional[int] = None,
 ) -> List[Dict[str, object]]:
@@ -591,12 +661,40 @@ def run_split_inference(
             task_mappings = global_mappings
         if not task_mappings:
             task_mappings = [None]
-        for c_idx, mapping in enumerate(task_mappings):
-            work_items.append((ex, c_idx, mapping))
+        task_id = getattr(ex, "task_id", None)
+        order = (
+            dihedral_orders_by_task.get(task_id)
+            if dihedral_orders_by_task is not None
+            else None
+        )
+        if order:
+            dihedral_indices = list(range(len(order)))
+        else:
+            dihedral_indices = [None]
+        for dihedral_index in dihedral_indices:
+            transform_index = _resolve_dihedral_transform_index(
+                task_id, dihedral_index, dihedral_orders_by_task
+            )
+            seq_len = _sequence_length_for_example(ex, transform_index)
+            pair_index = getattr(ex, "pair_index", None)
+            if dihedral_index is not None and pair_index is not None:
+                pair_index = int(pair_index) * 8 + int(dihedral_index)
+            for c_idx, mapping in enumerate(task_mappings):
+                work_items.append(
+                    (
+                        ex,
+                        dihedral_index,
+                        transform_index,
+                        c_idx,
+                        mapping,
+                        pair_index,
+                        seq_len,
+                    )
+                )
 
     # Sort ALL work items by sequence length (descending) to minimize padding.
-    # Note: Color permutation maps digits 1-to-1, so ex.seq_len is invariant.
-    work_items.sort(key=lambda item: item[0].seq_len, reverse=True)
+    # Note: Color permutation maps digits 1-to-1, so seq_len stays invariant per dihedral.
+    work_items.sort(key=lambda item: item[-1], reverse=True)
 
     all_results: List[Dict[str, object]] = []
 
@@ -605,8 +703,11 @@ def run_split_inference(
 
         # Unzip the batch components
         batch_examples = [item[0] for item in chunk]
-        batch_c_indices = [item[1] for item in chunk]
-        batch_mappings = [item[2] for item in chunk]
+        batch_dihedral_indices = [item[1] for item in chunk]
+        batch_transform_indices = [item[2] for item in chunk]
+        batch_c_indices = [item[3] for item in chunk]
+        batch_mappings = [item[4] for item in chunk]
+        batch_pair_indices = [item[5] for item in chunk]
 
         (prompts, example_ids, metadata, cached_positions, target_output_tokens) = (
             _prepare_examples_for_inference(
@@ -615,6 +716,8 @@ def run_split_inference(
                 solutions=solutions,
                 color_mappings=batch_mappings,  # Pass the batch-specific mappings
                 color_apply_fn=color_apply_fn,
+                dihedral_transform_indices=batch_transform_indices,
+                pair_indices=batch_pair_indices,
             )
         )
         if log_prompts:
@@ -645,9 +748,13 @@ def run_split_inference(
         )
 
         # Attach the correct color index to each result and collect
-        for res, c_idx in zip(batch_results, batch_c_indices):
+        for res, c_idx, d_idx in zip(
+            batch_results, batch_c_indices, batch_dihedral_indices
+        ):
             if color_mappings_by_task is not None or color_mappings is not None:
                 res["color_permutation_index"] = c_idx
+            if dihedral_orders_by_task is not None and d_idx is not None:
+                res["dihedral_index"] = d_idx
             all_results.append(res)
 
     return all_results

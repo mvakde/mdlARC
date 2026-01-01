@@ -49,7 +49,7 @@ def _build_eval_results_payload(eval_results, eval_configs):
 
 # Dataset building
 BUILD_DATASETS = True
-AUGMENT_DIHEDRAL = True
+AUGMENT_DIHEDRAL = False
 DATASET_NAMES = ["arc1", "conceptarc"]
 DATASET_SPLITS = ["train", "eval"]
 WITH_SOLUTIONS = True
@@ -101,8 +101,7 @@ ARGS = {
     "train_log_file": Path("runs/training_log.txt"),
     "save_path": Path("runs/tiny.pt"),
     "checkpoint_path": None,  # Path("runs/tiny.pt") to resume
-    "data_path": Path("assets/challenges_dihedral_both.json"),
-    "dihedral_augmented": True,
+    "data_path": Path("assets/challenges.json"),
     # hyperparameters
     "epochs": 101,
     "batch_size": 32,
@@ -113,6 +112,10 @@ ARGS = {
     "disable_color_aug_last_epochs": 1,
     "color_aug_seed": 42,
     "color_aug_seed_eval": None,
+    "enable_dihedral_aug_train": True,
+    "enable_dihedral_on_aug_test_split_during_training": True,
+    "enable_dihedral_aug_eval": True,
+    "dihedral_aug_seed": None,
     "lr": 3e-4,
     "warmup_pct": 0.02,
     "wsd_decay_start_pct": 0.8,  # 1.0 = no decay (start at last epoch)
@@ -299,9 +302,9 @@ def main() -> None:
             max_color_aug = eval_config[1]
             dataset_path = eval_config[2]
             if len(eval_config) > 3:
-                dihedral_augmented = bool(eval_config[3])
+                dihedral_enabled = bool(eval_config[3])
             else:
-                dihedral_augmented = bool(getattr(cfg, "dihedral_augmented", False))
+                dihedral_enabled = bool(getattr(cfg, "enable_dihedral_aug_eval", False))
 
             color_seed = getattr(cfg, "color_aug_seed_eval", None)
             if color_seed is None:
@@ -309,15 +312,26 @@ def main() -> None:
             if color_seed is None:
                 color_seed = getattr(cfg, "seed", 42)
 
+            dihedral_seed = getattr(cfg, "dihedral_aug_seed", None)
+            if dihedral_seed is None:
+                dihedral_seed = getattr(cfg, "seed", 42)
+            dihedral_orders = None
+            if dihedral_enabled:
+                challenges = utils.load_challenges(dataset_path)
+                dihedral_orders = utils.generate_task_dihedral_orders(
+                    list(challenges.keys()), int(dihedral_seed)
+                )
+
             aaivr.visualize_aaivr_flow(
                 test_results,
                 dataset_path=dataset_path,
                 input_index=AAIVR_FLOW_INPUT_INDEX,
                 task_id=AAIVR_FLOW_TASK_ID,
                 task_index=AAIVR_FLOW_TASK_INDEX,
-                is_dihedral_augmented=dihedral_augmented,
+                is_dihedral_augmented=dihedral_enabled,
                 max_color_augments=max_color_aug,
                 color_aug_seed=color_seed,
+                dihedral_orders_by_task=dihedral_orders,
             )
 
     if ENABLE_ARCHIVE and UPDATE_ARCHIVE_AFTER_EVAL:

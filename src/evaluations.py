@@ -16,6 +16,7 @@ from utils import (
     IO_SEPARATOR_TOKEN_ID,
     NEXT_LINE_TOKEN_ID,
     generate_task_color_mappings,
+    generate_task_dihedral_orders,
 )
 
 
@@ -101,6 +102,7 @@ def evaluate_model_on_dataset(
     color_mappings: Optional[Sequence[Sequence[int]]] = None,
     color_mappings_by_task: Optional[Dict[str, Sequence[Sequence[int]]]] = None,
     color_apply_fn: Optional[Callable[[str], bool]] = None,
+    dihedral_orders_by_task: Optional[Dict[str, Sequence[int]]] = None,
     task_ids: Optional[Sequence[str]] = None,
     include_targets: bool = True,
     temperature: Optional[float] = None,
@@ -126,6 +128,7 @@ def evaluate_model_on_dataset(
             color_mappings=color_mappings,
             color_mappings_by_task=color_mappings_by_task,
             color_apply_fn=color_apply_fn,
+            dihedral_orders_by_task=dihedral_orders_by_task,
             task_ids=task_ids,
             temperature=temperature,
             top_k=top_k,
@@ -243,6 +246,8 @@ def run_evaluation_pipeline(
     prev_enable_color_aug = getattr(cfg, "enable_color_aug_eval", None)
     had_max_color_aug = hasattr(cfg, "max_color_augments_eval")
     prev_max_color_aug = getattr(cfg, "max_color_augments_eval", None)
+    had_enable_dihedral_aug = hasattr(cfg, "enable_dihedral_aug_eval")
+    prev_enable_dihedral_aug = getattr(cfg, "enable_dihedral_aug_eval", None)
 
     if checkpoint_path is None:
         checkpoint_path = getattr(cfg, "checkpoint_path", None)
@@ -253,6 +258,12 @@ def run_evaluation_pipeline(
     cfg.data_path = dataset_path
     cfg.enable_color_aug_eval = max_color_augments > 0
     cfg.max_color_augments_eval = max_color_augments
+    dihedral_aug_enabled = (
+        is_dihedral_augmented
+        if is_dihedral_augmented is not None
+        else getattr(cfg, "enable_dihedral_aug_eval", False)
+    )
+    cfg.enable_dihedral_aug_eval = bool(dihedral_aug_enabled)
 
     reuse_dataset = None
     prior_dataset = state.get("dataset")
@@ -291,6 +302,15 @@ def run_evaluation_pipeline(
         )
         color_apply_fn = lambda split: True
 
+    dihedral_orders_eval = None
+    if cfg.enable_dihedral_aug_eval:
+        dihedral_seed = getattr(cfg, "dihedral_aug_seed", None)
+        if dihedral_seed is None:
+            dihedral_seed = getattr(cfg, "seed", 42)
+        dihedral_orders_eval = generate_task_dihedral_orders(
+            dataset.task_ids, int(dihedral_seed)
+        )
+
     evaluation = evaluate_model_on_dataset(
         model=model,
         dataset=dataset,
@@ -302,6 +322,7 @@ def run_evaluation_pipeline(
         splits=splits,
         color_mappings_by_task=color_mappings_eval,
         color_apply_fn=color_apply_fn,
+        dihedral_orders_by_task=dihedral_orders_eval,
         task_ids=task_ids,
         include_targets=include_targets,
     )
@@ -309,11 +330,7 @@ def run_evaluation_pipeline(
     epochs = getattr(cfg, "epochs", None)
     epoch_label = f"{epochs}ep" if epochs is not None else "eval"
     log_eval(f"\n-- {epoch_label} {max_color_augments}color --\n")
-    dihedral_augmented = (
-        is_dihedral_augmented
-        if is_dihedral_augmented is not None
-        else getattr(cfg, "dihedral_augmented", False)
-    )
+    dihedral_augmented = bool(cfg.enable_dihedral_aug_eval)
 
     for split in splits:
         summary = evaluation.get(split, {}).get("summary", {})
@@ -362,6 +379,7 @@ def run_evaluation_pipeline(
                 test_results,
                 is_dihedral_augmented=dataset_has_dihedral_augments,
                 color_mappings_by_task=color_mappings_eval,
+                dihedral_orders_by_task=dihedral_orders_eval,
             )
         else:
             print("No test results for AAIVR.")
@@ -393,6 +411,10 @@ def run_evaluation_pipeline(
         cfg.max_color_augments_eval = prev_max_color_aug
     else:
         delattr(cfg, "max_color_augments_eval")
+    if had_enable_dihedral_aug:
+        cfg.enable_dihedral_aug_eval = prev_enable_dihedral_aug
+    else:
+        delattr(cfg, "enable_dihedral_aug_eval")
 
     return evaluation, aaivr_results, submission_path, state
 
@@ -419,7 +441,7 @@ def run_evaluation_configs(
     for config in eval_configs:
         if len(config) == 3:
             name, aug_count, data_path = config
-            dihedral_augmented = getattr(cfg, "dihedral_augmented", False)
+            dihedral_augmented = getattr(cfg, "enable_dihedral_aug_eval", False)
         elif len(config) == 4:
             name, aug_count, data_path, dihedral_augmented = config
         else:
