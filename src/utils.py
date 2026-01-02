@@ -99,19 +99,26 @@ def _normalize_input_colors(colors: Iterable[int]) -> List[int]:
     return sorted({int(c) for c in colors if 1 <= int(c) <= 9})
 
 
-def extract_task_input_colors(task: Dict[str, object]) -> List[int]:
-    """Return sorted unique colors (1-9) present in ANY input grid for a task."""
+def _extract_task_colors(task: Dict[str, object], key: str) -> Set[int]:
     colors: Set[int] = set()
     for split in ("train", "test"):
         pairs = task.get(split, [])
         for pair in pairs:
-            grid = pair.get("input", [])
+            grid = pair.get(key) or []
             for row in grid:
                 for val in row:
                     val_i = int(val)
                     if 1 <= val_i <= 9:
                         colors.add(val_i)
-    return sorted(colors)
+    return colors
+
+
+def extract_task_input_colors(task: Dict[str, object]) -> List[int]:
+    """Return sorted colors (1-9) eligible for permutation (exclude output-only)."""
+    input_colors = _extract_task_colors(task, "input")
+    output_colors = _extract_task_colors(task, "output")
+    output_only = output_colors - input_colors
+    return [color for color in range(1, 10) if color not in output_only]
 
 
 def _stable_hash(text: str) -> int:
