@@ -3,7 +3,7 @@ import json
 import sys
 from pathlib import Path
 from time import perf_counter
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -218,7 +218,6 @@ def run_evaluation_pipeline(
     task_ids: Optional[Sequence[str]] = None,
     log_correct_grids: bool = False,
     state: Optional[Dict[str, object]] = None,
-    is_dihedral_augmented: Optional[bool] = None,
 ) -> Tuple[
     Dict[str, Dict[str, object]],
     List[aaivr.AAIVRSelection],
@@ -258,12 +257,9 @@ def run_evaluation_pipeline(
     cfg.data_path = dataset_path
     cfg.enable_color_aug_eval = max_color_augments > 0
     cfg.max_color_augments_eval = max_color_augments
-    dihedral_aug_enabled = (
-        is_dihedral_augmented
-        if is_dihedral_augmented is not None
-        else getattr(cfg, "enable_dihedral_aug_eval", False)
+    cfg.enable_dihedral_aug_eval = bool(
+        getattr(cfg, "enable_dihedral_aug_eval", False)
     )
-    cfg.enable_dihedral_aug_eval = bool(dihedral_aug_enabled)
 
     reuse_dataset = None
     prior_dataset = state.get("dataset")
@@ -421,9 +417,7 @@ def run_evaluation_pipeline(
 
 def run_evaluation_configs(
     cfg: argparse.Namespace,
-    eval_configs: Sequence[
-        Union[Tuple[str, int, Path], Tuple[str, int, Path, bool]]
-    ],
+    eval_configs: Sequence[Tuple[str, int, Path]],
     *,
     eval_batch_size: int = 1300,
     splits: Sequence[str] = ("test",),
@@ -439,16 +433,11 @@ def run_evaluation_configs(
     results: List[Tuple[str, Dict[str, Dict[str, object]], Path]] = []
 
     for config in eval_configs:
-        if len(config) == 3:
-            name, aug_count, data_path = config
-            dihedral_augmented = getattr(cfg, "enable_dihedral_aug_eval", False)
-        elif len(config) == 4:
-            name, aug_count, data_path, dihedral_augmented = config
-        else:
+        if len(config) != 3:
             raise ValueError(
-                "eval_configs entries must be (name, aug_count, data_path) or "
-                "(name, aug_count, data_path, dihedral_augmented)."
+                "eval_configs entries must be (name, aug_count, data_path)."
             )
+        name, aug_count, data_path = config
         t_start = perf_counter()
         evaluation, _, submission_path, state = run_evaluation_pipeline(
             cfg,
@@ -461,7 +450,6 @@ def run_evaluation_configs(
             include_targets=include_targets,
             task_ids=task_ids,
             log_correct_grids=log_correct_grids,
-            is_dihedral_augmented=dihedral_augmented,
             state=state,
         )
         t_duration = perf_counter() - t_start

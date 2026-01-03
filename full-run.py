@@ -1,6 +1,6 @@
 import argparse
-import json
 import os
+import pickle
 import shutil
 import subprocess
 import sys
@@ -9,39 +9,6 @@ from time import perf_counter
 from typing import List, Optional
 
 # Python port of interactive-run.ipynb for non-notebook runs.
-
-
-def _serialize_eval_configs(eval_configs):
-    serialized = []
-    for config in eval_configs:
-        if len(config) == 3:
-            name, aug_count, data_path = config
-            dihedral = None
-        else:
-            name, aug_count, data_path, dihedral = config
-        serialized.append(
-            [
-                name,
-                aug_count,
-                str(data_path),
-                bool(dihedral) if dihedral is not None else None,
-            ]
-        )
-    return serialized
-
-
-def _build_eval_results_payload(eval_results, eval_configs):
-    return {
-        "configs": _serialize_eval_configs(eval_configs),
-        "results": [
-            {
-                "name": name,
-                "evaluation": evaluation,
-                "submission_path": str(submission_path),
-            }
-            for name, evaluation, submission_path in eval_results
-        ],
-    }
 
 # ---------------------------
 # Config (edit in-place)
@@ -142,7 +109,7 @@ ARGS = {
 
 # Evaluation config
 PATH_BOTH = ARGS["data_path"]
-EVAL_CONFIGS = [("eval_100color_both", 100, PATH_BOTH, True)]
+EVAL_CONFIGS = [("eval_100color_both", 100, PATH_BOTH)]
 EVAL_BATCH_SIZE = 900
 EVAL_SPLITS = ["test"]
 EVAL_CHECKPOINT_PATH = ARGS["save_path"]
@@ -279,10 +246,8 @@ def main() -> None:
             log_correct_grids=EVAL_LOG_CORRECT_GRIDS,
         )
         if eval_results:
-            eval_results_path = runs_dir / "eval_results.json"
-            eval_results_path.write_text(
-                json.dumps(_build_eval_results_payload(eval_results, EVAL_CONFIGS))
-            )
+            eval_results_path = runs_dir / "eval_results.pkl"
+            eval_results_path.write_bytes(pickle.dumps(eval_results))
             print(f"Saved eval_results to {eval_results_path}")
 
     if RUN_EVALUATION and RUN_SCORING:
@@ -304,10 +269,7 @@ def main() -> None:
             eval_config = EVAL_CONFIGS[cfg_idx]
             max_color_aug = eval_config[1]
             dataset_path = eval_config[2]
-            if len(eval_config) > 3:
-                dihedral_enabled = bool(eval_config[3])
-            else:
-                dihedral_enabled = bool(getattr(cfg, "enable_dihedral_aug_eval", False))
+            dihedral_enabled = bool(getattr(cfg, "enable_dihedral_aug_eval", False))
 
             color_seed = getattr(cfg, "color_aug_seed_eval", None)
             if color_seed is None:
