@@ -91,6 +91,9 @@ ARGS = {
     "wsd_decay_start_pct": 0.8,  # 1.0 = no decay (start at last epoch)
     "lr_floor": 0.01,
     "weight_decay": 0.01,
+    "attention_weight_decay": 0.01,
+    "token_embedding_weight_decay": 0.0,
+    "task_embedding_weight_decay": 0.0,
     "grad_clip": 1.0,
     "dropout": 0.1,
     "seed": 42,

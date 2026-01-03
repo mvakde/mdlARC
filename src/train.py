@@ -9,7 +9,7 @@ from torch import nn
 from torch.optim import AdamW
 import numpy as np
 
-from tinytransformer import TinyTransformer, TinyTransformerConfig
+from tinytransformer import RMSNorm, TinyTransformer, TinyTransformerConfig
 from utils import (
     ARCExampleDataset,
     MAX_SEQ_LEN,
@@ -21,7 +21,7 @@ from utils import (
     tokens_to_string,
 )
 
-DEFAULT_DATA_PATH = Path("assets/ARC-2/grouped-tasks/training/challenges.json")
+DEFAULT_DATA_PATH = Path("assets/challenges.json")
 
 
 def set_seed(seed: int) -> None:
@@ -296,9 +296,46 @@ def train_one_epoch(
     return step
 
 
-def _build_weight_decay_param_groups(model: nn.Module, weight_decay: float) -> Any:
-    """Split parameters so only non-attention Linear weights use weight decay."""
+def _is_norm_module(module: nn.Module) -> bool:
+    return isinstance(
+        module,
+        (
+            nn.LayerNorm,
+            nn.BatchNorm1d,
+            nn.BatchNorm2d,
+            nn.BatchNorm3d,
+            nn.GroupNorm,
+            RMSNorm,
+        ),
+    )
+
+
+def _is_positional_embedding_param(name: str) -> bool:
+    lowered = name.lower()
+    return (
+        "pos_embed" in lowered
+        or "position_embedding" in lowered
+        or "positional_embedding" in lowered
+    )
+
+
+def _is_attention_param(name: str) -> bool:
+    parts = name.split(".")
+    return "attention" in parts
+
+
+def _build_weight_decay_param_groups(
+    model: nn.Module,
+    weight_decay: float,
+    attention_weight_decay: float,
+    token_embedding_weight_decay: float,
+    task_embedding_weight_decay: float,
+) -> Any:
+    """Split parameters into decay groups for linear, attention, and embeddings."""
     decay_params = []
+    attention_params = []
+    token_embed_params = []
+    task_embed_params = []
     no_decay_params = []
 
     for name, param in model.named_parameters():
@@ -311,7 +348,24 @@ def _build_weight_decay_param_groups(model: nn.Module, weight_decay: float) -> A
         module_name = name.rsplit(".", 1)[0] if "." in name else ""
         module = model.get_submodule(module_name) if module_name else model
 
-        if isinstance(module, nn.Linear) and "attention" not in module_name:
+        if _is_norm_module(module) or _is_positional_embedding_param(name):
+            no_decay_params.append(param)
+            continue
+
+        if isinstance(module, nn.Embedding):
+            if name.startswith("token_embedding."):
+                token_embed_params.append(param)
+            elif name.startswith("example_embedding."):
+                task_embed_params.append(param)
+            else:
+                no_decay_params.append(param)
+            continue
+
+        if _is_attention_param(name):
+            attention_params.append(param)
+            continue
+
+        if isinstance(module, nn.Linear):
             decay_params.append(param)
         else:
             no_decay_params.append(param)
@@ -319,6 +373,24 @@ def _build_weight_decay_param_groups(model: nn.Module, weight_decay: float) -> A
     param_groups = []
     if decay_params:
         param_groups.append({"params": decay_params, "weight_decay": weight_decay})
+    if attention_params:
+        param_groups.append(
+            {"params": attention_params, "weight_decay": attention_weight_decay}
+        )
+    if token_embed_params:
+        param_groups.append(
+            {
+                "params": token_embed_params,
+                "weight_decay": token_embedding_weight_decay,
+            }
+        )
+    if task_embed_params:
+        param_groups.append(
+            {
+                "params": task_embed_params,
+                "weight_decay": task_embedding_weight_decay,
+            }
+        )
     if no_decay_params:
         param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
     return param_groups
@@ -667,7 +739,17 @@ def train_model(
         getattr(args, "checkpoint_epochs", None), args.epochs
     )
 
-    param_groups = _build_weight_decay_param_groups(model, args.weight_decay)
+    attention_weight_decay = getattr(args, "attention_weight_decay", args.weight_decay)
+    token_embedding_weight_decay = getattr(args, "token_embedding_weight_decay", 0.0)
+    task_embedding_weight_decay = getattr(args, "task_embedding_weight_decay", 0.0)
+
+    param_groups = _build_weight_decay_param_groups(
+        model,
+        args.weight_decay,
+        attention_weight_decay,
+        token_embedding_weight_decay,
+        task_embedding_weight_decay,
+    )
 
     # Fused AdamW is significantly faster on CUDA.
     use_fused = device.type == "cuda"
