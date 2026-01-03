@@ -479,6 +479,7 @@ def build_model_and_data(
             include_outputs=True,
             max_seq_len=MAX_SEQ_LEN,
             task_whitelist=task_whitelist,
+            color_aug_mode=getattr(args, "color_aug_mode", None),
         )
 
     color_augmentor = _build_color_augmentor(args, dataset, is_eval=is_eval)
@@ -643,6 +644,7 @@ def train_model(
             load_test_solutions=True,  # <--- Loads solutions.json
             max_seq_len=MAX_SEQ_LEN,
             task_whitelist=dataset.task_ids,  # Keep ID mapping consistent
+            color_aug_mode=getattr(args, "color_aug_mode", None),
         )
 
         val_dataloader = create_dataloader(
