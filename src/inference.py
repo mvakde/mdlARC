@@ -141,7 +141,7 @@ def batched_greedy_generate(
     # We only need space for the prompt + new tokens
     batch_max_needed = current_len + max_new_tokens
 
-    # OPTIONAL: Round up to nearest 64 to reduce torch.compile recompilation frequency
+    # OPTIONAL: Round up to nearest 128 to reduce torch.compile recompilation frequency
     batch_max_needed = (batch_max_needed + 127) // 128 * 128
 
     # Clamp to model capacity
@@ -386,9 +386,7 @@ def _resolve_dihedral_transform_index(
     if not order:
         return int(dihedral_index)
     if dihedral_index < 0 or dihedral_index >= len(order):
-        raise ValueError(
-            f"Invalid dihedral index {dihedral_index} for task {task_id}."
-        )
+        raise ValueError(f"Invalid dihedral index {dihedral_index} for task {task_id}.")
     return int(order[dihedral_index])
 
 
@@ -485,9 +483,7 @@ def _prepare_examples_for_inference(
             if key in solutions and solutions[key] is not None:
                 target_grid = solutions[key]
                 if transform_index is not None:
-                    target_grid = apply_dihedral_transform(
-                        target_grid, transform_index
-                    )
+                    target_grid = apply_dihedral_transform(target_grid, transform_index)
                 if should_color:
                     target_grid = apply_color_permutation_to_grid(target_grid, mapping)
                 targets = grid_to_tokens(target_grid)
