@@ -99,19 +99,46 @@ def _normalize_input_colors(colors: Iterable[int]) -> List[int]:
     return sorted({int(c) for c in colors if 1 <= int(c) <= 9})
 
 
-def extract_task_input_colors(task: Dict[str, object]) -> List[int]:
-    """Return sorted unique colors (1-9) present in ANY input grid for a task."""
+_COLOR_AUG_MODES = ("input_only", "exclude_output_only")
+
+
+def _normalize_color_aug_mode(mode: Optional[str]) -> str:
+    if mode is None:
+        return "exclude_output_only"
+    mode_str = str(mode)
+    if mode_str not in _COLOR_AUG_MODES:
+        raise ValueError(
+            f"Unknown color augmentation mode '{mode_str}'. "
+            f"Expected one of: {', '.join(_COLOR_AUG_MODES)}."
+        )
+    return mode_str
+
+
+def _extract_task_colors(task: Dict[str, object], key: str) -> Set[int]:
     colors: Set[int] = set()
     for split in ("train", "test"):
         pairs = task.get(split, [])
         for pair in pairs:
-            grid = pair.get("input", [])
+            grid = pair.get(key) or []
             for row in grid:
                 for val in row:
                     val_i = int(val)
                     if 1 <= val_i <= 9:
                         colors.add(val_i)
-    return sorted(colors)
+    return colors
+
+
+def extract_task_input_colors(
+    task: Dict[str, object], mode: Optional[str] = None
+) -> List[int]:
+    """Return sorted colors (1-9) eligible for permutation."""
+    mode = _normalize_color_aug_mode(mode)
+    input_colors = _extract_task_colors(task, "input")
+    if mode == "input_only":
+        return sorted(input_colors)
+    output_colors = _extract_task_colors(task, "output")
+    output_only = output_colors - input_colors
+    return [color for color in range(1, 10) if color not in output_only]
 
 
 def _stable_hash(text: str) -> int:
@@ -195,6 +222,90 @@ def generate_task_color_mappings(
     return mappings_by_task
 
 
+_DIHEDRAL_TRANSFORM_NAMES = [
+    "identity",
+    "rot90",
+    "rot180",
+    "rot270",
+    "flip_horizontal",
+    "flip_vertical",
+    "flip_main_diagonal",
+    "flip_anti_diagonal",
+]
+
+
+def _dihedral_copy(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    return [list(row) for row in grid]
+
+
+def _dihedral_rot90(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    if not grid:
+        return []
+    return [list(row) for row in zip(*grid[::-1])]
+
+
+def _dihedral_rot180(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    return [list(reversed(row)) for row in reversed(grid)]
+
+
+def _dihedral_rot270(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    if not grid:
+        return []
+    return [list(row) for row in zip(*grid)][::-1]
+
+
+def _dihedral_flip_horizontal(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    return [list(reversed(row)) for row in grid]
+
+
+def _dihedral_flip_vertical(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    return [list(row) for row in reversed(grid)]
+
+
+def _dihedral_flip_main_diagonal(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    if not grid:
+        return []
+    return [list(row) for row in zip(*grid)]
+
+
+def _dihedral_flip_anti_diagonal(grid: Sequence[Sequence[int]]) -> List[List[int]]:
+    return _dihedral_flip_vertical(_dihedral_rot90(grid))
+
+
+_DIHEDRAL_TRANSFORMS = {
+    "identity": _dihedral_copy,
+    "rot90": _dihedral_rot90,
+    "rot180": _dihedral_rot180,
+    "rot270": _dihedral_rot270,
+    "flip_horizontal": _dihedral_flip_horizontal,
+    "flip_vertical": _dihedral_flip_vertical,
+    "flip_main_diagonal": _dihedral_flip_main_diagonal,
+    "flip_anti_diagonal": _dihedral_flip_anti_diagonal,
+}
+
+
+def apply_dihedral_transform(
+    grid: Sequence[Sequence[int]], transform_index: int
+) -> List[List[int]]:
+    if transform_index < 0:
+        raise ValueError("transform_index must be non-negative.")
+    transform_name = _DIHEDRAL_TRANSFORM_NAMES[transform_index % 8]
+    return _DIHEDRAL_TRANSFORMS[transform_name](grid)
+
+
+def generate_task_dihedral_orders(
+    task_ids: Sequence[str], seed: int
+) -> Dict[str, List[int]]:
+    orders: Dict[str, List[int]] = {}
+    for task_id in task_ids:
+        task_seed = _derive_task_seed(seed, task_id)
+        rng = random.Random(task_seed)
+        order = list(range(8))
+        rng.shuffle(order)
+        orders[task_id] = order
+    return orders
+
+
 def apply_color_permutation_to_tokens(
     tokens: Sequence[int], mapping: Sequence[int]
 ) -> List[int]:
@@ -262,6 +373,68 @@ class TaskColorAugmentor:
 
     def mappings_for_task(self, task_id: str) -> Sequence[torch.Tensor]:
         return self.mappings_by_task.get(task_id, [])
+
+
+class TaskDihedralAugmentor:
+    """Per-task dihedral augmentation with epoch-based indexing."""
+
+    def __init__(
+        self,
+        orders_by_task: Dict[str, Sequence[int]],
+        apply_to_test_split: bool = False,
+    ) -> None:
+        self.orders_by_task = {
+            task_id: list(order) for task_id, order in orders_by_task.items()
+        }
+        self.apply_to_test_split = apply_to_test_split
+        self._epoch = 0
+        self._enabled = True
+        self._max_transforms = max(
+            (len(order) for order in self.orders_by_task.values()), default=0
+        )
+
+    @property
+    def max_transforms(self) -> int:
+        if not self._enabled:
+            return 0
+        return self._max_transforms
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = bool(enabled)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = max(0, int(epoch))
+
+    def _index_for_task(self, task_id: str) -> Optional[int]:
+        order = self.orders_by_task.get(task_id)
+        if not order:
+            return None
+        return self._epoch % len(order)
+
+    def dihedral_index_for_task(self, task_id: str, split: str) -> Optional[int]:
+        if not self._enabled:
+            return None
+        if split == "test" and not self.apply_to_test_split:
+            return None
+        return self._index_for_task(task_id)
+
+    def transform_index_for_task(self, task_id: str, split: str) -> Optional[int]:
+        dihedral_index = self.dihedral_index_for_task(task_id, split)
+        if dihedral_index is None:
+            return None
+        order = self.orders_by_task.get(task_id)
+        if not order:
+            return None
+        return int(order[dihedral_index])
+
+    def transform_index_for_example(self, example: "SequenceExample") -> Optional[int]:
+        return self.transform_index_for_task(example.task_id, example.split)
+
+    def dihedral_index_for_example(self, example: "SequenceExample") -> Optional[int]:
+        return self.dihedral_index_for_task(example.task_id, example.split)
+
+    def order_for_task(self, task_id: str) -> Sequence[int]:
+        return self.orders_by_task.get(task_id, [])
 
 
 def _value_to_token_id(value: int) -> int:
@@ -857,6 +1030,9 @@ class SequenceExample:
     pair_index: int
     has_output: bool
     seq_len: int
+    tokens_by_dihedral: Optional[List[torch.LongTensor]] = None
+    cached_positions_by_dihedral: Optional[List[torch.LongTensor]] = None
+    seq_len_by_dihedral: Optional[List[int]] = None
 
 
 class ARCExampleDataset(Dataset):
@@ -871,6 +1047,7 @@ class ARCExampleDataset(Dataset):
         drop_long_sequences: bool = False,
         task_whitelist: Optional[Sequence[str]] = None,
         load_test_solutions: bool = False,
+        color_aug_mode: Optional[str] = None,
     ) -> None:
         available_splits = {"train", "test"}
         for split in splits:
@@ -883,6 +1060,7 @@ class ARCExampleDataset(Dataset):
         self.max_seq_len = max_seq_len
         self.drop_long_sequences = drop_long_sequences
         self.include_outputs = include_outputs
+        self.color_aug_mode = _normalize_color_aug_mode(color_aug_mode)
 
         challenges = load_challenges(self.source_path)
 
@@ -912,7 +1090,9 @@ class ARCExampleDataset(Dataset):
         for example_id, task_id in enumerate(task_ids):
             self.task_id_to_example_id[task_id] = example_id
             task = challenges[task_id]
-            self.task_input_colors[task_id] = extract_task_input_colors(task)
+            self.task_input_colors[task_id] = extract_task_input_colors(
+                task, mode=self.color_aug_mode
+            )
             for split in splits:
                 pairs = task.get(split, [])
                 for pair_index, pair in enumerate(pairs):
@@ -933,21 +1113,40 @@ class ARCExampleDataset(Dataset):
                     include_output_tokens = include_outputs and has_output
                     append_end = include_output_tokens
 
-                    tokens = encode_example(
-                        input_grid,
-                        output_grid,
-                        include_output=include_output_tokens,
-                        append_end=append_end,
-                    )
-                    if len(tokens) > max_seq_len:
-                        if drop_long_sequences:
-                            continue
-                        raise ValueError(
-                            f"Sequence length {len(tokens)} exceeds max_seq_len={max_seq_len} "
-                            f"for task {task_id} ({split} pair {pair_index})."
+                    tokens_by_dihedral: List[torch.Tensor] = []
+                    seq_len_by_dihedral: List[int] = []
+                    skip_example = False
+                    for transform_index in range(8):
+                        dihedral_input = apply_dihedral_transform(
+                            input_grid, transform_index
                         )
-                    tensor = torch.tensor(tokens, dtype=torch.long)
-                    seq_len = len(tokens)
+                        dihedral_output = (
+                            apply_dihedral_transform(output_grid, transform_index)
+                            if output_grid is not None
+                            else None
+                        )
+                        tokens = encode_example(
+                            dihedral_input,
+                            dihedral_output,
+                            include_output=include_output_tokens,
+                            append_end=append_end,
+                        )
+                        if len(tokens) > max_seq_len:
+                            if drop_long_sequences:
+                                skip_example = True
+                                break
+                            raise ValueError(
+                                f"Sequence length {len(tokens)} exceeds max_seq_len={max_seq_len} "
+                                f"for task {task_id} ({split} pair {pair_index}) dihedral {transform_index}."
+                            )
+                        tensor = torch.tensor(tokens, dtype=torch.long)
+                        tokens_by_dihedral.append(tensor)
+                        seq_len_by_dihedral.append(len(tokens))
+                    if skip_example:
+                        continue
+
+                    tensor = tokens_by_dihedral[0]
+                    seq_len = seq_len_by_dihedral[0]
                     example = SequenceExample(
                         tokens=tensor,
                         example_id=example_id,
@@ -956,28 +1155,33 @@ class ARCExampleDataset(Dataset):
                         pair_index=pair_index,
                         has_output=has_output,
                         seq_len=seq_len,
+                        tokens_by_dihedral=tokens_by_dihedral,
+                        seq_len_by_dihedral=seq_len_by_dihedral,
                     )
                     self.indices_by_split.setdefault(split, []).append(
                         len(self.examples)
                     )
                     self.examples.append(example)
-                    self.sequence_lengths.append(seq_len)
+                    self.sequence_lengths.append(max(seq_len_by_dihedral))
 
         self.num_examples = len(self.task_id_to_example_id)
 
         print("Precomputing 3D positions...")
         for ex in self.examples:
-            # We treat a single example as a batch of 1 to reuse your existing function
-            # or refactor the function to handle 1D tensors.
-            # Using your existing function for minimal code changes:
-            fake_batch = ex.tokens.unsqueeze(0)  # [1, seq_len]
-            mask = torch.ones_like(fake_batch, dtype=torch.bool)
-
-            # This is slow, but it only happens ONCE during startup
-            pos = compute_positions_3d(fake_batch, mask)
-
-            # Store the result (remove batch dim)
-            ex.cached_positions = pos.squeeze(0)
+            if ex.tokens_by_dihedral:
+                cached_positions_by_dihedral: List[torch.Tensor] = []
+                for tokens in ex.tokens_by_dihedral:
+                    fake_batch = tokens.unsqueeze(0)  # [1, seq_len]
+                    mask = torch.ones_like(fake_batch, dtype=torch.bool)
+                    pos = compute_positions_3d(fake_batch, mask)
+                    cached_positions_by_dihedral.append(pos.squeeze(0))
+                ex.cached_positions_by_dihedral = cached_positions_by_dihedral
+                ex.cached_positions = cached_positions_by_dihedral[0]
+            else:
+                fake_batch = ex.tokens.unsqueeze(0)  # [1, seq_len]
+                mask = torch.ones_like(fake_batch, dtype=torch.bool)
+                pos = compute_positions_3d(fake_batch, mask)
+                ex.cached_positions = pos.squeeze(0)
 
     def __len__(self) -> int:
         return len(self.examples)
@@ -1065,21 +1269,42 @@ def collate_examples(
     batch: List[SequenceExample],
     pad_token_id: int = END_TOKEN_ID,
     color_mapper: Optional[Callable[[SequenceExample], Optional[torch.Tensor]]] = None,
+    dihedral_mapper: Optional[Callable[[SequenceExample], Optional[int]]] = None,
 ) -> Dict[str, torch.Tensor]:
     if not batch:
         raise ValueError("Empty batch encountered during collation.")
 
-    batch_size = len(batch)
-    max_len = max(example.seq_len for example in batch)
+    selected: List[Tuple[SequenceExample, torch.Tensor, Optional[torch.Tensor], int]] = []
+    for example in batch:
+        tokens = example.tokens
+        cached_positions = getattr(example, "cached_positions", None)
+        if dihedral_mapper is not None:
+            transform_index = dihedral_mapper(example)
+            if transform_index is not None:
+                tokens_by_dihedral = getattr(example, "tokens_by_dihedral", None)
+                if tokens_by_dihedral:
+                    if transform_index < 0 or transform_index >= len(tokens_by_dihedral):
+                        raise ValueError(
+                            f"Invalid dihedral index {transform_index} for example {example.task_id}."
+                        )
+                    tokens = tokens_by_dihedral[transform_index]
+                    cached_by_dihedral = getattr(
+                        example, "cached_positions_by_dihedral", None
+                    )
+                    if cached_by_dihedral:
+                        cached_positions = cached_by_dihedral[transform_index]
+        seq_len = int(tokens.size(0))
+        selected.append((example, tokens, cached_positions, seq_len))
+
+    batch_size = len(selected)
+    max_len = max(item[3] for item in selected)
 
     input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
     example_ids = torch.zeros(batch_size, dtype=torch.long)
     positions_3d = torch.zeros((batch_size, max_len, 3), dtype=torch.long)
 
-    for idx, example in enumerate(batch):
-        seq_len = example.seq_len
-        tokens = example.tokens
+    for idx, (example, tokens, cached_positions, seq_len) in enumerate(selected):
         if color_mapper is not None:
             mapping = color_mapper(example)
             if mapping is not None:
@@ -1087,7 +1312,11 @@ def collate_examples(
         input_ids[idx, :seq_len] = tokens
         attention_mask[idx, :seq_len] = True
         example_ids[idx] = example.example_id
-        positions_3d[idx, :seq_len] = example.cached_positions
+        if cached_positions is None:
+            fake_batch = tokens.unsqueeze(0)
+            mask = torch.ones_like(fake_batch, dtype=torch.bool)
+            cached_positions = compute_positions_3d(fake_batch, mask).squeeze(0)
+        positions_3d[idx, :seq_len] = cached_positions
 
     # positions_3d = compute_positions_3d(input_ids, attention_mask)
 
@@ -1109,6 +1338,7 @@ def create_dataloader(
     num_workers: int = 0,
     bucket_size_multiplier: int = 4,
     color_mapper: Optional[Callable[[SequenceExample], Optional[torch.Tensor]]] = None,
+    dihedral_mapper: Optional[Callable[[SequenceExample], Optional[int]]] = None,
 ) -> DataLoader:
     lengths = getattr(dataset, "sequence_lengths", None)
     if lengths is None:
@@ -1118,11 +1348,14 @@ def create_dataloader(
     batch_sampler = LengthBucketBatchSampler(
         lengths=lengths, batch_size=batch_size, shuffle=shuffle, bucket_size=bucket_size
     )
-    collate_fn = (
-        functools.partial(collate_examples, color_mapper=color_mapper)
-        if color_mapper is not None
-        else collate_examples
-    )
+    if color_mapper is not None or dihedral_mapper is not None:
+        collate_fn = functools.partial(
+            collate_examples,
+            color_mapper=color_mapper,
+            dihedral_mapper=dihedral_mapper,
+        )
+    else:
+        collate_fn = collate_examples
     return DataLoader(
         dataset,
         batch_sampler=batch_sampler,

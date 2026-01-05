@@ -1,18 +1,8 @@
-# 27.5% on ARC-AGI in just $2 using a 28M transformer
+# 39% on ARC-AGI-1 Pub in just ~$2 using a 60M transformer
 
-For verification, run `sanitised-env-run-script.ipynb` on modal/colab or `ultra-sanitised-env-run-script.ipynb` on colab  
-The latter requires a kaggle account to download the official dataset  
-(You can skip this by manually downloading the dataset [here](https://www.kaggle.com/competitions/arc-prize-2024/data).
+Update: I am in the middle of refactoring the code. Performance has improved to 36% for the same cost. Doing a final push towards 50% now. The repo might be a bit unusable till I am done with refactoring and improving the model. Expect 1st week of Jan.
 
-## Run scripts (Colab/Modal)
-
-There are three runnable notebooks in the repo root. Each notebook is self-contained: it clones the repo into the runtime, downloads/builds the datasets, then trains + runs inference to produce a `submission.json`.
-
-It works directly on the standard colab/modal environments
-
-- `run-script.ipynb`: main reproduction notebook (tuned for A100); optionally mount Drive/Modal Volume to persist `runs/` checkpoints and logs.
-- `sanitised-env-run-script.ipynb`: “no Kaggle” reproduction; downloads ARC datasets from GitHub and deletes eval solutions before starting.
-- `ultra-sanitised-env-run-script.ipynb`: strongest leakage check; uses the official ARC Prize 2024 public Kaggle dataset (requires a Kaggle legacy API key), deletes eval solutions before training/inference, and only re-downloads them at the end for scoring (tested on Colab).
+---
 
 Deploy:
 - Colab: upload one of the notebooks → select GPU runtime (A100 if available) → (optional) mount google drive to save runs -> “Run all”.

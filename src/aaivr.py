@@ -111,6 +111,23 @@ def apply_inverse_dihedral_transform(
     return _DIHEDRAL_TRANSFORMS[inverse_name](grid)
 
 
+def _resolve_dihedral_transform_index(
+    task_id: Optional[str],
+    dihedral_index: int,
+    dihedral_orders_by_task: Optional[Dict[str, Sequence[int]]],
+) -> int:
+    if dihedral_orders_by_task is None or task_id is None:
+        return int(dihedral_index)
+    order = dihedral_orders_by_task.get(task_id)
+    if not order:
+        return int(dihedral_index)
+    if dihedral_index < 0 or dihedral_index >= len(order):
+        raise ValueError(
+            f"Invalid dihedral index {dihedral_index} for task {task_id}."
+        )
+    return int(order[dihedral_index])
+
+
 def _grid_to_tuple(grid: Sequence[Sequence[int]]) -> Tuple[Tuple[int, ...], ...]:
     return tuple(tuple(int(val) for val in row) for row in grid)
 
@@ -142,6 +159,7 @@ def run_aaivr_on_results(
     color_mappings_by_task: Optional[Dict[str, Sequence[Sequence[int]]]] = None,
     color_aug_seed: Optional[int] = None,
     max_color_augments: int = 0,
+    dihedral_orders_by_task: Optional[Dict[str, Sequence[int]]] = None,
 ) -> List[AAIVRSelection]:
     """Aggregate augmented predictions via AAIVR voting. (automated augmentation inverse)
 
@@ -189,6 +207,9 @@ def run_aaivr_on_results(
             # Standard dataset: index is just the pair index
             base_pair_index = int(pair_index)
             transform_index = 0
+        transform_index = _resolve_dihedral_transform_index(
+            task_id, transform_index, dihedral_orders_by_task
+        )
 
         color_idx = res.get("color_permutation_index", 0)
 
@@ -418,6 +439,7 @@ def visualize_aaivr_flow(
     is_dihedral_augmented: bool = False,
     max_color_augments: int = 0,
     color_aug_seed: Optional[int] = None,
+    dihedral_orders_by_task: Optional[Dict[str, Sequence[int]]] = None,
     rng: Optional[random.Random] = None,
 ) -> None:
     """Visualize augmented input/output pairs grouped by AAIVR-normalized outputs."""
@@ -473,8 +495,11 @@ def visualize_aaivr_flow(
         normalized_key = None
         if is_rectangular_grid(output_grid):
             try:
+                transform_index = _resolve_dihedral_transform_index(
+                    resolved_task_id, dihedral_index, dihedral_orders_by_task
+                )
                 normalized = apply_inverse_dihedral_transform(
-                    output_grid, dihedral_index
+                    output_grid, transform_index
                 )
                 if (
                     inverse_color_mappings
@@ -532,9 +557,10 @@ def visualize_aaivr_flow(
     for _, group_entries in items:
         print(f"\nPreference order: {rank} | Count: {len(group_entries)}")
         for entry in group_entries:
-            dihedral_label = _DIHEDRAL_TRANSFORM_NAMES[
-                entry["dihedral_index"] % 8
-            ]
+            transform_index = _resolve_dihedral_transform_index(
+                resolved_task_id, entry["dihedral_index"], dihedral_orders_by_task
+            )
+            dihedral_label = _DIHEDRAL_TRANSFORM_NAMES[transform_index % 8]
             title = (
                 f"{resolved_task_id} | input {entry['base_pair_index']} | "
                 f"pair {entry['raw_pair_index']} | dihedral {entry['dihedral_index']}:{dihedral_label} | "
@@ -551,9 +577,10 @@ def visualize_aaivr_flow(
             f"\nPreference order: {rank} | Count: {len(invalid_entries)} | Invalid outputs"
         )
         for entry in invalid_entries:
-            dihedral_label = _DIHEDRAL_TRANSFORM_NAMES[
-                entry["dihedral_index"] % 8
-            ]
+            transform_index = _resolve_dihedral_transform_index(
+                resolved_task_id, entry["dihedral_index"], dihedral_orders_by_task
+            )
+            dihedral_label = _DIHEDRAL_TRANSFORM_NAMES[transform_index % 8]
             title = (
                 f"{resolved_task_id} | input {entry['base_pair_index']} | "
                 f"pair {entry['raw_pair_index']} | dihedral {entry['dihedral_index']}:{dihedral_label} | "
