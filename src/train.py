@@ -976,6 +976,8 @@ def train_model(
             print(
                 f"Using per-task dihedral permutations (max {dihedral_augmentor.max_transforms})."
             )
+        if sanitized_augmentor is not None:
+            sanitized_augmentor.set_epoch(epoch)
 
         # Run Training
         step = train_one_epoch(

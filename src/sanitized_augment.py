@@ -26,6 +26,44 @@ def _hash_tokens(tokens: Sequence[int]) -> int:
     return int.from_bytes(digest[:8], "little")
 
 
+def _derive_order_seed(seed: int, key: Tuple[str, str, int]) -> int:
+    payload = f"{int(seed)}|{key[0]}|{key[1]}|{int(key[2])}"
+    digest = hashlib.sha256(payload.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "little")
+
+
+def _cycle_seed(order_seed: int, mode: int, cycle: int) -> int:
+    payload = f"{int(order_seed)}|{int(mode)}|{int(cycle)}"
+    digest = hashlib.sha256(payload.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "little")
+
+
+def _shuffled_indices(indices: Sequence[int], seed: int) -> List[int]:
+    order = list(indices)
+    rng = random.Random(int(seed))
+    rng.shuffle(order)
+    return order
+
+
+def _index_for_epoch(
+    order_seed: int, indices: Sequence[int], epoch: int, mode: int
+) -> int:
+    if len(indices) == 1:
+        return int(indices[0])
+    epoch_i = max(0, int(epoch))
+    cycle_len = len(indices)
+    cycle = epoch_i // cycle_len
+    offset = epoch_i % cycle_len
+    order = _shuffled_indices(indices, _cycle_seed(order_seed, mode, cycle))
+    if cycle > 0:
+        prev_order = _shuffled_indices(
+            indices, _cycle_seed(order_seed, mode, cycle - 1)
+        )
+        if order == prev_order:
+            order = order[1:] + order[:1]
+    return int(order[offset])
+
+
 def _colors_from_tokens(tokens: Sequence[int]) -> List[int]:
     return sorted({int(tok) for tok in tokens if 1 <= int(tok) <= 9})
 
@@ -90,6 +128,7 @@ class SanitizedAugments:
     identity_tuple_index: int
     color_identity_indices: List[int]
     dihedral_identity_indices: List[int]
+    order_seed: int = 0
 
 
 class SanitizedAugmentor:
@@ -106,6 +145,7 @@ class SanitizedAugmentor:
         self._enabled = True
         self._color_enabled = True
         self._dihedral_enabled = True
+        self._epoch = 0
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = bool(enabled)
@@ -116,6 +156,9 @@ class SanitizedAugmentor:
     def set_dihedral_enabled(self, enabled: bool) -> None:
         self._dihedral_enabled = bool(enabled)
 
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = max(0, int(epoch))
+
     def _resolve_flags(self, split: str) -> Tuple[bool, bool]:
         color_enabled = self._color_enabled
         dihedral_enabled = self._dihedral_enabled
@@ -123,6 +166,24 @@ class SanitizedAugmentor:
             color_enabled = color_enabled and self.color_apply_to_test_split
             dihedral_enabled = dihedral_enabled and self.dihedral_apply_to_test_split
         return color_enabled, dihedral_enabled
+
+    def _select_index_for_epoch(
+        self, augments: SanitizedAugments, *, color_enabled: bool, dihedral_enabled: bool
+    ) -> int:
+        if not color_enabled and not dihedral_enabled:
+            return augments.identity_tuple_index
+        if not color_enabled:
+            candidates = augments.color_identity_indices
+        elif not dihedral_enabled:
+            candidates = augments.dihedral_identity_indices
+        else:
+            candidates = list(range(len(augments.dihedral_indices)))
+        if not candidates:
+            return augments.identity_tuple_index
+        if len(candidates) == 1:
+            return candidates[0]
+        mode = (1 if color_enabled else 0) | (2 if dihedral_enabled else 0)
+        return _index_for_epoch(augments.order_seed, candidates, self._epoch, mode)
 
     def select_for_example(
         self, example: SequenceExample
@@ -135,24 +196,9 @@ class SanitizedAugmentor:
             return None, None
 
         color_enabled, dihedral_enabled = self._resolve_flags(example.split)
-        if not color_enabled and not dihedral_enabled:
-            idx = augments.identity_tuple_index
-        elif not color_enabled:
-            candidates = augments.color_identity_indices
-            idx = (
-                random.choice(candidates)
-                if candidates
-                else augments.identity_tuple_index
-            )
-        elif not dihedral_enabled:
-            candidates = augments.dihedral_identity_indices
-            idx = (
-                random.choice(candidates)
-                if candidates
-                else augments.identity_tuple_index
-            )
-        else:
-            idx = random.randrange(len(augments.dihedral_indices))
+        idx = self._select_index_for_epoch(
+            augments, color_enabled=color_enabled, dihedral_enabled=dihedral_enabled
+        )
 
         color_idx = augments.color_map_indices[idx]
         dihedral_idx = augments.dihedral_indices[idx]
@@ -272,6 +318,7 @@ def build_sanitized_augmentor(
                 identity_tuple_index=0,
                 color_identity_indices=color_identity_indices,
                 dihedral_identity_indices=dihedral_identity_indices,
+                order_seed=_derive_order_seed(seed, key),
             )
             augments_by_key[key] = augments
             stats.append(len(dihedral_indices))
