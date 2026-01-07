@@ -9,6 +9,7 @@ from torch import nn
 from torch.optim import AdamW
 import numpy as np
 
+from sanitized_augment import build_sanitized_augmentor
 from tinytransformer import RMSNorm, TinyTransformer, TinyTransformerConfig
 from utils import (
     ARCExampleDataset,
@@ -554,30 +555,73 @@ def build_model_and_data(
             color_aug_mode=getattr(args, "color_aug_mode", None),
         )
 
-    color_augmentor = _build_color_augmentor(args, dataset, is_eval=is_eval)
-    if color_augmentor is not None:
-        dataset.color_task_mappings = color_augmentor.mappings_by_task
-        dataset.color_aug_apply_to_test = color_augmentor.apply_to_test_split
+    use_sanitized = bool(
+        getattr(args, "enable_sanitized_aug_train", False) and not is_eval
+    )
+    sanitized_augmentor = None
+    color_augmentor = None
+    dihedral_augmentor = None
 
-    dihedral_augmentor = _build_dihedral_augmentor(args, dataset, is_eval=is_eval)
-    if dihedral_augmentor is not None:
-        dataset.dihedral_orders_by_task = dihedral_augmentor.orders_by_task
-        dataset.dihedral_aug_apply_to_test = dihedral_augmentor.apply_to_test_split
+    if use_sanitized:
+        if getattr(args, "num_workers", 0) != 0:
+            raise ValueError("Sanitized augmentation requires num_workers=0.")
+        max_color_augments = int(getattr(args, "max_color_augments_train", 0) or 0)
+        enable_color = bool(getattr(args, "enable_color_aug_train", False))
+        enable_dihedral = bool(getattr(args, "enable_dihedral_aug_train", False))
+        color_apply_to_test = bool(
+            getattr(args, "enable_color_on_aug_test_split_during_training", False)
+        )
+        dihedral_apply_to_test = bool(
+            getattr(args, "enable_dihedral_on_aug_test_split_during_training", False)
+        )
+        seed = getattr(args, "sanitized_aug_seed", None)
+        if seed is None:
+            seed = getattr(args, "color_aug_seed", None)
+        if seed is None:
+            seed = args.seed
 
-    if dihedral_augmentor is not None and getattr(args, "num_workers", 0) != 0:
-        raise ValueError("Dihedral augmentation requires num_workers=0.")
+        sanitized_augmentor = build_sanitized_augmentor(
+            dataset.examples,
+            dataset.task_input_colors,
+            max_color_augments=max_color_augments,
+            enable_color=enable_color,
+            enable_dihedral=enable_dihedral,
+            seed=int(seed),
+            color_apply_to_test_split=color_apply_to_test,
+            dihedral_apply_to_test_split=dihedral_apply_to_test,
+        )
+        dataset.sanitized_augmentor = sanitized_augmentor
+    else:
+        color_augmentor = _build_color_augmentor(args, dataset, is_eval=is_eval)
+        if color_augmentor is not None:
+            dataset.color_task_mappings = color_augmentor.mappings_by_task
+            dataset.color_aug_apply_to_test = color_augmentor.apply_to_test_split
+
+        dihedral_augmentor = _build_dihedral_augmentor(args, dataset, is_eval=is_eval)
+        if dihedral_augmentor is not None:
+            dataset.dihedral_orders_by_task = dihedral_augmentor.orders_by_task
+            dataset.dihedral_aug_apply_to_test = dihedral_augmentor.apply_to_test_split
+
+        if dihedral_augmentor is not None and getattr(args, "num_workers", 0) != 0:
+            raise ValueError("Dihedral augmentation requires num_workers=0.")
 
     # We always recreate the dataloader because batch_size might have changed in args
-    collate_color_mapper = (
-        color_augmentor.mapping_for_example
-        if color_augmentor is not None and getattr(args, "num_workers", 0) == 0
-        else None
-    )
-    collate_dihedral_mapper = (
-        dihedral_augmentor.transform_index_for_example
-        if dihedral_augmentor is not None
-        else None
-    )
+    collate_color_mapper = None
+    collate_dihedral_mapper = None
+    collate_augment_selector = None
+    if sanitized_augmentor is not None:
+        collate_augment_selector = sanitized_augmentor.select_for_example
+    else:
+        collate_color_mapper = (
+            color_augmentor.mapping_for_example
+            if color_augmentor is not None and getattr(args, "num_workers", 0) == 0
+            else None
+        )
+        collate_dihedral_mapper = (
+            dihedral_augmentor.transform_index_for_example
+            if dihedral_augmentor is not None
+            else None
+        )
     dataloader = create_dataloader(
         dataset=dataset,
         batch_size=args.batch_size,
@@ -585,12 +629,15 @@ def build_model_and_data(
         num_workers=args.num_workers,
         color_mapper=collate_color_mapper,
         dihedral_mapper=collate_dihedral_mapper,
+        augment_selector=collate_augment_selector,
     )
     if color_augmentor is not None:
         dataloader.color_augmentor = color_augmentor
         dataloader.color_aug_in_collate = collate_color_mapper is not None
     if dihedral_augmentor is not None:
         dataloader.dihedral_augmentor = dihedral_augmentor
+    if sanitized_augmentor is not None:
+        dataloader.sanitized_augmentor = sanitized_augmentor
 
     if (
         checkpoint_num_examples is not None
@@ -835,6 +882,7 @@ def train_model(
     else:
         training_model = model
 
+    sanitized_augmentor = getattr(dataloader, "sanitized_augmentor", None)
     color_augmentor = getattr(dataloader, "color_augmentor", None)
     dihedral_augmentor = getattr(dataloader, "dihedral_augmentor", None)
     disable_color_aug_last_epochs = int(
@@ -863,7 +911,17 @@ def train_model(
         color_aug_enabled = (
             True if disable_color_aug_start is None else epoch < disable_color_aug_start
         )
-        if color_augmentor is not None and hasattr(color_augmentor, "set_enabled"):
+        if sanitized_augmentor is not None:
+            if (
+                prev_color_aug_enabled is None
+                or color_aug_enabled != prev_color_aug_enabled
+            ):
+                sanitized_augmentor.set_color_enabled(color_aug_enabled)
+                if prev_color_aug_enabled is not None or not color_aug_enabled:
+                    state = "enabled" if color_aug_enabled else "disabled"
+                    print(f"Color augmentation {state} for epoch {epoch + 1}.")
+                prev_color_aug_enabled = color_aug_enabled
+        elif color_augmentor is not None and hasattr(color_augmentor, "set_enabled"):
             if (
                 prev_color_aug_enabled is None
                 or color_aug_enabled != prev_color_aug_enabled
@@ -873,7 +931,11 @@ def train_model(
                     state = "enabled" if color_aug_enabled else "disabled"
                     print(f"Color augmentation {state} for epoch {epoch + 1}.")
                 prev_color_aug_enabled = color_aug_enabled
-        if color_augmentor is not None and color_augmentor.max_permutations > 0:
+        if (
+            sanitized_augmentor is None
+            and color_augmentor is not None
+            and color_augmentor.max_permutations > 0
+        ):
             color_augmentor.set_epoch(epoch)
             print(
                 f"Using per-task color permutations (max {color_augmentor.max_permutations})."
@@ -883,7 +945,17 @@ def train_model(
             if disable_dihedral_aug_start is None
             else epoch < disable_dihedral_aug_start
         )
-        if dihedral_augmentor is not None and hasattr(
+        if sanitized_augmentor is not None:
+            if (
+                prev_dihedral_aug_enabled is None
+                or dihedral_aug_enabled != prev_dihedral_aug_enabled
+            ):
+                sanitized_augmentor.set_dihedral_enabled(dihedral_aug_enabled)
+                if prev_dihedral_aug_enabled is not None or not dihedral_aug_enabled:
+                    state = "enabled" if dihedral_aug_enabled else "disabled"
+                    print(f"Dihedral augmentation {state} for epoch {epoch + 1}.")
+                prev_dihedral_aug_enabled = dihedral_aug_enabled
+        elif dihedral_augmentor is not None and hasattr(
             dihedral_augmentor, "set_enabled"
         ):
             if (
@@ -895,7 +967,11 @@ def train_model(
                     state = "enabled" if dihedral_aug_enabled else "disabled"
                     print(f"Dihedral augmentation {state} for epoch {epoch + 1}.")
                 prev_dihedral_aug_enabled = dihedral_aug_enabled
-        if dihedral_augmentor is not None and dihedral_augmentor.max_transforms > 0:
+        if (
+            sanitized_augmentor is None
+            and dihedral_augmentor is not None
+            and dihedral_augmentor.max_transforms > 0
+        ):
             dihedral_augmentor.set_epoch(epoch)
             print(
                 f"Using per-task dihedral permutations (max {dihedral_augmentor.max_transforms})."

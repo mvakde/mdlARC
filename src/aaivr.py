@@ -439,6 +439,7 @@ def visualize_aaivr_flow(
     is_dihedral_augmented: bool = False,
     max_color_augments: int = 0,
     color_aug_seed: Optional[int] = None,
+    color_mappings_by_task: Optional[Dict[str, Sequence[Sequence[int]]]] = None,
     dihedral_orders_by_task: Optional[Dict[str, Sequence[int]]] = None,
     rng: Optional[random.Random] = None,
 ) -> None:
@@ -457,7 +458,11 @@ def visualize_aaivr_flow(
         return
 
     inverse_color_mappings: List[List[int]] = []
-    if max_color_augments > 0:
+    if color_mappings_by_task is not None:
+        mappings = color_mappings_by_task.get(resolved_task_id, [])
+        if mappings:
+            inverse_color_mappings = _invert_color_mappings(mappings)
+    elif max_color_augments > 0:
         if dataset_path is None:
             print("dataset_path is required when max_color_augments > 0.")
             return

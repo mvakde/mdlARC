@@ -704,6 +704,10 @@ def plot_grids(
             continue
         arr = np.array(grid, dtype=int)
         ax.imshow(arr, cmap=cmap, vmin=0, vmax=9)
+        ax.set_xticks(np.arange(-0.5, arr.shape[1], 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, arr.shape[0], 1), minor=True)
+        ax.grid(which="minor", color="white", linewidth=0.5)
+        ax.tick_params(which="minor", bottom=False, left=False)
         ax.set_xticks([])
         ax.set_yticks([])
     if title:
@@ -1270,31 +1274,47 @@ def collate_examples(
     pad_token_id: int = END_TOKEN_ID,
     color_mapper: Optional[Callable[[SequenceExample], Optional[torch.Tensor]]] = None,
     dihedral_mapper: Optional[Callable[[SequenceExample], Optional[int]]] = None,
+    augment_selector: Optional[
+        Callable[[SequenceExample], Tuple[Optional[torch.Tensor], Optional[int]]]
+    ] = None,
 ) -> Dict[str, torch.Tensor]:
     if not batch:
         raise ValueError("Empty batch encountered during collation.")
 
-    selected: List[Tuple[SequenceExample, torch.Tensor, Optional[torch.Tensor], int]] = []
+    selected: List[
+        Tuple[
+            SequenceExample,
+            torch.Tensor,
+            Optional[torch.Tensor],
+            int,
+            Optional[torch.Tensor],
+        ]
+    ] = []
     for example in batch:
         tokens = example.tokens
         cached_positions = getattr(example, "cached_positions", None)
-        if dihedral_mapper is not None:
-            transform_index = dihedral_mapper(example)
-            if transform_index is not None:
-                tokens_by_dihedral = getattr(example, "tokens_by_dihedral", None)
-                if tokens_by_dihedral:
-                    if transform_index < 0 or transform_index >= len(tokens_by_dihedral):
-                        raise ValueError(
-                            f"Invalid dihedral index {transform_index} for example {example.task_id}."
-                        )
-                    tokens = tokens_by_dihedral[transform_index]
-                    cached_by_dihedral = getattr(
-                        example, "cached_positions_by_dihedral", None
+        mapping: Optional[torch.Tensor] = None
+        transform_index: Optional[int] = None
+        if augment_selector is not None:
+            mapping, transform_index = augment_selector(example)
+        else:
+            if dihedral_mapper is not None:
+                transform_index = dihedral_mapper(example)
+            if color_mapper is not None:
+                mapping = color_mapper(example)
+        if transform_index is not None:
+            tokens_by_dihedral = getattr(example, "tokens_by_dihedral", None)
+            if tokens_by_dihedral:
+                if transform_index < 0 or transform_index >= len(tokens_by_dihedral):
+                    raise ValueError(
+                        f"Invalid dihedral index {transform_index} for example {example.task_id}."
                     )
-                    if cached_by_dihedral:
-                        cached_positions = cached_by_dihedral[transform_index]
+                tokens = tokens_by_dihedral[transform_index]
+                cached_by_dihedral = getattr(example, "cached_positions_by_dihedral", None)
+                if cached_by_dihedral:
+                    cached_positions = cached_by_dihedral[transform_index]
         seq_len = int(tokens.size(0))
-        selected.append((example, tokens, cached_positions, seq_len))
+        selected.append((example, tokens, cached_positions, seq_len, mapping))
 
     batch_size = len(selected)
     max_len = max(item[3] for item in selected)
@@ -1304,11 +1324,11 @@ def collate_examples(
     example_ids = torch.zeros(batch_size, dtype=torch.long)
     positions_3d = torch.zeros((batch_size, max_len, 3), dtype=torch.long)
 
-    for idx, (example, tokens, cached_positions, seq_len) in enumerate(selected):
-        if color_mapper is not None:
-            mapping = color_mapper(example)
-            if mapping is not None:
-                tokens = mapping[tokens]
+    for idx, (example, tokens, cached_positions, seq_len, mapping) in enumerate(
+        selected
+    ):
+        if mapping is not None:
+            tokens = mapping[tokens]
         input_ids[idx, :seq_len] = tokens
         attention_mask[idx, :seq_len] = True
         example_ids[idx] = example.example_id
@@ -1339,6 +1359,9 @@ def create_dataloader(
     bucket_size_multiplier: int = 4,
     color_mapper: Optional[Callable[[SequenceExample], Optional[torch.Tensor]]] = None,
     dihedral_mapper: Optional[Callable[[SequenceExample], Optional[int]]] = None,
+    augment_selector: Optional[
+        Callable[[SequenceExample], Tuple[Optional[torch.Tensor], Optional[int]]]
+    ] = None,
 ) -> DataLoader:
     lengths = getattr(dataset, "sequence_lengths", None)
     if lengths is None:
@@ -1348,11 +1371,12 @@ def create_dataloader(
     batch_sampler = LengthBucketBatchSampler(
         lengths=lengths, batch_size=batch_size, shuffle=shuffle, bucket_size=bucket_size
     )
-    if color_mapper is not None or dihedral_mapper is not None:
+    if augment_selector is not None or color_mapper is not None or dihedral_mapper is not None:
         collate_fn = functools.partial(
             collate_examples,
             color_mapper=color_mapper,
             dihedral_mapper=dihedral_mapper,
+            augment_selector=augment_selector,
         )
     else:
         collate_fn = collate_examples

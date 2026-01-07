@@ -8,8 +8,10 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 
 import aaivr
+import sanitized_eval
 import train
 from inference import DEFAULT_MAX_NEW_TOKENS, run_split_inference
+from sanitized_augment import build_sanitized_augmentor
 from tinytransformer import TinyTransformer
 from utils import (
     END_TOKEN_ID,
@@ -260,6 +262,7 @@ def run_evaluation_pipeline(
     cfg.enable_dihedral_aug_eval = bool(
         getattr(cfg, "enable_dihedral_aug_eval", False)
     )
+    use_sanitized = bool(getattr(cfg, "enable_sanitized_aug_train", False))
 
     reuse_dataset = None
     prior_dataset = state.get("dataset")
@@ -287,46 +290,110 @@ def run_evaluation_pipeline(
 
     color_mappings_eval = None
     color_apply_fn = None
-    if cfg.enable_color_aug_eval and cfg.max_color_augments_eval > 0:
-        color_seed = getattr(cfg, "color_aug_seed_eval", None)
-        if color_seed is None:
-            color_seed = getattr(cfg, "color_aug_seed", None)
-        if color_seed is None:
-            color_seed = cfg.seed
-        color_mappings_eval = generate_task_color_mappings(
-            dataset.task_input_colors, cfg.max_color_augments_eval, int(color_seed)
-        )
-        color_apply_fn = lambda split: True
-
     dihedral_orders_eval = None
-    if cfg.enable_dihedral_aug_eval:
-        dihedral_seed = getattr(cfg, "dihedral_aug_seed", None)
-        if dihedral_seed is None:
-            dihedral_seed = getattr(cfg, "seed", 42)
-        dihedral_orders_eval = generate_task_dihedral_orders(
-            dataset.task_ids, int(dihedral_seed)
-        )
+    sanitized_color_mappings_by_split: Dict[str, Dict[str, List[List[int]]]] = {}
+    sanitized_dihedral_by_split: Dict[str, bool] = {}
 
-    evaluation = evaluate_model_on_dataset(
-        model=model,
-        dataset=dataset,
-        device=device,
-        batch_size=eval_batch_size,
-        log_prompts=getattr(cfg, "log_inference_prompt", False),
-        temperature=getattr(cfg, "inference_temperature", None),
-        top_k=getattr(cfg, "inference_top_k", None),
-        splits=splits,
-        color_mappings_by_task=color_mappings_eval,
-        color_apply_fn=color_apply_fn,
-        dihedral_orders_by_task=dihedral_orders_eval,
-        task_ids=task_ids,
-        include_targets=include_targets,
-    )
+    if use_sanitized:
+        sanitized_augmentor = getattr(dataset, "sanitized_augmentor", None)
+        if sanitized_augmentor is None:
+            max_color_augments_train = int(
+                getattr(cfg, "max_color_augments_train", 0) or 0
+            )
+            enable_color_train = bool(getattr(cfg, "enable_color_aug_train", False))
+            enable_dihedral_train = bool(
+                getattr(cfg, "enable_dihedral_aug_train", False)
+            )
+            color_apply_to_test = bool(
+                getattr(cfg, "enable_color_on_aug_test_split_during_training", False)
+            )
+            dihedral_apply_to_test = bool(
+                getattr(cfg, "enable_dihedral_on_aug_test_split_during_training", False)
+            )
+            seed = getattr(cfg, "sanitized_aug_seed", None)
+            if seed is None:
+                seed = getattr(cfg, "color_aug_seed", None)
+            if seed is None:
+                seed = getattr(cfg, "seed", 42)
+            sanitized_augmentor = build_sanitized_augmentor(
+                dataset.examples,
+                dataset.task_input_colors,
+                max_color_augments=max_color_augments_train,
+                enable_color=enable_color_train,
+                enable_dihedral=enable_dihedral_train,
+                seed=int(seed),
+                color_apply_to_test_split=color_apply_to_test,
+                dihedral_apply_to_test_split=dihedral_apply_to_test,
+            )
+            dataset.sanitized_augmentor = sanitized_augmentor
+        evaluation: Dict[str, Dict[str, object]] = {}
+        for split in splits:
+            split_results, color_maps, dihedral_augmented = (
+                sanitized_eval.run_split_inference_sanitized(
+                    model=model,
+                    dataset=dataset,
+                    split=split,
+                    device=device,
+                    augmentor=sanitized_augmentor,
+                    batch_size=eval_batch_size,
+                    max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+                    task_ids=task_ids,
+                    log_prompts=getattr(cfg, "log_inference_prompt", False),
+                    include_targets=include_targets,
+                    temperature=getattr(cfg, "inference_temperature", None),
+                    top_k=getattr(cfg, "inference_top_k", None),
+                )
+            )
+            summary = summarize_split_results(split_results)
+            evaluation[split] = {"results": split_results, "summary": summary}
+            sanitized_color_mappings_by_split[split] = color_maps
+            sanitized_dihedral_by_split[split] = dihedral_augmented
+        evaluation["_sanitized"] = {
+            "color_mappings_by_split": sanitized_color_mappings_by_split,
+            "dihedral_augmented_by_split": sanitized_dihedral_by_split,
+        }
+    else:
+        if cfg.enable_color_aug_eval and cfg.max_color_augments_eval > 0:
+            color_seed = getattr(cfg, "color_aug_seed_eval", None)
+            if color_seed is None:
+                color_seed = getattr(cfg, "color_aug_seed", None)
+            if color_seed is None:
+                color_seed = cfg.seed
+            color_mappings_eval = generate_task_color_mappings(
+                dataset.task_input_colors, cfg.max_color_augments_eval, int(color_seed)
+            )
+            color_apply_fn = lambda split: True
+
+        if cfg.enable_dihedral_aug_eval:
+            dihedral_seed = getattr(cfg, "dihedral_aug_seed", None)
+            if dihedral_seed is None:
+                dihedral_seed = getattr(cfg, "seed", 42)
+            dihedral_orders_eval = generate_task_dihedral_orders(
+                dataset.task_ids, int(dihedral_seed)
+            )
+
+        evaluation = evaluate_model_on_dataset(
+            model=model,
+            dataset=dataset,
+            device=device,
+            batch_size=eval_batch_size,
+            log_prompts=getattr(cfg, "log_inference_prompt", False),
+            temperature=getattr(cfg, "inference_temperature", None),
+            top_k=getattr(cfg, "inference_top_k", None),
+            splits=splits,
+            color_mappings_by_task=color_mappings_eval,
+            color_apply_fn=color_apply_fn,
+            dihedral_orders_by_task=dihedral_orders_eval,
+            task_ids=task_ids,
+            include_targets=include_targets,
+        )
 
     epochs = getattr(cfg, "epochs", None)
     epoch_label = f"{epochs}ep" if epochs is not None else "eval"
     log_eval(f"\n-- {epoch_label} {max_color_augments}color --\n")
     dihedral_augmented = bool(cfg.enable_dihedral_aug_eval)
+    if use_sanitized:
+        dihedral_augmented = sanitized_dihedral_by_split.get("test", False)
 
     for split in splits:
         summary = evaluation.get(split, {}).get("summary", {})
@@ -342,7 +409,11 @@ def run_evaluation_pipeline(
         if log_correct_grids and fully_correct > 0:
             log_eval(f"  [Correct Grids Details for {split}]")
 
-            is_dihedral_split = dihedral_augmented
+            is_dihedral_split = (
+                sanitized_dihedral_by_split.get(split, dihedral_augmented)
+                if use_sanitized
+                else dihedral_augmented
+            )
 
             correct_results = summary.get("fully_correct_results", [])
             for res in correct_results:
@@ -371,10 +442,13 @@ def run_evaluation_pipeline(
 
         aaivr_results: List[aaivr.AAIVRSelection] = []
         if test_results:
+            aaivr_color_mappings = color_mappings_eval
+            if use_sanitized:
+                aaivr_color_mappings = sanitized_color_mappings_by_split.get("test")
             aaivr_results = aaivr.run_aaivr_on_results(
                 test_results,
                 is_dihedral_augmented=dataset_has_dihedral_augments,
-                color_mappings_by_task=color_mappings_eval,
+                color_mappings_by_task=aaivr_color_mappings,
                 dihedral_orders_by_task=dihedral_orders_eval,
             )
         else:

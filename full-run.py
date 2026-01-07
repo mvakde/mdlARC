@@ -81,6 +81,8 @@ ARGS = {
     "disable_color_aug_last_epochs": 1,
     "color_aug_seed": 42,
     "color_aug_seed_eval": None,
+    "enable_sanitized_aug_train": False,
+    "sanitized_aug_seed": None,
     "disable_dihedral_aug_last_epochs": 0,
     "enable_dihedral_aug_train": True,
     "enable_dihedral_on_aug_test_split_during_training": True,
@@ -273,6 +275,16 @@ def main() -> None:
             max_color_aug = eval_config[1]
             dataset_path = eval_config[2]
             dihedral_enabled = bool(getattr(cfg, "enable_dihedral_aug_eval", False))
+            color_mappings_by_task = None
+
+            sanitized_ctx = eval_data.get("_sanitized", {})
+            if sanitized_ctx:
+                color_mappings_by_task = sanitized_ctx.get(
+                    "color_mappings_by_split", {}
+                ).get("test")
+                dihedral_enabled = sanitized_ctx.get(
+                    "dihedral_augmented_by_split", {}
+                ).get("test", dihedral_enabled)
 
             color_seed = getattr(cfg, "color_aug_seed_eval", None)
             if color_seed is None:
@@ -284,7 +296,7 @@ def main() -> None:
             if dihedral_seed is None:
                 dihedral_seed = getattr(cfg, "seed", 42)
             dihedral_orders = None
-            if dihedral_enabled:
+            if dihedral_enabled and color_mappings_by_task is None:
                 challenges = utils.load_challenges(dataset_path)
                 dihedral_orders = utils.generate_task_dihedral_orders(
                     list(challenges.keys()), int(dihedral_seed)
@@ -299,6 +311,7 @@ def main() -> None:
                 is_dihedral_augmented=dihedral_enabled,
                 max_color_augments=max_color_aug,
                 color_aug_seed=color_seed,
+                color_mappings_by_task=color_mappings_by_task,
                 dihedral_orders_by_task=dihedral_orders,
             )
 
