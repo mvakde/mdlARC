@@ -68,55 +68,60 @@ def _colors_from_tokens(tokens: Sequence[int]) -> List[int]:
     return sorted({int(tok) for tok in tokens if 1 <= int(tok) <= 9})
 
 
-def _max_injections(n_a: int, n_b: int) -> int:
-    return math.factorial(n_a + n_b) // math.factorial(n_b)
+def _max_color_permutations(n_colors: int, k: int) -> int:
+    if k <= 0 or n_colors <= 0 or k > n_colors:
+        return 1
+    return math.factorial(n_colors) // math.factorial(n_colors - k)
 
 
-def _sample_injections(
-    colors_a: Sequence[int],
-    colors_b: Sequence[int],
-    target_count: int,
-    rng: random.Random,
+def _unrank_permutation(
+    domain: Sequence[int], index: int, factorials: Sequence[int]
+) -> Tuple[int, ...]:
+    items = [int(c) for c in domain]
+    result: List[int] = []
+    idx = int(index)
+    for size in range(len(items), 0, -1):
+        fact = factorials[size - 1]
+        pos = idx // fact
+        idx %= fact
+        result.append(int(items.pop(pos)))
+    return tuple(result)
+
+
+def _generate_task_permutations(
+    domain: Sequence[int], max_permutations: int, rng: random.Random
 ) -> List[Tuple[int, ...]]:
-    n_a = len(colors_a)
-    if n_a == 0:
+    domain_list = [int(c) for c in domain]
+    n = len(domain_list)
+    if n == 0:
         return [tuple()]
 
-    max_count = _max_injections(n_a, len(colors_b))
-    target_count = min(int(target_count), max_count)
-    identity = tuple(int(c) for c in colors_a)
-    injections: List[Tuple[int, ...]] = [identity]
-    seen = {identity}
-    if target_count <= 1:
-        return injections
+    total = math.factorial(n)
+    target = min(max(1, int(max_permutations)), total)
+    if target == 1:
+        return [tuple(domain_list)]
 
-    pool = [int(c) for c in list(colors_a) + list(colors_b)]
-    max_attempts = max(100, target_count * 50)
-    attempts = 0
-    while len(injections) < target_count and attempts < max_attempts:
-        attempts += 1
-        rng.shuffle(pool)
-        target = tuple(pool[:n_a])
-        if target in seen:
-            continue
-        seen.add(target)
-        injections.append(target)
-    return injections
+    factorials = [1]
+    for i in range(1, n + 1):
+        factorials.append(factorials[-1] * i)
+
+    if target >= total:
+        indices = list(range(total))
+        rng.shuffle(indices)
+    else:
+        indices = rng.sample(range(1, total), target - 1)
+        indices.append(0)
+        rng.shuffle(indices)
+
+    return [_unrank_permutation(domain_list, idx, factorials) for idx in indices]
 
 
-def _build_color_mapping(
-    colors_a: Sequence[int], colors_b: Sequence[int], targets: Sequence[int]
+def _mapping_from_permutation(
+    domain: Sequence[int], perm: Sequence[int]
 ) -> List[int]:
     mapping = list(range(VOCAB_SIZE))
-    target_to_source: Dict[int, int] = {}
-    for src, dst in zip(colors_a, targets):
-        src_i = int(src)
-        dst_i = int(dst)
-        mapping[src_i] = dst_i
-        target_to_source[dst_i] = src_i
-    for color in colors_b:
-        color_i = int(color)
-        mapping[color_i] = target_to_source.get(color_i, color_i)
+    for src, dst in zip(domain, perm):
+        mapping[int(src)] = int(dst)
     return mapping
 
 
@@ -224,9 +229,6 @@ def build_sanitized_augmentor(
     if not enable_color:
         max_color_augments = 1
 
-    dihedral_count = 8 if enable_dihedral else 1
-    max_total_augments = max_color_augments * dihedral_count
-
     examples_by_task: Dict[str, List[Tuple[str, str, int]]] = {}
     input_tokens_by_key: Dict[Tuple[str, str, int], List[List[int]]] = {}
     input_colors_by_key: Dict[Tuple[str, str, int], List[int]] = {}
@@ -259,69 +261,121 @@ def build_sanitized_augmentor(
             int(c) for c in task_input_colors.get(task_id, []) if 1 <= int(c) <= 9
         ]
         allowed_set = set(allowed_colors)
-
+        task_input_set: Set[int] = set()
         for key in keys:
-            colors_a = input_colors_by_key[key]
-            colors_b = sorted(allowed_set - set(colors_a))
-            target_injections = _sample_injections(
-                colors_a, colors_b, max_color_augments, rng
-            )
+            task_input_set.update(input_colors_by_key[key])
+        colors_a = sorted(task_input_set)
+        if not allowed_set:
+            allowed_set = set(colors_a)
+        colors_b = sorted(allowed_set - set(colors_a))
+        domain_colors = colors_a + colors_b
+        identity_perm = tuple(domain_colors)
 
-            identity_map = list(range(VOCAB_SIZE))
-            color_maps: List[List[int]] = [identity_map]
-            color_map_lookup = {tuple(identity_map): 0}
+        identity_map = list(range(VOCAB_SIZE))
+        sequence_states: Dict[Tuple[str, str, int], Dict[str, object]] = {}
+        remaining = 0
+        for key in keys:
+            input_colors = input_colors_by_key[key]
+            max_color_x = _max_color_permutations(len(domain_colors), len(input_colors))
+            color_limit = min(max_color_augments, max_color_x)
+            if color_limit <= 0:
+                color_limit = 1
+            state: Dict[str, object] = {
+                "input_colors": input_colors,
+                "input_tokens_by_dihedral": input_tokens_by_key[key],
+                "color_maps": [identity_map],
+                "dihedral_indices": [0],
+                "color_map_indices": [0],
+                "color_limit": int(color_limit),
+                "color_count": 1,
+                "seen_signatures": {tuple(input_colors)},
+            }
+            if state["color_count"] < state["color_limit"]:
+                remaining += 1
+            sequence_states[key] = state
 
-            dihedral_indices: List[int] = [0]
-            color_map_indices: List[int] = [0]
-
-            dihedral_range = range(8) if enable_dihedral else range(1)
-            input_tokens_by_dihedral = input_tokens_by_key[key]
-
-            for targets in target_injections:
-                mapping = _build_color_mapping(colors_a, colors_b, targets)
-                mapping_key = tuple(mapping)
-                map_idx = color_map_lookup.get(mapping_key)
-                if map_idx is None:
-                    map_idx = len(color_maps)
-                    color_map_lookup[mapping_key] = map_idx
-                    color_maps.append(mapping)
-
+        dihedral_range = range(8) if enable_dihedral else range(1)
+        if enable_dihedral:
+            for key in keys:
+                state = sequence_states[key]
+                input_tokens_by_dihedral = state["input_tokens_by_dihedral"]
                 for d in dihedral_range:
-                    if len(dihedral_indices) >= max_total_augments:
-                        break
+                    if d == 0:
+                        continue
                     tokens = input_tokens_by_dihedral[d]
-                    mapped_tokens = [
-                        mapping[tok] if 0 <= tok < len(mapping) else tok
-                        for tok in tokens
-                    ]
-                    hashed = _hash_tokens(mapped_tokens)
+                    hashed = _hash_tokens(tokens)
                     if hashed in seen_hashes:
                         continue
-                    dihedral_indices.append(int(d))
-                    color_map_indices.append(int(map_idx))
                     seen_hashes.add(hashed)
-                if len(dihedral_indices) >= max_total_augments:
-                    break
+                    state["dihedral_indices"].append(int(d))
+                    state["color_map_indices"].append(0)
 
-            color_maps_tensor = torch.tensor(color_maps, dtype=torch.long)
+        if remaining > 0:
+            # Task-level permutations over A+B (C stays fixed), filtered by per-sequence hashes.
+            task_permutations = _generate_task_permutations(
+                domain_colors, 50_000, rng
+            )
+            for perm in task_permutations:
+                if remaining == 0:
+                    break
+                if perm == identity_perm:
+                    continue
+                mapping = _mapping_from_permutation(domain_colors, perm)
+
+                for key in keys:
+                    state = sequence_states[key]
+                    if state["color_count"] >= state["color_limit"]:
+                        continue
+                    input_colors = state["input_colors"]
+                    signature = tuple(mapping[color] for color in input_colors)
+                    if signature in state["seen_signatures"]:
+                        continue
+                    map_idx: Optional[int] = None
+                    input_tokens_by_dihedral = state["input_tokens_by_dihedral"]
+                    for d in dihedral_range:
+                        tokens = input_tokens_by_dihedral[d]
+                        mapped_tokens = [
+                            mapping[tok] if 0 <= tok < len(mapping) else tok
+                            for tok in tokens
+                        ]
+                        hashed = _hash_tokens(mapped_tokens)
+                        if hashed in seen_hashes:
+                            continue
+                        if map_idx is None:
+                            map_idx = len(state["color_maps"])
+                            state["color_maps"].append(mapping)
+                            state["color_count"] += 1
+                            state["seen_signatures"].add(signature)
+                            if state["color_count"] >= state["color_limit"]:
+                                remaining -= 1
+                        state["dihedral_indices"].append(int(d))
+                        state["color_map_indices"].append(int(map_idx))
+                        seen_hashes.add(hashed)
+
+                    if map_idx is None:
+                        state["seen_signatures"].add(signature)
+
+        for key in keys:
+            state = sequence_states[key]
+            color_maps_tensor = torch.tensor(state["color_maps"], dtype=torch.long)
             color_identity_indices = [
-                idx for idx, c in enumerate(color_map_indices) if c == 0
+                idx for idx, c in enumerate(state["color_map_indices"]) if c == 0
             ]
             dihedral_identity_indices = [
-                idx for idx, d in enumerate(dihedral_indices) if d == 0
+                idx for idx, d in enumerate(state["dihedral_indices"]) if d == 0
             ]
 
             augments = SanitizedAugments(
                 color_maps=color_maps_tensor,
-                dihedral_indices=dihedral_indices,
-                color_map_indices=color_map_indices,
+                dihedral_indices=state["dihedral_indices"],
+                color_map_indices=state["color_map_indices"],
                 identity_tuple_index=0,
                 color_identity_indices=color_identity_indices,
                 dihedral_identity_indices=dihedral_identity_indices,
                 order_seed=_derive_order_seed(seed, key),
             )
             augments_by_key[key] = augments
-            stats.append(len(dihedral_indices))
+            stats.append(len(state["dihedral_indices"]))
 
     if stats:
         avg = sum(stats) / len(stats)
