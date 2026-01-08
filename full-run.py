@@ -82,7 +82,7 @@ ARGS = {
     "disable_color_aug_last_epochs": 1,
     "color_aug_seed": 42,
     "color_aug_seed_eval": None,
-    "enable_sanitized_aug_train": False,
+    "enable_sanitized_aug_train": True,
     "sanitized_aug_seed": None,
     "disable_dihedral_aug_last_epochs": 0,
     "enable_dihedral_aug_train": True,
