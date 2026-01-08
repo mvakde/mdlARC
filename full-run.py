@@ -77,6 +77,7 @@ ARGS = {
     "enable_color_aug_train": True,
     "enable_color_on_aug_test_split_during_training": True,
     "max_color_augments_train": 100,
+    "max_sanitized_augments": 100,
     "color_aug_mode": "exclude_output_only",  # "input_only" | "exclude_output_only"
     "disable_color_aug_last_epochs": 1,
     "color_aug_seed": 42,
@@ -114,6 +115,7 @@ ARGS = {
 
 # Evaluation config
 PATH_BOTH = ARGS["data_path"]
+# aug_count = max_color_augments for non-sanitized, max_sanitized_augments when sanitized
 EVAL_CONFIGS = [("eval_100color_both", 100, PATH_BOTH)]
 EVAL_BATCH_SIZE = 900
 EVAL_SPLITS = ["test"]
@@ -272,7 +274,7 @@ def main() -> None:
             eval_data = eval_results[cfg_idx][1]
             test_results = eval_data.get("test", {}).get("results", [])
             eval_config = EVAL_CONFIGS[cfg_idx]
-            max_color_aug = eval_config[1]
+            max_eval_aug = eval_config[1]
             dataset_path = eval_config[2]
             dihedral_enabled = bool(getattr(cfg, "enable_dihedral_aug_eval", False))
             color_mappings_by_task = None
@@ -309,7 +311,7 @@ def main() -> None:
                 task_id=AAIVR_FLOW_TASK_ID,
                 task_index=AAIVR_FLOW_TASK_INDEX,
                 is_dihedral_augmented=dihedral_enabled,
-                max_color_augments=max_color_aug,
+                max_color_augments=max_eval_aug,
                 color_aug_seed=color_seed,
                 color_mappings_by_task=color_mappings_by_task,
                 dihedral_orders_by_task=dihedral_orders,

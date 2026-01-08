@@ -210,7 +210,7 @@ def _compute_arc_style_score(
 def run_evaluation_pipeline(
     cfg: argparse.Namespace,
     run_name: str,
-    max_color_augments: int,
+    max_eval_augments: int,
     dataset_path: Path,
     *,
     eval_batch_size: int = 1300,
@@ -227,7 +227,11 @@ def run_evaluation_pipeline(
     Dict[str, object],
 ]:
     print(f"\n{'=' * 60}")
-    print(f"STARTING PIPELINE: {run_name} (Color Augs: {max_color_augments})")
+    print(
+        f"STARTING PIPELINE: {run_name} "
+        f"({'Sanitized' if getattr(cfg, 'enable_sanitized_aug_train', False) else 'Color'} "
+        f"Augs: {max_eval_augments})"
+    )
     print(f"{'=' * 60}\n")
 
     if state is None:
@@ -247,6 +251,8 @@ def run_evaluation_pipeline(
     prev_enable_color_aug = getattr(cfg, "enable_color_aug_eval", None)
     had_max_color_aug = hasattr(cfg, "max_color_augments_eval")
     prev_max_color_aug = getattr(cfg, "max_color_augments_eval", None)
+    had_max_sanitized_aug = hasattr(cfg, "max_sanitized_augments")
+    prev_max_sanitized_aug = getattr(cfg, "max_sanitized_augments", None)
     had_enable_dihedral_aug = hasattr(cfg, "enable_dihedral_aug_eval")
     prev_enable_dihedral_aug = getattr(cfg, "enable_dihedral_aug_eval", None)
 
@@ -257,12 +263,14 @@ def run_evaluation_pipeline(
 
     cfg.checkpoint_path = Path(checkpoint_path)
     cfg.data_path = dataset_path
-    cfg.enable_color_aug_eval = max_color_augments > 0
-    cfg.max_color_augments_eval = max_color_augments
+    cfg.enable_color_aug_eval = max_eval_augments > 0
+    cfg.max_color_augments_eval = max_eval_augments
     cfg.enable_dihedral_aug_eval = bool(
         getattr(cfg, "enable_dihedral_aug_eval", False)
     )
     use_sanitized = bool(getattr(cfg, "enable_sanitized_aug_train", False))
+    if use_sanitized:
+        cfg.max_sanitized_augments = int(max_eval_augments)
 
     reuse_dataset = None
     prior_dataset = state.get("dataset")
@@ -295,11 +303,19 @@ def run_evaluation_pipeline(
     sanitized_dihedral_by_split: Dict[str, bool] = {}
 
     if use_sanitized:
-        sanitized_augmentor = getattr(dataset, "sanitized_augmentor", None)
-        if sanitized_augmentor is None:
-            max_color_augments_train = int(
+        max_sanitized_augments = int(
+            getattr(cfg, "max_sanitized_augments", 0) or 0
+        )
+        if max_sanitized_augments <= 0:
+            max_sanitized_augments = int(
                 getattr(cfg, "max_color_augments_train", 0) or 0
             )
+        sanitized_augmentor = getattr(dataset, "sanitized_augmentor", None)
+        if (
+            sanitized_augmentor is None
+            or getattr(sanitized_augmentor, "max_sanitized_augments", None)
+            != max_sanitized_augments
+        ):
             enable_color_train = bool(getattr(cfg, "enable_color_aug_train", False))
             enable_dihedral_train = bool(
                 getattr(cfg, "enable_dihedral_aug_train", False)
@@ -318,7 +334,7 @@ def run_evaluation_pipeline(
             sanitized_augmentor = build_sanitized_augmentor(
                 dataset.examples,
                 dataset.task_input_colors,
-                max_color_augments=max_color_augments_train,
+                max_sanitized_augments=max_sanitized_augments,
                 enable_color=enable_color_train,
                 enable_dihedral=enable_dihedral_train,
                 seed=int(seed),
@@ -390,7 +406,8 @@ def run_evaluation_pipeline(
 
     epochs = getattr(cfg, "epochs", None)
     epoch_label = f"{epochs}ep" if epochs is not None else "eval"
-    log_eval(f"\n-- {epoch_label} {max_color_augments}color --\n")
+    label = "sanitized" if use_sanitized else "color"
+    log_eval(f"\n-- {epoch_label} {max_eval_augments}{label} --\n")
     dihedral_augmented = bool(cfg.enable_dihedral_aug_eval)
     if use_sanitized:
         dihedral_augmented = sanitized_dihedral_by_split.get("test", False)
@@ -485,6 +502,11 @@ def run_evaluation_pipeline(
         cfg.enable_dihedral_aug_eval = prev_enable_dihedral_aug
     else:
         delattr(cfg, "enable_dihedral_aug_eval")
+    if had_max_sanitized_aug:
+        cfg.max_sanitized_augments = prev_max_sanitized_aug
+    else:
+        if hasattr(cfg, "max_sanitized_augments"):
+            delattr(cfg, "max_sanitized_augments")
 
     return evaluation, aaivr_results, submission_path, state
 

@@ -143,10 +143,12 @@ class SanitizedAugmentor:
         *,
         color_apply_to_test_split: bool,
         dihedral_apply_to_test_split: bool,
+        max_sanitized_augments: int = 0,
     ) -> None:
         self.augments_by_key = augments_by_key
         self.color_apply_to_test_split = bool(color_apply_to_test_split)
         self.dihedral_apply_to_test_split = bool(dihedral_apply_to_test_split)
+        self.max_sanitized_augments = int(max_sanitized_augments)
         self._enabled = True
         self._color_enabled = True
         self._dihedral_enabled = True
@@ -215,7 +217,7 @@ def build_sanitized_augmentor(
     dataset: Iterable[SequenceExample],
     task_input_colors: Dict[str, Sequence[int]],
     *,
-    max_color_augments: int,
+    max_sanitized_augments: int,
     enable_color: bool,
     enable_dihedral: bool,
     seed: int,
@@ -223,11 +225,9 @@ def build_sanitized_augmentor(
     dihedral_apply_to_test_split: bool,
 ) -> SanitizedAugmentor:
     rng = random.Random(int(seed))
-    max_color_augments = int(max_color_augments)
-    if max_color_augments <= 0:
-        max_color_augments = 1
-    if not enable_color:
-        max_color_augments = 1
+    max_sanitized_augments = int(max_sanitized_augments)
+    if max_sanitized_augments <= 0:
+        max_sanitized_augments = 1
 
     examples_by_task: Dict[str, List[Tuple[str, str, int]]] = {}
     input_tokens_by_key: Dict[Tuple[str, str, int], List[List[int]]] = {}
@@ -277,31 +277,45 @@ def build_sanitized_augmentor(
         for key in keys:
             input_colors = input_colors_by_key[key]
             max_color_x = _max_color_permutations(len(domain_colors), len(input_colors))
-            color_limit = min(max_color_augments, max_color_x)
-            if color_limit <= 0:
-                color_limit = 1
+            if enable_color:
+                augment_limit = min(max_sanitized_augments, max_color_x)
+            else:
+                max_dihedral = 8 if enable_dihedral else 1
+                augment_limit = min(max_sanitized_augments, max_dihedral)
+            if augment_limit <= 0:
+                augment_limit = 1
+            dihedral_order = list(range(8 if enable_dihedral else 1))
+            if len(dihedral_order) > 1:
+                dihedral_order = _shuffled_indices(
+                    dihedral_order, _derive_order_seed(seed, key)
+                )
             state: Dict[str, object] = {
                 "input_colors": input_colors,
                 "input_tokens_by_dihedral": input_tokens_by_key[key],
                 "color_maps": [identity_map],
                 "dihedral_indices": [0],
                 "color_map_indices": [0],
-                "color_limit": int(color_limit),
-                "color_count": 1,
+                "augment_limit": int(augment_limit),
+                "augment_count": 1,
                 "seen_signatures": {tuple(input_colors)},
+                "dihedral_order": dihedral_order,
+                "dihedral_cursor": 0,
             }
-            if state["color_count"] < state["color_limit"]:
+            if state["augment_count"] < state["augment_limit"]:
                 remaining += 1
             sequence_states[key] = state
 
-        dihedral_range = range(8) if enable_dihedral else range(1)
-        if enable_dihedral:
+        if enable_dihedral and not enable_color:
             for key in keys:
                 state = sequence_states[key]
+                if state["augment_count"] >= state["augment_limit"]:
+                    continue
                 input_tokens_by_dihedral = state["input_tokens_by_dihedral"]
-                for d in dihedral_range:
+                for d in state["dihedral_order"]:
                     if d == 0:
                         continue
+                    if state["augment_count"] >= state["augment_limit"]:
+                        break
                     tokens = input_tokens_by_dihedral[d]
                     hashed = _hash_tokens(tokens)
                     if hashed in seen_hashes:
@@ -309,8 +323,9 @@ def build_sanitized_augmentor(
                     seen_hashes.add(hashed)
                     state["dihedral_indices"].append(int(d))
                     state["color_map_indices"].append(0)
+                    state["augment_count"] += 1
 
-        if remaining > 0:
+        if enable_color and remaining > 0:
             # Task-level permutations over A+B (C stays fixed), filtered by per-sequence hashes.
             task_permutations = _generate_task_permutations(
                 domain_colors, 50_000, rng
@@ -324,33 +339,41 @@ def build_sanitized_augmentor(
 
                 for key in keys:
                     state = sequence_states[key]
-                    if state["color_count"] >= state["color_limit"]:
+                    if state["augment_count"] >= state["augment_limit"]:
                         continue
                     input_colors = state["input_colors"]
                     signature = tuple(mapping[color] for color in input_colors)
                     if signature in state["seen_signatures"]:
                         continue
-                    map_idx: Optional[int] = None
                     input_tokens_by_dihedral = state["input_tokens_by_dihedral"]
-                    for d in dihedral_range:
-                        tokens = input_tokens_by_dihedral[d]
-                        mapped_tokens = [
-                            mapping[tok] if 0 <= tok < len(mapping) else tok
-                            for tok in tokens
-                        ]
-                        hashed = _hash_tokens(mapped_tokens)
-                        if hashed in seen_hashes:
-                            continue
-                        if map_idx is None:
+                    dihedral_order = state["dihedral_order"]
+                    dihedral_cursor = int(state["dihedral_cursor"])
+                    map_idx: Optional[int] = None
+                    if dihedral_order:
+                        order_len = len(dihedral_order)
+                        for offset in range(order_len):
+                            d_idx = int(
+                                dihedral_order[(dihedral_cursor + offset) % order_len]
+                            )
+                            tokens = input_tokens_by_dihedral[d_idx]
+                            mapped_tokens = [
+                                mapping[tok] if 0 <= tok < len(mapping) else tok
+                                for tok in tokens
+                            ]
+                            hashed = _hash_tokens(mapped_tokens)
+                            if hashed in seen_hashes:
+                                continue
                             map_idx = len(state["color_maps"])
                             state["color_maps"].append(mapping)
-                            state["color_count"] += 1
+                            state["dihedral_indices"].append(d_idx)
+                            state["color_map_indices"].append(map_idx)
+                            state["augment_count"] += 1
                             state["seen_signatures"].add(signature)
-                            if state["color_count"] >= state["color_limit"]:
+                            state["dihedral_cursor"] = (dihedral_cursor + offset + 1) % order_len
+                            seen_hashes.add(hashed)
+                            if state["augment_count"] >= state["augment_limit"]:
                                 remaining -= 1
-                        state["dihedral_indices"].append(int(d))
-                        state["color_map_indices"].append(int(map_idx))
-                        seen_hashes.add(hashed)
+                            break
 
                     if map_idx is None:
                         state["seen_signatures"].add(signature)
@@ -389,4 +412,5 @@ def build_sanitized_augmentor(
         augments_by_key,
         color_apply_to_test_split=color_apply_to_test_split,
         dihedral_apply_to_test_split=dihedral_apply_to_test_split,
+        max_sanitized_augments=max_sanitized_augments,
     )

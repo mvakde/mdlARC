@@ -565,7 +565,13 @@ def build_model_and_data(
     if use_sanitized:
         if getattr(args, "num_workers", 0) != 0:
             raise ValueError("Sanitized augmentation requires num_workers=0.")
-        max_color_augments = int(getattr(args, "max_color_augments_train", 0) or 0)
+        max_sanitized_augments = int(
+            getattr(args, "max_sanitized_augments", 0) or 0
+        )
+        if max_sanitized_augments <= 0:
+            max_sanitized_augments = int(
+                getattr(args, "max_color_augments_train", 0) or 0
+            )
         enable_color = bool(getattr(args, "enable_color_aug_train", False))
         enable_dihedral = bool(getattr(args, "enable_dihedral_aug_train", False))
         color_apply_to_test = bool(
@@ -583,7 +589,7 @@ def build_model_and_data(
         sanitized_augmentor = build_sanitized_augmentor(
             dataset.examples,
             dataset.task_input_colors,
-            max_color_augments=max_color_augments,
+            max_sanitized_augments=max_sanitized_augments,
             enable_color=enable_color,
             enable_dihedral=enable_dihedral,
             seed=int(seed),
