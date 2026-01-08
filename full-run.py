@@ -81,7 +81,7 @@ ARGS = {
     "disable_color_aug_last_epochs": 1,
     "color_aug_seed": 42,
     "color_aug_seed_eval": None,
-    "enable_sanitized_aug_train": False,
+    "enable_sanitized_aug_train": True,
     "sanitized_aug_seed": None,
     "disable_dihedral_aug_last_epochs": 0,
     "enable_dihedral_aug_train": True,
@@ -260,15 +260,15 @@ def main() -> None:
 
     if RUN_AAIVR_FLOW_VIS:
         if not eval_results:
-            print("AAIVR flow visualization requires eval_results; enable RUN_EVALUATION.")
+            print(
+                "AAIVR flow visualization requires eval_results; enable RUN_EVALUATION."
+            )
         else:
             import aaivr
 
             cfg_idx = AAIVR_FLOW_CONFIG_INDEX
             if cfg_idx < 0 or cfg_idx >= len(eval_results):
-                raise ValueError(
-                    f"AAIVR_FLOW_CONFIG_INDEX {cfg_idx} is out of range."
-                )
+                raise ValueError(f"AAIVR_FLOW_CONFIG_INDEX {cfg_idx} is out of range.")
             eval_data = eval_results[cfg_idx][1]
             test_results = eval_data.get("test", {}).get("results", [])
             eval_config = EVAL_CONFIGS[cfg_idx]

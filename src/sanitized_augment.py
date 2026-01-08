@@ -38,15 +38,26 @@ def _cycle_seed(order_seed: int, mode: int, cycle: int) -> int:
     return int.from_bytes(digest[:8], "little")
 
 
-def _shuffled_indices(indices: Sequence[int], seed: int) -> List[int]:
+def _shuffled_indices(
+    indices: Sequence[int], seed: int, identity_index: Optional[int] = None
+) -> List[int]:
     order = list(indices)
     rng = random.Random(int(seed))
+    if identity_index is not None and identity_index in order:
+        order = [idx for idx in order if idx != identity_index]
+        rng.shuffle(order)
+        return [int(identity_index)] + order
     rng.shuffle(order)
     return order
 
 
 def _index_for_epoch(
-    order_seed: int, indices: Sequence[int], epoch: int, mode: int
+    order_seed: int,
+    indices: Sequence[int],
+    epoch: int,
+    mode: int,
+    *,
+    identity_index: Optional[int] = None,
 ) -> int:
     if len(indices) == 1:
         return int(indices[0])
@@ -54,13 +65,20 @@ def _index_for_epoch(
     cycle_len = len(indices)
     cycle = epoch_i // cycle_len
     offset = epoch_i % cycle_len
-    order = _shuffled_indices(indices, _cycle_seed(order_seed, mode, cycle))
+    order = _shuffled_indices(
+        indices, _cycle_seed(order_seed, mode, cycle), identity_index
+    )
     if cycle > 0:
         prev_order = _shuffled_indices(
-            indices, _cycle_seed(order_seed, mode, cycle - 1)
+            indices, _cycle_seed(order_seed, mode, cycle - 1), identity_index
         )
         if order == prev_order:
-            order = order[1:] + order[:1]
+            if identity_index is not None and identity_index in order:
+                if len(order) > 2:
+                    tail = order[1:]
+                    order = [order[0]] + tail[1:] + tail[:1]
+            else:
+                order = order[1:] + order[:1]
     return int(order[offset])
 
 
@@ -188,7 +206,13 @@ class SanitizedAugmentor:
         if len(candidates) == 1:
             return candidates[0]
         mode = (1 if color_enabled else 0) | (2 if dihedral_enabled else 0)
-        return _index_for_epoch(augments.order_seed, candidates, self._epoch, mode)
+        return _index_for_epoch(
+            augments.order_seed,
+            candidates,
+            self._epoch,
+            mode,
+            identity_index=augments.identity_tuple_index,
+        )
 
     def select_for_example(
         self, example: SequenceExample
