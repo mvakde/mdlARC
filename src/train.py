@@ -325,6 +325,30 @@ def _is_attention_param(name: str) -> bool:
     return "attention" in parts
 
 
+def _is_muon_candidate(
+    module: nn.Module, name: str, param: nn.Parameter
+) -> bool:
+    if not isinstance(module, nn.Linear):
+        return False
+    if name.startswith("lm_head."):
+        return False
+    if not name.endswith(".weight"):
+        return False
+    return param.ndim == 2
+
+
+def _muon_supported(device: torch.device) -> Tuple[bool, str]:
+    if not hasattr(torch.optim, "Muon"):
+        return False, "torch.optim.Muon is unavailable in this PyTorch build"
+    if device.type == "mps":
+        return False, "Muon uses bfloat16 orthogonalization which is unsupported on MPS"
+    if device.type == "cuda":
+        bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
+        if callable(bf16_supported) and not bf16_supported():
+            return False, "Muon requires CUDA bfloat16 support"
+    return True, ""
+
+
 def _build_weight_decay_param_groups(
     model: nn.Module,
     weight_decay: float,
@@ -396,6 +420,240 @@ def _build_weight_decay_param_groups(
         param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
     return param_groups
 
+
+def _build_muon_and_adamw_param_groups(
+    model: nn.Module,
+    weight_decay: float,
+    attention_weight_decay: float,
+    token_embedding_weight_decay: float,
+    task_embedding_weight_decay: float,
+) -> Tuple[Sequence[Dict[str, Any]], Sequence[Dict[str, Any]]]:
+    """Split params for Muon (linear weights only) and AdamW (everything else)."""
+    muon_params = []
+    muon_attention_params = []
+    decay_params = []
+    attention_params = []
+    token_embed_params = []
+    task_embed_params = []
+    no_decay_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        module_name = name.rsplit(".", 1)[0] if "." in name else ""
+        module = model.get_submodule(module_name) if module_name else model
+
+        if _is_muon_candidate(module, name, param):
+            if _is_attention_param(name):
+                muon_attention_params.append(param)
+            else:
+                muon_params.append(param)
+            continue
+
+        if name.endswith(".bias"):
+            no_decay_params.append(param)
+            continue
+
+        if _is_norm_module(module) or _is_positional_embedding_param(name):
+            no_decay_params.append(param)
+            continue
+
+        if isinstance(module, nn.Embedding):
+            if name.startswith("token_embedding."):
+                token_embed_params.append(param)
+            elif name.startswith("example_embedding."):
+                task_embed_params.append(param)
+            else:
+                no_decay_params.append(param)
+            continue
+
+        if _is_attention_param(name):
+            attention_params.append(param)
+            continue
+
+        if isinstance(module, nn.Linear):
+            decay_params.append(param)
+        else:
+            no_decay_params.append(param)
+
+    muon_groups = []
+    if muon_params:
+        muon_groups.append({"params": muon_params, "weight_decay": weight_decay})
+    if muon_attention_params:
+        muon_groups.append(
+            {"params": muon_attention_params, "weight_decay": attention_weight_decay}
+        )
+
+    adamw_groups = []
+    if decay_params:
+        adamw_groups.append({"params": decay_params, "weight_decay": weight_decay})
+    if attention_params:
+        adamw_groups.append(
+            {"params": attention_params, "weight_decay": attention_weight_decay}
+        )
+    if token_embed_params:
+        adamw_groups.append(
+            {
+                "params": token_embed_params,
+                "weight_decay": token_embedding_weight_decay,
+            }
+        )
+    if task_embed_params:
+        adamw_groups.append(
+            {"params": task_embed_params, "weight_decay": task_embedding_weight_decay}
+        )
+    if no_decay_params:
+        adamw_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+
+    return muon_groups, adamw_groups
+
+
+class _MuonAdamWOptimizer(torch.optim.Optimizer):
+    """Wraps Muon + AdamW so schedulers can treat them as one optimizer."""
+
+    def __init__(
+        self,
+        muon_optimizer: torch.optim.Optimizer,
+        adamw_optimizer: torch.optim.Optimizer,
+    ) -> None:
+        self.muon_optimizer = muon_optimizer
+        self.adamw_optimizer = adamw_optimizer
+
+        params = []
+        for optimizer in (muon_optimizer, adamw_optimizer):
+            for group in optimizer.param_groups:
+                params.extend(group["params"])
+
+        super().__init__(params, defaults={})
+        self.param_groups = (
+            muon_optimizer.param_groups + adamw_optimizer.param_groups
+        )
+
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+        self.muon_optimizer.step()
+        self.adamw_optimizer.step()
+        return loss
+
+    def zero_grad(self, set_to_none: bool = False) -> None:
+        self.muon_optimizer.zero_grad(set_to_none=set_to_none)
+        self.adamw_optimizer.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "muon": self.muon_optimizer.state_dict(),
+            "adamw": self.adamw_optimizer.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        if "muon" in state_dict and "adamw" in state_dict:
+            self.muon_optimizer.load_state_dict(state_dict["muon"])
+            self.adamw_optimizer.load_state_dict(state_dict["adamw"])
+            return
+        # Backward compatibility: old checkpoints only stored AdamW state.
+        self.adamw_optimizer.load_state_dict(state_dict)
+        print("Loaded optimizer state into AdamW; Muon state reset.")
+
+
+def _move_optimizer_state(
+    optimizer: torch.optim.Optimizer, device: torch.device
+) -> None:
+    def _move_state(opt: torch.optim.Optimizer) -> None:
+        for state in opt.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+
+    if isinstance(optimizer, _MuonAdamWOptimizer):
+        _move_state(optimizer.muon_optimizer)
+        _move_state(optimizer.adamw_optimizer)
+    else:
+        _move_state(optimizer)
+
+
+def _normalize_muon_coefficients(value: object) -> Tuple[float, float, float]:
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        return tuple(float(v) for v in value)
+    return (3.4445, -4.775, 2.0315)
+
+
+def _build_optimizer(
+    args: argparse.Namespace,
+    model: nn.Module,
+    device: torch.device,
+    attention_weight_decay: float,
+    token_embedding_weight_decay: float,
+    task_embedding_weight_decay: float,
+) -> torch.optim.Optimizer:
+    optimizer_name = str(getattr(args, "optimizer", "adamw")).lower()
+    use_fused = device.type == "cuda"
+
+    if optimizer_name != "muon":
+        param_groups = _build_weight_decay_param_groups(
+            model,
+            args.weight_decay,
+            attention_weight_decay,
+            token_embedding_weight_decay,
+            task_embedding_weight_decay,
+        )
+        return AdamW(param_groups, lr=args.lr, fused=use_fused)
+
+    supported, reason = _muon_supported(device)
+    if not supported:
+        print(f"Muon unavailable ({reason}); falling back to AdamW.")
+        param_groups = _build_weight_decay_param_groups(
+            model,
+            args.weight_decay,
+            attention_weight_decay,
+            token_embedding_weight_decay,
+            task_embedding_weight_decay,
+        )
+        return AdamW(param_groups, lr=args.lr, fused=use_fused)
+
+    muon_groups, adamw_groups = _build_muon_and_adamw_param_groups(
+        model,
+        args.weight_decay,
+        attention_weight_decay,
+        token_embedding_weight_decay,
+        task_embedding_weight_decay,
+    )
+    if not muon_groups:
+        print("Muon requested but no eligible linear weights found; using AdamW.")
+        return AdamW(adamw_groups, lr=args.lr, fused=use_fused)
+
+    muon_lr = getattr(args, "muon_lr", None)
+    muon_lr = args.lr if muon_lr is None else float(muon_lr)
+    muon_momentum = float(getattr(args, "muon_momentum", 0.95))
+    muon_nesterov = bool(getattr(args, "muon_nesterov", True))
+    muon_ns_steps = int(getattr(args, "muon_ns_steps", 5))
+    muon_ns_coefficients = _normalize_muon_coefficients(
+        getattr(args, "muon_ns_coefficients", (3.4445, -4.775, 2.0315))
+    )
+    muon_eps = float(getattr(args, "muon_eps", 1e-7))
+    muon_adjust_lr_fn = getattr(args, "muon_adjust_lr_fn", None)
+
+    muon_optimizer = torch.optim.Muon(
+        muon_groups,
+        lr=muon_lr,
+        weight_decay=args.weight_decay,
+        momentum=muon_momentum,
+        nesterov=muon_nesterov,
+        ns_coefficients=muon_ns_coefficients,
+        eps=muon_eps,
+        ns_steps=muon_ns_steps,
+        adjust_lr_fn=muon_adjust_lr_fn,
+    )
+
+    if not adamw_groups:
+        return muon_optimizer
+
+    adamw_lr = getattr(args, "adamw_lr", None)
+    adamw_lr = args.lr if adamw_lr is None else float(adamw_lr)
+    adamw_optimizer = AdamW(adamw_groups, lr=adamw_lr, fused=use_fused)
+    return _MuonAdamWOptimizer(muon_optimizer, adamw_optimizer)
 
 def maybe_save_model(
     model: TinyTransformer,
@@ -796,17 +1054,14 @@ def train_model(
     token_embedding_weight_decay = getattr(args, "token_embedding_weight_decay", 0.0)
     task_embedding_weight_decay = getattr(args, "task_embedding_weight_decay", 0.0)
 
-    param_groups = _build_weight_decay_param_groups(
+    optimizer = _build_optimizer(
+        args,
         model,
-        args.weight_decay,
+        device,
         attention_weight_decay,
         token_embedding_weight_decay,
         task_embedding_weight_decay,
     )
-
-    # Fused AdamW is significantly faster on CUDA.
-    use_fused = device.type == "cuda"
-    optimizer = AdamW(param_groups, lr=args.lr, fused=use_fused)
 
     step = int(checkpoint.get("global_step", 0)) if checkpoint else 0
 
@@ -836,10 +1091,7 @@ def train_model(
     # Restore optimizer state if available so momentum/adam moments resume.
     if checkpoint and "optimizer_state" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state"])
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device)
+        _move_optimizer_state(optimizer, device)
         print("Restored optimizer state from checkpoint.")
 
     # print(f"DEBUG CHECK: Optimizer state size = {len(optimizer.state)} (0 = Fresh/Reset, >0 = Restored)")

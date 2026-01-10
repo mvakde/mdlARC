@@ -89,6 +89,14 @@ ARGS = {
     "enable_dihedral_on_aug_test_split_during_training": True,
     "enable_dihedral_aug_eval": True,
     "dihedral_aug_seed": None,
+    "optimizer": "muon",  # "adamw" | "muon"
+    "muon_lr": None,  # None = use lr
+    "muon_momentum": 0.95,
+    "muon_nesterov": True,
+    "muon_ns_steps": 5,
+    "muon_ns_coefficients": (3.4445, -4.775, 2.0315),
+    "muon_eps": 1e-7,
+    "muon_adjust_lr_fn": "match_rms_adamw",  # "original" | "match_rms_adamw"
     "lr": 3e-4,
     "warmup_pct": 0.02,
     "wsd_decay_start_pct": 0.8,  # 1.0 = no decay (start at last epoch)
