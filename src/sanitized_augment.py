@@ -313,7 +313,7 @@ def build_sanitized_augmentor(
         if enable_color and remaining > 0:
             # Task-level permutations over A+B (C stays fixed), filtered by per-sequence hashes.
             task_permutations = _generate_task_permutations(
-                domain_colors, 50_000, rng
+                domain_colors, 5000, rng
             )
             for perm in task_permutations:
                 if remaining == 0:
