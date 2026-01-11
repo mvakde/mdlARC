@@ -1,5 +1,7 @@
 import argparse
 from dataclasses import asdict
+import math
+import numbers
 import random
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Set, Tuple
@@ -7,6 +9,10 @@ from typing import Any, Dict, Optional, Sequence, Set, Tuple
 import torch
 from torch import nn
 from torch.optim import AdamW
+try:
+    from torch.optim.swa_utils import AveragedModel
+except Exception:
+    AveragedModel = None
 import numpy as np
 
 from sanitized_augment import build_sanitized_augmentor
@@ -574,10 +580,215 @@ def _move_optimizer_state(
         _move_state(optimizer)
 
 
+def _load_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    state_dict: Dict[str, Any],
+    device: torch.device,
+) -> bool:
+    def _is_torch_state_dict(value: Any) -> bool:
+        return isinstance(value, dict) and "param_groups" in value
+
+    if isinstance(optimizer, _MuonAdamWOptimizer):
+        try:
+            optimizer.load_state_dict(state_dict)
+        except (KeyError, ValueError, RuntimeError) as exc:
+            print(f"Skipping optimizer state restore ({exc}).")
+            return False
+        _move_optimizer_state(optimizer, device)
+        return True
+
+    candidate_state: Optional[Dict[str, Any]] = None
+    if _is_torch_state_dict(state_dict):
+        candidate_state = state_dict
+    else:
+        state_key = optimizer.__class__.__name__.lower()
+        sub_state = state_dict.get(state_key)
+        if _is_torch_state_dict(sub_state):
+            candidate_state = sub_state
+
+    if candidate_state is None:
+        return False
+
+    try:
+        optimizer.load_state_dict(candidate_state)
+    except (KeyError, ValueError, RuntimeError) as exc:
+        print(f"Skipping optimizer state restore ({exc}).")
+        return False
+    _move_optimizer_state(optimizer, device)
+    return True
+
+
+def _optimizer_identity(optimizer: torch.optim.Optimizer) -> str:
+    return optimizer.__class__.__name__.lower()
+
+
+_OPTIMIZER_HPARAMS_IGNORE_KEYS = {
+    "params",
+    "fused",
+    "foreach",
+    "capturable",
+    "differentiable",
+}
+
+
+def _sanitize_optimizer_value(value: Any) -> Optional[Any]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Number):
+        return float(value)
+    if isinstance(value, str) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        sanitized = []
+        for item in value:
+            item_sanitized = _sanitize_optimizer_value(item)
+            if item_sanitized is None and item is not None:
+                return None
+            sanitized.append(item_sanitized)
+        return sanitized
+    if isinstance(value, dict):
+        sanitized_dict = {}
+        for key, item in value.items():
+            item_sanitized = _sanitize_optimizer_value(item)
+            if item_sanitized is None and item is not None:
+                return None
+            sanitized_dict[key] = item_sanitized
+        return sanitized_dict
+    return None
+
+
+def _param_groups_snapshot(
+    param_groups: Sequence[Dict[str, Any]],
+) -> Sequence[Dict[str, Any]]:
+    snapshot = []
+    for group in param_groups:
+        entry: Dict[str, Any] = {}
+        for key, value in group.items():
+            if key in _OPTIMIZER_HPARAMS_IGNORE_KEYS:
+                continue
+            sanitized = _sanitize_optimizer_value(value)
+            if sanitized is None and value is not None:
+                continue
+            entry[key] = sanitized
+        snapshot.append(entry)
+    return snapshot
+
+
+def _optimizer_hparams_snapshot(optimizer: torch.optim.Optimizer) -> Any:
+    if isinstance(optimizer, _MuonAdamWOptimizer):
+        return {
+            "muon": _param_groups_snapshot(optimizer.muon_optimizer.param_groups),
+            "adamw": _param_groups_snapshot(optimizer.adamw_optimizer.param_groups),
+        }
+    return _param_groups_snapshot(optimizer.param_groups)
+
+
+def _checkpoint_optimizer_hparams(checkpoint: Dict[str, Any]) -> Optional[Any]:
+    state_dict = checkpoint.get("optimizer_state")
+    if not isinstance(state_dict, dict):
+        return None
+    if "muon" in state_dict and "adamw" in state_dict:
+        muon_state = state_dict.get("muon", {})
+        adamw_state = state_dict.get("adamw", {})
+        if not isinstance(muon_state, dict) or not isinstance(adamw_state, dict):
+            return None
+        return {
+            "muon": _param_groups_snapshot(muon_state.get("param_groups", [])),
+            "adamw": _param_groups_snapshot(adamw_state.get("param_groups", [])),
+        }
+    if "param_groups" in state_dict:
+        return _param_groups_snapshot(state_dict.get("param_groups", []))
+    return None
+
+
+def _optimizer_values_match(left: Any, right: Any) -> bool:
+    if isinstance(left, float) and isinstance(right, float):
+        return math.isclose(left, right, rel_tol=1e-6, abs_tol=1e-8)
+    if isinstance(left, list) and isinstance(right, list):
+        if len(left) != len(right):
+            return False
+        return all(_optimizer_values_match(lv, rv) for lv, rv in zip(left, right))
+    if isinstance(left, dict) and isinstance(right, dict):
+        if left.keys() != right.keys():
+            return False
+        return all(
+            _optimizer_values_match(left[key], right[key]) for key in left.keys()
+        )
+    return left == right
+
+
+def _optimizer_hparams_changed(
+    optimizer: torch.optim.Optimizer, checkpoint: Dict[str, Any]
+) -> bool:
+    saved = checkpoint.get("optimizer_hparams")
+    if saved is None:
+        saved = _checkpoint_optimizer_hparams(checkpoint)
+    if saved is None:
+        return False
+    current = _optimizer_hparams_snapshot(optimizer)
+    return not _optimizer_values_match(current, saved)
+
+
+def _apply_param_group_hparams(
+    param_groups: Sequence[Dict[str, Any]],
+    hparams: Optional[Sequence[Dict[str, Any]]],
+) -> None:
+    if not isinstance(hparams, Sequence):
+        return
+    for group, desired in zip(param_groups, hparams):
+        if not isinstance(desired, dict):
+            continue
+        for key, value in desired.items():
+            group[key] = value
+
+
+def _apply_optimizer_hparams(optimizer: torch.optim.Optimizer, hparams: Any) -> None:
+    if isinstance(optimizer, _MuonAdamWOptimizer):
+        if isinstance(hparams, dict):
+            _apply_param_group_hparams(
+                optimizer.muon_optimizer.param_groups, hparams.get("muon")
+            )
+            _apply_param_group_hparams(
+                optimizer.adamw_optimizer.param_groups, hparams.get("adamw")
+            )
+        return
+    _apply_param_group_hparams(optimizer.param_groups, hparams)
+
+
+def _optimizer_switch_detected(
+    optimizer: torch.optim.Optimizer,
+    checkpoint: Dict[str, Any],
+) -> bool:
+    checkpoint_name = checkpoint.get("optimizer_name")
+    if checkpoint_name:
+        return str(checkpoint_name).lower() != _optimizer_identity(optimizer)
+    state_dict = checkpoint.get("optimizer_state")
+    if not isinstance(state_dict, dict):
+        return False
+    checkpoint_has_muon_combo = "muon" in state_dict and "adamw" in state_dict
+    current_has_muon_combo = isinstance(optimizer, _MuonAdamWOptimizer)
+    return checkpoint_has_muon_combo != current_has_muon_combo
+
+
 def _normalize_muon_coefficients(value: object) -> Tuple[float, float, float]:
     if isinstance(value, (list, tuple)) and len(value) == 3:
         return tuple(float(v) for v in value)
     return (3.4445, -4.775, 2.0315)
+
+
+def _swa_start_epoch(total_epochs: int) -> int:
+    return max(0, int(total_epochs * 0.75))
+
+
+def _swa_n_averaged(swa_model: nn.Module) -> int:
+    n_averaged = getattr(swa_model, "n_averaged", None)
+    if isinstance(n_averaged, torch.Tensor):
+        return int(n_averaged.item())
+    if isinstance(n_averaged, numbers.Integral):
+        return int(n_averaged)
+    return 0
 
 
 def _build_optimizer(
@@ -665,6 +876,7 @@ def maybe_save_model(
     epoch: Optional[int] = None,
     rng_state: Optional[Dict[str, Any]] = None,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    swa_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     if save_path is None:
         return
@@ -677,8 +889,12 @@ def maybe_save_model(
     }
     if optimizer is not None:
         checkpoint["optimizer_state"] = optimizer.state_dict()
+        checkpoint["optimizer_name"] = _optimizer_identity(optimizer)
+        checkpoint["optimizer_hparams"] = _optimizer_hparams_snapshot(optimizer)
     if scheduler is not None:  # <--- SAVE SCHEDULER
         checkpoint["scheduler_state"] = scheduler.state_dict()
+    if swa_state is not None:
+        checkpoint["swa_state"] = swa_state
     if global_step is not None:
         checkpoint["global_step"] = int(global_step)
     if epoch is not None:
@@ -1062,8 +1278,10 @@ def train_model(
         token_embedding_weight_decay,
         task_embedding_weight_decay,
     )
+    desired_optimizer_hparams = _optimizer_hparams_snapshot(optimizer)
 
     step = int(checkpoint.get("global_step", 0)) if checkpoint else 0
+    resume_start_step = step
 
     start_epoch = 0
     if checkpoint:
@@ -1088,11 +1306,31 @@ def train_model(
     if checkpoint and start_epoch > 0:
         print(f"Resuming training from epoch {start_epoch + 1}/{args.epochs}.")
 
+    resume_warmup = False
+    if checkpoint and _optimizer_switch_detected(optimizer, checkpoint):
+        resume_warmup = True
+        print("Detected optimizer change; resetting LR schedule.")
+    optimizer_hparams_changed = False
+    if checkpoint and _optimizer_hparams_changed(optimizer, checkpoint):
+        optimizer_hparams_changed = True
+        resume_warmup = True
+        print("Detected optimizer hyperparameter change; applying new settings.")
+
     # Restore optimizer state if available so momentum/adam moments resume.
     if checkpoint and "optimizer_state" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer_state"])
-        _move_optimizer_state(optimizer, device)
-        print("Restored optimizer state from checkpoint.")
+        restored = _load_optimizer_state(
+            optimizer, checkpoint["optimizer_state"], device
+        )
+        if restored:
+            if optimizer_hparams_changed:
+                _apply_optimizer_hparams(optimizer, desired_optimizer_hparams)
+            print("Restored optimizer state from checkpoint.")
+        else:
+            resume_warmup = True
+            print("Skipping optimizer state restore (incompatible optimizer).")
+    elif checkpoint:
+        resume_warmup = True
+        print("No optimizer state in checkpoint; starting with fresh optimizer.")
 
     # print(f"DEBUG CHECK: Optimizer state size = {len(optimizer.state)} (0 = Fresh/Reset, >0 = Restored)")
 
@@ -1110,7 +1348,7 @@ def train_model(
     decay_start_step = min(decay_start_step, total_steps)
     decay_steps = max(1, total_steps - decay_start_step)
 
-    def lr_lambda(current_step: int):
+    def base_lr_lambda(current_step: int):
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
         if decay_start_step >= total_steps or current_step < decay_start_step:
@@ -1120,14 +1358,41 @@ def train_model(
         linear = 1.0 - progress
         return min_lr_factor + (1.0 - min_lr_factor) * linear
 
+    lr_lambda = base_lr_lambda
+    if resume_warmup and resume_start_step > 0:
+        remaining_steps = max(0, total_steps - resume_start_step)
+        if remaining_steps > 0:
+            resume_warmup_steps = max(1, int(remaining_steps * 0.02))
+            resume_warmup_start = resume_start_step
+            resume_warmup_end = resume_start_step + resume_warmup_steps
+            resume_target = base_lr_lambda(resume_warmup_end)
+
+            def lr_lambda(current_step: int):
+                if current_step < resume_warmup_start:
+                    return base_lr_lambda(current_step)
+                if current_step < resume_warmup_end:
+                    progress = float(current_step - resume_warmup_start + 1) / float(
+                        resume_warmup_steps
+                    )
+                    return resume_target * progress
+                return base_lr_lambda(current_step)
+
+            print(
+                f"Applying resume LR warmup for {resume_warmup_steps} steps."
+            )
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Restore scheduler if resuming
-    if checkpoint and "scheduler_state" in checkpoint:
+    # Restore scheduler if resuming (unless we intentionally reset the schedule).
+    if checkpoint and "scheduler_state" in checkpoint and not resume_warmup:
         scheduler.load_state_dict(checkpoint["scheduler_state"])
         print("Restored scheduler state from checkpoint.")
     elif step > 0:
-        # If we didn't save scheduler state but have steps, fast-forward
+        if resume_warmup:
+            print(
+                "Skipping scheduler state restore; recomputing schedule from args."
+            )
+        # If we didn't save scheduler state or intentionally reset, fast-forward
         for _ in range(step):
             scheduler.step()
 
@@ -1139,6 +1404,19 @@ def train_model(
         training_model = torch.compile(model)
     else:
         training_model = model
+
+    swa_model = None
+    swa_start_epoch = _swa_start_epoch(args.epochs)
+    if AveragedModel is None:
+        print("SWA unavailable (torch.optim.swa_utils.AveragedModel missing).")
+    elif args.epochs > 0 and swa_start_epoch < args.epochs:
+        swa_model = AveragedModel(model)
+        if checkpoint and "swa_state" in checkpoint:
+            try:
+                swa_model.load_state_dict(checkpoint["swa_state"])
+                print("Restored SWA state from checkpoint.")
+            except (KeyError, ValueError, RuntimeError) as exc:
+                print(f"Skipping SWA state restore ({exc}).")
 
     sanitized_augmentor = getattr(dataloader, "sanitized_augmentor", None)
     color_augmentor = getattr(dataloader, "color_augmentor", None)
@@ -1251,6 +1529,13 @@ def train_model(
             scheduler=scheduler,
         )
 
+        if swa_model is not None and epoch >= swa_start_epoch:
+            if epoch == swa_start_epoch:
+                print(
+                    f"Starting SWA averaging at epoch {epoch + 1}/{args.epochs}."
+                )
+            swa_model.update_parameters(model)
+
         # Run Validation
         if val_dataloader is not None:
             val_loss = validate_one_epoch(
@@ -1272,6 +1557,11 @@ def train_model(
             epoch_num = epoch + 1
             if epoch_num in checkpoint_schedule:
                 rng_state = _capture_rng_state(device)
+                swa_state = (
+                    swa_model.state_dict()
+                    if swa_model is not None and _swa_n_averaged(swa_model) > 0
+                    else None
+                )
                 epoch_save_path = _checkpoint_path_for_epoch(
                     save_path, epoch_num, args.epochs
                 )
@@ -1285,9 +1575,20 @@ def train_model(
                     epoch=epoch_num,
                     rng_state=rng_state,
                     scheduler=scheduler,
+                    swa_state=swa_state,
                 )
 
     rng_state = _capture_rng_state(device)
+    swa_state = None
+    if swa_model is not None:
+        swa_count = _swa_n_averaged(swa_model)
+        if swa_count > 0:
+            print(
+                "Applying SWA weights for final checkpoint "
+                f"(n_averaged={swa_count})."
+            )
+            model.load_state_dict(swa_model.module.state_dict())
+            swa_state = swa_model.state_dict()
     maybe_save_model(
         model,
         dataset,
@@ -1298,4 +1599,5 @@ def train_model(
         epoch=args.epochs,
         rng_state=rng_state,
         scheduler=scheduler,
+        swa_state=swa_state,
     )
