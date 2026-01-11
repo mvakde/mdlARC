@@ -65,7 +65,7 @@ def _index_for_epoch(
 
 
 def _colors_from_tokens(tokens: Sequence[int]) -> List[int]:
-    return sorted({int(tok) for tok in tokens if 1 <= int(tok) <= 9})
+    return sorted({int(tok) for tok in tokens if 0 <= int(tok) <= 9})
 
 
 def _max_color_permutations(n_colors: int, k: int) -> int:
@@ -259,7 +259,7 @@ def build_sanitized_augmentor(
             seen_hashes.add(_hash_tokens(identity_tokens))
 
         allowed_colors = [
-            int(c) for c in task_input_colors.get(task_id, []) if 1 <= int(c) <= 9
+            int(c) for c in task_input_colors.get(task_id, []) if 0 <= int(c) <= 9
         ]
         allowed_set = set(allowed_colors)
         task_input_set: Set[int] = set()

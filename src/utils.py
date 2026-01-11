@@ -45,18 +45,18 @@ IGNORE_INDEX = -100
 def generate_color_permutations(
     max_permutations: int, seed: int
 ) -> List[Tuple[int, ...]]:
-    """Return up to `max_permutations` unique shuffles of colors 1-9.
+    """Return up to `max_permutations` unique shuffles of colors 0-9.
 
     Identity permutation is always included first (index 0 / permutation 1).
     """
     if max_permutations <= 0:
         return []
     rng = random.Random(seed)
-    digits = list(range(1, 10))
+    digits = list(range(10))
     identity = tuple(digits)
     permutations: List[Tuple[int, ...]] = [identity]
     seen = {identity}
-    limit = math.factorial(9)
+    limit = math.factorial(10)
     target = min(max_permutations, limit)
     if target == 1:
         return permutations
@@ -84,7 +84,7 @@ def generate_color_permutations(
 def color_permutation_to_mapping(perm: Sequence[int]) -> torch.Tensor:
     """Build a token-id mapping tensor for a specific color permutation."""
     mapping = torch.arange(VOCAB_SIZE, dtype=torch.long)
-    mapping[1:10] = torch.tensor(list(perm), dtype=torch.long)
+    mapping[0:10] = torch.tensor(list(perm), dtype=torch.long)
     return mapping
 
 
@@ -96,7 +96,7 @@ def generate_color_mapping_tensors(
 
 
 def _normalize_input_colors(colors: Iterable[int]) -> List[int]:
-    return sorted({int(c) for c in colors if 1 <= int(c) <= 9})
+    return sorted({int(c) for c in colors if 0 <= int(c) <= 9})
 
 
 _COLOR_AUG_MODES = ("input_only", "exclude_output_only")
@@ -123,7 +123,7 @@ def _extract_task_colors(task: Dict[str, object], key: str) -> Set[int]:
             for row in grid:
                 for val in row:
                     val_i = int(val)
-                    if 1 <= val_i <= 9:
+                    if 0 <= val_i <= 9:
                         colors.add(val_i)
     return colors
 
@@ -131,14 +131,14 @@ def _extract_task_colors(task: Dict[str, object], key: str) -> Set[int]:
 def extract_task_input_colors(
     task: Dict[str, object], mode: Optional[str] = None
 ) -> List[int]:
-    """Return sorted colors (1-9) eligible for permutation."""
+    """Return sorted colors (0-9) eligible for permutation."""
     mode = _normalize_color_aug_mode(mode)
     input_colors = _extract_task_colors(task, "input")
     if mode == "input_only":
         return sorted(input_colors)
     output_colors = _extract_task_colors(task, "output")
     output_only = output_colors - input_colors
-    return [color for color in range(1, 10) if color not in output_only]
+    return [color for color in range(10) if color not in output_only]
 
 
 def _stable_hash(text: str) -> int:
@@ -309,7 +309,7 @@ def generate_task_dihedral_orders(
 def apply_color_permutation_to_tokens(
     tokens: Sequence[int], mapping: Sequence[int]
 ) -> List[int]:
-    """Apply a color permutation mapping to a token list (keeps specials/0 fixed)."""
+    """Apply a color permutation mapping to a token list (keeps specials fixed)."""
     return [int(mapping[tok] if 0 <= tok < len(mapping) else tok) for tok in tokens]
 
 
