@@ -188,6 +188,8 @@ def train_one_epoch(
     log_train_limit: int = 0,
     log_file: Optional[Path] = None,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    epoch: Optional[int] = None,
+    steps_per_epoch: Optional[int] = None,
 ) -> int:
     model.train()
     step = start_step
@@ -201,7 +203,12 @@ def train_one_epoch(
     # Enable BF16 autocast only if on CUDA
     use_amp = device.type == "cuda"
 
-    for batch in dataloader:
+    if steps_per_epoch is None:
+        steps_per_epoch = len(dataloader)
+    if steps_per_epoch is not None and steps_per_epoch <= 0:
+        steps_per_epoch = None
+
+    for batch_idx, batch in enumerate(dataloader):
         step += 1
         # print(f"DEBUG: Step {step} sequence index: {batch['example_ids'][0].item()}")
         input_ids = batch["input_ids"].to(device)
@@ -252,7 +259,11 @@ def train_one_epoch(
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         if scheduler is not None:
-            scheduler.step()
+            if epoch is None or steps_per_epoch is None:
+                scheduler.step()
+            else:
+                epoch_progress = float(epoch) + (batch_idx + 1) / float(steps_per_epoch)
+                scheduler.step(epoch_progress)
 
         total_loss += loss.item()
         total_input_loss += inp_loss.item() if inp_loss is not None else 0.0
@@ -1281,7 +1292,7 @@ def train_model(
     desired_optimizer_hparams = _optimizer_hparams_snapshot(optimizer)
 
     step = int(checkpoint.get("global_step", 0)) if checkpoint else 0
-    resume_start_step = step
+    steps_per_epoch = len(dataloader)
 
     start_epoch = 0
     if checkpoint:
@@ -1291,7 +1302,6 @@ def train_model(
         if saved_epoch is not None:
             start_epoch = int(saved_epoch)
         elif step > 0:
-            steps_per_epoch = len(dataloader)
             if steps_per_epoch > 0:
                 start_epoch = step // steps_per_epoch
         if start_epoch > args.epochs:
@@ -1335,66 +1345,91 @@ def train_model(
     # print(f"DEBUG CHECK: Optimizer state size = {len(optimizer.state)} (0 = Fresh/Reset, >0 = Restored)")
 
     # Linear warmup + WSD (warmup, stable, decay) schedule with linear decay tail.
-    total_steps = len(dataloader) * args.epochs
+    # Schedule uses epoch progress so it is insensitive to batch size changes.
+    total_epochs = max(0.0, float(args.epochs))
+    steps_per_epoch = max(1, steps_per_epoch)
     warmup_pct = float(getattr(args, "warmup_pct", 0.02))
     warmup_pct = max(0.0, min(1.0, warmup_pct))
-    warmup_steps = int(total_steps * warmup_pct)
+    warmup_epochs = total_epochs * warmup_pct
+    warmup_epochs = max(0.0, min(total_epochs, warmup_epochs))
     min_lr_factor = float(getattr(args, "lr_floor", 0.01))
     min_lr_factor = max(0.0, min(1.0, min_lr_factor))
     decay_start_pct = float(getattr(args, "wsd_decay_start_pct", 0.8))
     decay_start_pct = max(0.0, min(1.0, decay_start_pct))
-    decay_start_step = int(total_steps * decay_start_pct)
-    decay_start_step = max(decay_start_step, warmup_steps)
-    decay_start_step = min(decay_start_step, total_steps)
-    decay_steps = max(1, total_steps - decay_start_step)
+    decay_start_epoch = total_epochs * decay_start_pct
+    decay_start_epoch = max(decay_start_epoch, warmup_epochs)
+    decay_start_epoch = min(decay_start_epoch, total_epochs)
+    decay_epochs = max(1e-8, total_epochs - decay_start_epoch)
 
-    def base_lr_lambda(current_step: int):
-        if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
-        if decay_start_step >= total_steps or current_step < decay_start_step:
+    def base_lr_lambda(current_epoch: float):
+        if warmup_epochs > 0 and current_epoch < warmup_epochs:
+            return float(current_epoch) / float(warmup_epochs)
+        if decay_start_epoch >= total_epochs or current_epoch < decay_start_epoch:
             return 1.0
-        progress = float(current_step - decay_start_step) / float(decay_steps)
+        progress = float(current_epoch - decay_start_epoch) / float(decay_epochs)
         progress = max(0.0, min(1.0, progress))
         linear = 1.0 - progress
         return min_lr_factor + (1.0 - min_lr_factor) * linear
 
     lr_lambda = base_lr_lambda
-    if resume_warmup and resume_start_step > 0:
-        remaining_steps = max(0, total_steps - resume_start_step)
-        if remaining_steps > 0:
-            resume_warmup_steps = max(1, int(remaining_steps * 0.02))
-            resume_warmup_start = resume_start_step
-            resume_warmup_end = resume_start_step + resume_warmup_steps
+    resume_start_epoch = float(start_epoch)
+    if resume_warmup and resume_start_epoch > 0:
+        remaining_epochs = max(0.0, total_epochs - resume_start_epoch)
+        if remaining_epochs > 0:
+            resume_warmup_epochs = remaining_epochs * 0.02
+            min_warmup_epochs = 1.0 / float(steps_per_epoch)
+            resume_warmup_epochs = max(min_warmup_epochs, resume_warmup_epochs)
+            resume_warmup_epochs = min(resume_warmup_epochs, remaining_epochs)
+            resume_warmup_start = resume_start_epoch
+            resume_warmup_end = resume_start_epoch + resume_warmup_epochs
             resume_target = base_lr_lambda(resume_warmup_end)
 
-            def lr_lambda(current_step: int):
-                if current_step < resume_warmup_start:
-                    return base_lr_lambda(current_step)
-                if current_step < resume_warmup_end:
-                    progress = float(current_step - resume_warmup_start + 1) / float(
-                        resume_warmup_steps
+            def lr_lambda(current_epoch: float):
+                if current_epoch < resume_warmup_start:
+                    return base_lr_lambda(current_epoch)
+                if current_epoch < resume_warmup_end:
+                    progress = float(current_epoch - resume_warmup_start) / float(
+                        resume_warmup_epochs
                     )
                     return resume_target * progress
-                return base_lr_lambda(current_step)
+                return base_lr_lambda(current_epoch)
 
             print(
-                f"Applying resume LR warmup for {resume_warmup_steps} steps."
+                f"Applying resume LR warmup for {resume_warmup_epochs:.3f} epochs."
             )
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Restore scheduler if resuming (unless we intentionally reset the schedule).
+    scheduler_restored = False
     if checkpoint and "scheduler_state" in checkpoint and not resume_warmup:
-        scheduler.load_state_dict(checkpoint["scheduler_state"])
-        print("Restored scheduler state from checkpoint.")
-    elif step > 0:
-        if resume_warmup:
+        scheduler_state = checkpoint["scheduler_state"]
+        last_epoch = (
+            scheduler_state.get("last_epoch")
+            if isinstance(scheduler_state, dict)
+            else None
+        )
+        if isinstance(last_epoch, (int, float)) and abs(
+            float(last_epoch) - float(start_epoch)
+        ) > 1.0:
             print(
-                "Skipping scheduler state restore; recomputing schedule from args."
+                "Skipping scheduler state restore; using epoch-based schedule from args."
             )
-        # If we didn't save scheduler state or intentionally reset, fast-forward
-        for _ in range(step):
-            scheduler.step()
+        else:
+            scheduler.load_state_dict(scheduler_state)
+            scheduler_restored = True
+            print("Restored scheduler state from checkpoint.")
+    elif checkpoint and "scheduler_state" in checkpoint and resume_warmup:
+        print(
+            "Skipping scheduler state restore; recomputing schedule from args."
+        )
+    if not scheduler_restored and start_epoch > 0:
+        if resume_warmup:
+            resume_base_factor = base_lr_lambda(resume_start_epoch)
+            for base_lr, group in zip(scheduler.base_lrs, optimizer.param_groups):
+                group["lr"] = base_lr * resume_base_factor
+        else:
+            scheduler.step(float(start_epoch))
 
     # Compile a specific reference for training execution only.
     # We do this AFTER optimizer loading to ensure parameter consistency.
@@ -1407,16 +1442,18 @@ def train_model(
 
     swa_model = None
     swa_start_epoch = _swa_start_epoch(args.epochs)
-    if AveragedModel is None:
-        print("SWA unavailable (torch.optim.swa_utils.AveragedModel missing).")
-    elif args.epochs > 0 and swa_start_epoch < args.epochs:
-        swa_model = AveragedModel(model)
-        if checkpoint and "swa_state" in checkpoint:
-            try:
-                swa_model.load_state_dict(checkpoint["swa_state"])
-                print("Restored SWA state from checkpoint.")
-            except (KeyError, ValueError, RuntimeError) as exc:
-                print(f"Skipping SWA state restore ({exc}).")
+    enable_swa = bool(getattr(args, "enable_swa", False))
+    if enable_swa:
+        if AveragedModel is None:
+            print("SWA unavailable (torch.optim.swa_utils.AveragedModel missing).")
+        elif args.epochs > 0 and swa_start_epoch < args.epochs:
+            swa_model = AveragedModel(model)
+            if checkpoint and "swa_state" in checkpoint:
+                try:
+                    swa_model.load_state_dict(checkpoint["swa_state"])
+                    print("Restored SWA state from checkpoint.")
+                except (KeyError, ValueError, RuntimeError) as exc:
+                    print(f"Skipping SWA state restore ({exc}).")
 
     sanitized_augmentor = getattr(dataloader, "sanitized_augmentor", None)
     color_augmentor = getattr(dataloader, "color_augmentor", None)
@@ -1527,6 +1564,8 @@ def train_model(
             log_train_limit=args.log_train_limit,
             log_file=log_file,
             scheduler=scheduler,
+            epoch=epoch,
+            steps_per_epoch=steps_per_epoch,
         )
 
         if swa_model is not None and epoch >= swa_start_epoch:

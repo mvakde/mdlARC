@@ -119,6 +119,7 @@ ARGS = {
     "log_inference_prompt": False,
     "inference_temperature": None,
     "inference_top_k": None,
+    "enable_swa": False,
 }
 
 # Evaluation config
