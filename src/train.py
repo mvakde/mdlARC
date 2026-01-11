@@ -1291,6 +1291,10 @@ def train_model(
     )
     desired_optimizer_hparams = _optimizer_hparams_snapshot(optimizer)
 
+    batch_sampler = getattr(dataloader, "batch_sampler", None)
+    if batch_sampler is not None and hasattr(batch_sampler, "drop_last"):
+        batch_sampler.drop_last = True
+
     step = int(checkpoint.get("global_step", 0)) if checkpoint else 0
     steps_per_epoch = len(dataloader)
 
