@@ -16,6 +16,7 @@ except Exception:
 import numpy as np
 
 from sanitized_augment import build_sanitized_augmentor
+from normuon import SingleDeviceNorMuon, SingleDeviceNorMuonWithAuxAdam
 from tinytransformer import RMSNorm, TinyTransformer, TinyTransformerConfig
 from utils import (
     ARCExampleDataset,
@@ -400,6 +401,16 @@ def _muon_supported(device: torch.device) -> Tuple[bool, str]:
         bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
         if callable(bf16_supported) and not bf16_supported():
             return False, "Muon requires CUDA bfloat16 support"
+    return True, ""
+
+
+def _normuon_supported(device: torch.device) -> Tuple[bool, str]:
+    if device.type == "mps":
+        return False, "NorMuon uses bfloat16 orthogonalization which is unsupported on MPS"
+    if device.type == "cuda":
+        bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
+        if callable(bf16_supported) and not bf16_supported():
+            return False, "NorMuon requires CUDA bfloat16 support"
     return True, ""
 
 
@@ -850,7 +861,7 @@ def _build_optimizer(
     optimizer_name = str(getattr(args, "optimizer", "adamw")).lower()
     use_fused = device.type == "cuda"
 
-    if optimizer_name != "muon":
+    if optimizer_name not in {"muon", "normuon"}:
         param_groups = _build_weight_decay_param_groups(
             model,
             args.weight_decay,
@@ -860,9 +871,64 @@ def _build_optimizer(
         )
         return AdamW(param_groups, lr=args.lr, fused=use_fused)
 
-    supported, reason = _muon_supported(device)
+    if optimizer_name == "muon":
+        supported, reason = _muon_supported(device)
+        if not supported:
+            print(f"Muon unavailable ({reason}); falling back to AdamW.")
+            param_groups = _build_weight_decay_param_groups(
+                model,
+                args.weight_decay,
+                attention_weight_decay,
+                token_embedding_weight_decay,
+                task_embedding_weight_decay,
+            )
+            return AdamW(param_groups, lr=args.lr, fused=use_fused)
+
+        muon_groups, adamw_groups = _build_muon_and_adamw_param_groups(
+            model,
+            args.weight_decay,
+            attention_weight_decay,
+            token_embedding_weight_decay,
+            task_embedding_weight_decay,
+        )
+        if not muon_groups:
+            print("Muon requested but no eligible linear weights found; using AdamW.")
+            return AdamW(adamw_groups, lr=args.lr, fused=use_fused)
+
+        muon_lr = getattr(args, "muon_lr", None)
+        muon_lr = args.lr if muon_lr is None else float(muon_lr)
+        muon_momentum = float(getattr(args, "muon_momentum", 0.95))
+        muon_nesterov = bool(getattr(args, "muon_nesterov", True))
+        muon_ns_steps = int(getattr(args, "muon_ns_steps", 5))
+        muon_ns_coefficients = _normalize_muon_coefficients(
+            getattr(args, "muon_ns_coefficients", (3.4445, -4.775, 2.0315))
+        )
+        muon_eps = float(getattr(args, "muon_eps", 1e-7))
+        muon_adjust_lr_fn = getattr(args, "muon_adjust_lr_fn", None)
+
+        muon_optimizer = torch.optim.Muon(
+            muon_groups,
+            lr=muon_lr,
+            weight_decay=args.weight_decay,
+            momentum=muon_momentum,
+            nesterov=muon_nesterov,
+            ns_coefficients=muon_ns_coefficients,
+            eps=muon_eps,
+            ns_steps=muon_ns_steps,
+            adjust_lr_fn=muon_adjust_lr_fn,
+        )
+
+        if not adamw_groups:
+            return muon_optimizer
+
+        adamw_lr = getattr(args, "adamw_lr", None)
+        adamw_lr = args.lr if adamw_lr is None else float(adamw_lr)
+        adamw_optimizer = AdamW(adamw_groups, lr=adamw_lr, fused=use_fused)
+        return _MuonAdamWOptimizer(muon_optimizer, adamw_optimizer)
+
+    supported, reason = _normuon_supported(device)
     if not supported:
-        print(f"Muon unavailable ({reason}); falling back to AdamW.")
+        print(f"NorMuon unavailable ({reason}); falling back to AdamW.")
         param_groups = _build_weight_decay_param_groups(
             model,
             args.weight_decay,
@@ -872,47 +938,47 @@ def _build_optimizer(
         )
         return AdamW(param_groups, lr=args.lr, fused=use_fused)
 
-    muon_groups, adamw_groups = _build_muon_and_adamw_param_groups(
+    normuon_groups, adamw_groups = _build_muon_and_adamw_param_groups(
         model,
         args.weight_decay,
         attention_weight_decay,
         token_embedding_weight_decay,
         task_embedding_weight_decay,
     )
-    if not muon_groups:
-        print("Muon requested but no eligible linear weights found; using AdamW.")
+    if not normuon_groups:
+        print("NorMuon requested but no eligible linear weights found; using AdamW.")
         return AdamW(adamw_groups, lr=args.lr, fused=use_fused)
 
-    muon_lr = getattr(args, "muon_lr", None)
-    muon_lr = args.lr if muon_lr is None else float(muon_lr)
-    muon_momentum = float(getattr(args, "muon_momentum", 0.95))
-    muon_nesterov = bool(getattr(args, "muon_nesterov", True))
-    muon_ns_steps = int(getattr(args, "muon_ns_steps", 5))
-    muon_ns_coefficients = _normalize_muon_coefficients(
-        getattr(args, "muon_ns_coefficients", (3.4445, -4.775, 2.0315))
-    )
-    muon_eps = float(getattr(args, "muon_eps", 1e-7))
-    muon_adjust_lr_fn = getattr(args, "muon_adjust_lr_fn", None)
-
-    muon_optimizer = torch.optim.Muon(
-        muon_groups,
-        lr=muon_lr,
-        weight_decay=args.weight_decay,
-        momentum=muon_momentum,
-        nesterov=muon_nesterov,
-        ns_coefficients=muon_ns_coefficients,
-        eps=muon_eps,
-        ns_steps=muon_ns_steps,
-        adjust_lr_fn=muon_adjust_lr_fn,
-    )
+    normuon_lr = getattr(args, "normuon_lr", None)
+    normuon_lr = 0.02 if normuon_lr is None else float(normuon_lr)
+    normuon_momentum = float(getattr(args, "normuon_momentum", 0.95))
+    normuon_beta2 = float(getattr(args, "normuon_beta2", 0.95))
 
     if not adamw_groups:
-        return muon_optimizer
+        return SingleDeviceNorMuon(
+            normuon_groups,
+            lr=normuon_lr,
+            momentum=normuon_momentum,
+            beta2=normuon_beta2,
+        )
 
     adamw_lr = getattr(args, "adamw_lr", None)
     adamw_lr = args.lr if adamw_lr is None else float(adamw_lr)
-    adamw_optimizer = AdamW(adamw_groups, lr=adamw_lr, fused=use_fused)
-    return _MuonAdamWOptimizer(muon_optimizer, adamw_optimizer)
+    normuon_param_groups = []
+    for group in normuon_groups:
+        normuon_group = dict(group)
+        normuon_group["use_muon"] = True
+        normuon_group["lr"] = normuon_lr
+        normuon_group["momentum"] = normuon_momentum
+        normuon_group["beta2"] = normuon_beta2
+        normuon_param_groups.append(normuon_group)
+    for group in adamw_groups:
+        adam_group = dict(group)
+        adam_group["use_muon"] = False
+        adam_group["lr"] = adamw_lr
+        normuon_param_groups.append(adam_group)
+    return SingleDeviceNorMuonWithAuxAdam(normuon_param_groups)
+
 
 def maybe_save_model(
     model: TinyTransformer,
