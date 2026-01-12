@@ -53,7 +53,7 @@ def normuon_update(
     ################ NorMuon added ###################
     vnorm = update.norm(dim=(-2, -1), keepdim=True)
     v_mean = torch.mean(update * update, dim=-1, keepdim=True)
-    second_momentum.lerp_(v_mean, 1 - beta2)
+    second_momentum.lerp_(v_mean.to(second_momentum.dtype), 1 - beta2)
     step_size = 1 / second_momentum.sqrt().add_(1e-10)
     update.mul_(step_size)
     vnorm_new = update.norm(dim=(-2, -1), keepdim=True)
@@ -65,7 +65,7 @@ def normuon_update(
 
 # modified from https://github.com/KellerJordan/Muon/blob/master/muon.py
 class NorMuon(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95, beta2=0.95):
+    def __init__(self, params, lr=0.02, weight_decay=0.1, momentum=0.95, beta2=0.95):
         defaults = dict(
             lr=lr,
             weight_decay=weight_decay,
@@ -123,7 +123,7 @@ class SingleDeviceNorMuon(torch.optim.Optimizer):
     Muon variant for usage in non-distributed settings.
     """
 
-    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95, beta2=0.95):
+    def __init__(self, params, lr=0.02, weight_decay=0.1, momentum=0.95, beta2=0.95):
         defaults = dict(
             lr=lr,
             weight_decay=weight_decay,
@@ -183,7 +183,7 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
                 group["lr"] = group.get("lr", 0.02)
                 group["momentum"] = group.get("momentum", 0.95)
                 group["beta2"] = group.get("beta2", 0.95)
-                group["weight_decay"] = group.get("weight_decay", 0)
+                group["weight_decay"] = group.get("weight_decay", 0.1)
                 assert set(group.keys()) == {
                     "params",
                     "lr",
@@ -196,7 +196,7 @@ class NorMuonWithAuxAdam(torch.optim.Optimizer):
                 group["lr"] = group.get("lr", 3e-4)
                 group["betas"] = group.get("betas", (0.9, 0.95))
                 group["eps"] = group.get("eps", 1e-10)
-                group["weight_decay"] = group.get("weight_decay", 0)
+                group["weight_decay"] = group.get("weight_decay", 0.1)
                 assert set(group.keys()) == {
                     "params",
                     "lr",
@@ -283,7 +283,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 group["lr"] = group.get("lr", 0.02)
                 group["momentum"] = group.get("momentum", 0.95)
                 group["beta2"] = group.get("beta2", 0.95)
-                group["weight_decay"] = group.get("weight_decay", 0)
+                group["weight_decay"] = group.get("weight_decay", 0.1)
                 assert set(group.keys()) == {
                     "params",
                     "lr",
@@ -296,7 +296,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 group["lr"] = group.get("lr", 3e-4)
                 group["betas"] = group.get("betas", (0.9, 0.95))
                 group["eps"] = group.get("eps", 1e-10)
-                group["weight_decay"] = group.get("weight_decay", 0)
+                group["weight_decay"] = group.get("weight_decay", 0.1)
                 assert set(group.keys()) == {
                     "params",
                     "lr",
