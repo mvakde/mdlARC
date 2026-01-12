@@ -183,6 +183,7 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     grad_clip: float,
+    gradient_accumulation_steps: int = 1,
     start_step: int = 0,
     log_train_strings: bool = False,
     log_train_limit: int = 0,
@@ -208,7 +209,14 @@ def train_one_epoch(
     if steps_per_epoch is not None and steps_per_epoch <= 0:
         steps_per_epoch = None
 
+    accum_steps = max(1, int(gradient_accumulation_steps or 1))
+    accum_index = 0
+    accum_target = accum_steps
+    dataloader_length = steps_per_epoch if steps_per_epoch is not None else None
+
+    last_batch_idx = None
     for batch_idx, batch in enumerate(dataloader):
+        last_batch_idx = batch_idx
         step += 1
         # print(f"DEBUG: Step {step} sequence index: {batch['example_ids'][0].item()}")
         input_ids = batch["input_ids"].to(device)
@@ -238,8 +246,14 @@ def train_one_epoch(
                     # Apply map to all tokens: input_ids[b, t] = batch_maps[b, input_ids[b, t]]
                     input_ids = torch.gather(batch_maps, 1, input_ids)
 
-        # (set_to_none is slightly faster)
-        optimizer.zero_grad(set_to_none=True)
+        if accum_index == 0:
+            # (set_to_none is slightly faster)
+            optimizer.zero_grad(set_to_none=True)
+            if dataloader_length is not None:
+                remaining = dataloader_length - batch_idx
+                accum_target = min(accum_steps, remaining)
+            else:
+                accum_target = accum_steps
 
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
@@ -254,20 +268,31 @@ def train_one_epoch(
             inp_loss = outputs.get("input_loss")
             out_loss = outputs.get("output_loss")
 
-        loss.backward()
-        if grad_clip > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
-        if scheduler is not None:
-            if epoch is None or steps_per_epoch is None:
-                scheduler.step()
-            else:
-                epoch_progress = float(epoch) + (batch_idx + 1) / float(steps_per_epoch)
-                scheduler.step(epoch_progress)
+        loss_value = loss.item()
+        inp_loss_value = inp_loss.item() if inp_loss is not None else 0.0
+        out_loss_value = out_loss.item() if out_loss is not None else 0.0
 
-        total_loss += loss.item()
-        total_input_loss += inp_loss.item() if inp_loss is not None else 0.0
-        total_output_loss += out_loss.item() if out_loss is not None else 0.0
+        loss = loss / accum_target
+        loss.backward()
+        accum_index += 1
+
+        if accum_index >= accum_target:
+            if grad_clip > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            if scheduler is not None:
+                if epoch is None or steps_per_epoch is None:
+                    scheduler.step()
+                else:
+                    epoch_progress = float(epoch) + (batch_idx + 1) / float(
+                        steps_per_epoch
+                    )
+                    scheduler.step(epoch_progress)
+            accum_index = 0
+
+        total_loss += loss_value
+        total_input_loss += inp_loss_value
+        total_output_loss += out_loss_value
 
         # Optional: log the exact serialized strings the model is trained on
         if log_train_strings and logged < log_train_limit:
@@ -311,6 +336,18 @@ def train_one_epoch(
             total_loss = 0.0
             total_input_loss = 0.0
             total_output_loss = 0.0
+    if accum_index > 0:
+        if grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        if scheduler is not None:
+            if epoch is None or steps_per_epoch is None or last_batch_idx is None:
+                scheduler.step()
+            else:
+                epoch_progress = float(epoch) + (last_batch_idx + 1) / float(
+                    steps_per_epoch
+                )
+                scheduler.step(epoch_progress)
     return step
 
 
@@ -1563,6 +1600,7 @@ def train_model(
             optimizer=optimizer,
             device=device,
             grad_clip=args.grad_clip,
+            gradient_accumulation_steps=getattr(args, "gradient_accumulation_steps", 1),
             start_step=step,
             log_train_strings=args.log_train_strings,
             log_train_limit=args.log_train_limit,

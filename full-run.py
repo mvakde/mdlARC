@@ -73,6 +73,7 @@ ARGS = {
     # hyperparameters
     "epochs": 101,
     "batch_size": 32,
+    "gradient_accumulation_steps": 1,
     "val_batch_size": 300,
     "enable_color_aug_train": True,
     "enable_color_on_aug_test_split_during_training": True,
