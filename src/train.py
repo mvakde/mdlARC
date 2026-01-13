@@ -1441,6 +1441,10 @@ def train_model(
         if restored:
             if optimizer_hparams_changed:
                 _apply_optimizer_hparams(optimizer, desired_optimizer_hparams)
+                # Keep scheduler base LRs in sync with updated args after restore.
+                for group in optimizer.param_groups:
+                    if "initial_lr" in group and "lr" in group:
+                        group["initial_lr"] = group.get("lr", group["initial_lr"])
             print("Restored optimizer state from checkpoint.")
         else:
             resume_warmup = True
