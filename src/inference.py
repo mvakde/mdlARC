@@ -192,14 +192,15 @@ def batched_greedy_generate(
     # Convert the prompt KVs into a fixed size buffer [B, H, MaxLen, D]
     past_key_values = []
     for k, v in prompt_kvs:
-        # k, v are [B, H, PromptLen, D]
-        B, H, L, D = k.shape
+        # k: [B, H, PromptLen, Dk], v: [B, H, PromptLen, Dv]
+        B, H, L, Dk = k.shape
+        Dv = v.size(-1)
         # Create full-sized buffer
         k_buf = torch.zeros(
-            (B, H, max_model_len, D), dtype=torch.bfloat16, device=device
+            (B, H, max_model_len, Dk), dtype=k.dtype, device=device
         )
         v_buf = torch.zeros(
-            (B, H, max_model_len, D), dtype=torch.bfloat16, device=device
+            (B, H, max_model_len, Dv), dtype=v.dtype, device=device
         )
         # Copy prompt history into buffer
         k_buf[:, :, :L, :] = k
