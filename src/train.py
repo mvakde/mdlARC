@@ -9,14 +9,10 @@ from typing import Any, Dict, Optional, Sequence, Set, Tuple
 import torch
 from torch import nn
 from torch.optim import AdamW
-try:
-    from torch.optim.swa_utils import AveragedModel
-except Exception:
-    AveragedModel = None
 import numpy as np
 
 from sanitized_augment import build_sanitized_augmentor
-from normuon import SingleDeviceNorMuon, SingleDeviceNorMuonWithAuxAdam
+from normuon import SingleDeviceNorMuonWithAuxAdam
 from tinytransformer import RMSNorm, TinyTransformer, TinyTransformerConfig
 from utils import (
     ARCExampleDataset,
@@ -297,17 +293,6 @@ def _is_muon_candidate(
     return param.ndim == 2
 
 
-def _muon_supported(device: torch.device) -> Tuple[bool, str]:
-    if not hasattr(torch.optim, "Muon"):
-        return False, "torch.optim.Muon is unavailable in this PyTorch build"
-    if device.type == "mps":
-        return False, "Muon uses bfloat16 orthogonalization which is unsupported on MPS"
-    if device.type == "cuda":
-        bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
-        if callable(bf16_supported) and not bf16_supported():
-            return False, "Muon requires CUDA bfloat16 support"
-    return True, ""
-
 
 def _normuon_supported(device: torch.device) -> Tuple[bool, str]:
     if device.type == "mps":
@@ -479,70 +464,14 @@ def _build_muon_and_adamw_param_groups(
     return muon_groups, adamw_groups
 
 
-class _MuonAdamWOptimizer(torch.optim.Optimizer):
-    """Wraps Muon + AdamW so schedulers can treat them as one optimizer."""
-
-    def __init__(
-        self,
-        muon_optimizer: torch.optim.Optimizer,
-        adamw_optimizer: torch.optim.Optimizer,
-    ) -> None:
-        self.muon_optimizer = muon_optimizer
-        self.adamw_optimizer = adamw_optimizer
-
-        params = []
-        for optimizer in (muon_optimizer, adamw_optimizer):
-            for group in optimizer.param_groups:
-                params.extend(group["params"])
-
-        super().__init__(params, defaults={})
-        self.param_groups = (
-            muon_optimizer.param_groups + adamw_optimizer.param_groups
-        )
-
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            loss = closure()
-        self.muon_optimizer.step()
-        self.adamw_optimizer.step()
-        return loss
-
-    def zero_grad(self, set_to_none: bool = False) -> None:
-        self.muon_optimizer.zero_grad(set_to_none=set_to_none)
-        self.adamw_optimizer.zero_grad(set_to_none=set_to_none)
-
-    def state_dict(self) -> Dict[str, Any]:
-        return {
-            "muon": self.muon_optimizer.state_dict(),
-            "adamw": self.adamw_optimizer.state_dict(),
-        }
-
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        if "muon" in state_dict and "adamw" in state_dict:
-            self.muon_optimizer.load_state_dict(state_dict["muon"])
-            self.adamw_optimizer.load_state_dict(state_dict["adamw"])
-            return
-        # Backward compatibility: old checkpoints only stored AdamW state.
-        self.adamw_optimizer.load_state_dict(state_dict)
-        print("Loaded optimizer state into AdamW; Muon state reset.")
-
 
 def _move_optimizer_state(
     optimizer: torch.optim.Optimizer, device: torch.device
 ) -> None:
-    def _move_state(opt: torch.optim.Optimizer) -> None:
-        for state in opt.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device)
-
-    if isinstance(optimizer, _MuonAdamWOptimizer):
-        _move_state(optimizer.muon_optimizer)
-        _move_state(optimizer.adamw_optimizer)
-    else:
-        _move_state(optimizer)
-
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(device)
 
 def _load_optimizer_state(
     optimizer: torch.optim.Optimizer,
@@ -551,15 +480,6 @@ def _load_optimizer_state(
 ) -> bool:
     def _is_torch_state_dict(value: Any) -> bool:
         return isinstance(value, dict) and "param_groups" in value
-
-    if isinstance(optimizer, _MuonAdamWOptimizer):
-        try:
-            optimizer.load_state_dict(state_dict)
-        except (KeyError, ValueError, RuntimeError) as exc:
-            print(f"Skipping optimizer state restore ({exc}).")
-            return False
-        _move_optimizer_state(optimizer, device)
-        return True
 
     candidate_state: Optional[Dict[str, Any]] = None
     if _is_torch_state_dict(state_dict):
@@ -641,28 +561,12 @@ def _param_groups_snapshot(
 
 
 def _optimizer_hparams_snapshot(optimizer: torch.optim.Optimizer) -> Any:
-    if isinstance(optimizer, _MuonAdamWOptimizer):
-        return {
-            "muon": _param_groups_snapshot(optimizer.muon_optimizer.param_groups),
-            "adamw": _param_groups_snapshot(optimizer.adamw_optimizer.param_groups),
-        }
     return _param_groups_snapshot(optimizer.param_groups)
 
 
 def _checkpoint_optimizer_hparams(checkpoint: Dict[str, Any]) -> Optional[Any]:
     state_dict = checkpoint.get("optimizer_state")
-    if not isinstance(state_dict, dict):
-        return None
-    if "muon" in state_dict and "adamw" in state_dict:
-        muon_state = state_dict.get("muon", {})
-        adamw_state = state_dict.get("adamw", {})
-        if not isinstance(muon_state, dict) or not isinstance(adamw_state, dict):
-            return None
-        return {
-            "muon": _param_groups_snapshot(muon_state.get("param_groups", [])),
-            "adamw": _param_groups_snapshot(adamw_state.get("param_groups", [])),
-        }
-    if "param_groups" in state_dict:
+    if isinstance(state_dict, dict) and "param_groups" in state_dict:
         return _param_groups_snapshot(state_dict.get("param_groups", []))
     return None
 
@@ -709,15 +613,6 @@ def _apply_param_group_hparams(
 
 
 def _apply_optimizer_hparams(optimizer: torch.optim.Optimizer, hparams: Any) -> None:
-    if isinstance(optimizer, _MuonAdamWOptimizer):
-        if isinstance(hparams, dict):
-            _apply_param_group_hparams(
-                optimizer.muon_optimizer.param_groups, hparams.get("muon")
-            )
-            _apply_param_group_hparams(
-                optimizer.adamw_optimizer.param_groups, hparams.get("adamw")
-            )
-        return
     _apply_param_group_hparams(optimizer.param_groups, hparams)
 
 
@@ -728,31 +623,13 @@ def _optimizer_switch_detected(
     checkpoint_name = checkpoint.get("optimizer_name")
     if checkpoint_name:
         return str(checkpoint_name).lower() != _optimizer_identity(optimizer)
+    # If we are loading an old checkpoint that had the Muon/AdamW split,
+    # but we are now using a standard/Normuon optimizer, assume a switch occurred.
     state_dict = checkpoint.get("optimizer_state")
-    if not isinstance(state_dict, dict):
-        return False
-    checkpoint_has_muon_combo = "muon" in state_dict and "adamw" in state_dict
-    current_has_muon_combo = isinstance(optimizer, _MuonAdamWOptimizer)
-    return checkpoint_has_muon_combo != current_has_muon_combo
-
-
-def _normalize_muon_coefficients(value: object) -> Tuple[float, float, float]:
-    if isinstance(value, (list, tuple)) and len(value) == 3:
-        return tuple(float(v) for v in value)
-    return (3.4445, -4.775, 2.0315)
-
-
-def _swa_start_epoch(total_epochs: int) -> int:
-    return max(0, int(total_epochs * 0.75))
-
-
-def _swa_n_averaged(swa_model: nn.Module) -> int:
-    n_averaged = getattr(swa_model, "n_averaged", None)
-    if isinstance(n_averaged, torch.Tensor):
-        return int(n_averaged.item())
-    if isinstance(n_averaged, numbers.Integral):
-        return int(n_averaged)
-    return 0
+    if isinstance(state_dict, dict) and "muon" in state_dict and "adamw" in state_dict:
+        return True
+        
+    return False
 
 
 def _build_optimizer(
@@ -766,7 +643,7 @@ def _build_optimizer(
     optimizer_name = str(getattr(args, "optimizer", "adamw")).lower()
     use_fused = device.type == "cuda"
 
-    if optimizer_name not in {"muon", "normuon"}:
+    if optimizer_name not in {"normuon"}:
         param_groups = _build_weight_decay_param_groups(
             model,
             args.weight_decay,
@@ -776,67 +653,12 @@ def _build_optimizer(
         )
         return AdamW(param_groups, lr=args.lr, fused=use_fused)
 
-    if optimizer_name == "muon":
-        supported, reason = _muon_supported(device)
-        if not supported:
-            print(f"Muon unavailable ({reason}); falling back to AdamW.")
-            param_groups = _build_weight_decay_param_groups(
-                model,
-                args.weight_decay,
-                attention_weight_decay,
-                token_embedding_weight_decay,
-                task_embedding_weight_decay,
-            )
-            return AdamW(param_groups, lr=args.lr, fused=use_fused)
-
-        muon_groups, adamw_groups = _build_muon_and_adamw_param_groups(
-            model,
-            args.weight_decay,
-            attention_weight_decay,
-            token_embedding_weight_decay,
-            task_embedding_weight_decay,
-        )
-        if not muon_groups:
-            print("Muon requested but no eligible linear weights found; using AdamW.")
-            return AdamW(adamw_groups, lr=args.lr, fused=use_fused)
-
-        muon_lr = getattr(args, "muon_lr", None)
-        muon_lr = args.lr if muon_lr is None else float(muon_lr)
-        muon_momentum = float(getattr(args, "muon_momentum", 0.95))
-        muon_nesterov = bool(getattr(args, "muon_nesterov", True))
-        muon_ns_steps = int(getattr(args, "muon_ns_steps", 5))
-        muon_ns_coefficients = _normalize_muon_coefficients(
-            getattr(args, "muon_ns_coefficients", (3.4445, -4.775, 2.0315))
-        )
-        muon_eps = float(getattr(args, "muon_eps", 1e-7))
-        muon_adjust_lr_fn = getattr(args, "muon_adjust_lr_fn", None)
-
-        muon_optimizer = torch.optim.Muon(
-            muon_groups,
-            lr=muon_lr,
-            weight_decay=args.weight_decay,
-            momentum=muon_momentum,
-            nesterov=muon_nesterov,
-            ns_coefficients=muon_ns_coefficients,
-            eps=muon_eps,
-            ns_steps=muon_ns_steps,
-            adjust_lr_fn=muon_adjust_lr_fn,
-        )
-
-        if not adamw_groups:
-            return muon_optimizer
-
-        adamw_lr = getattr(args, "adamw_lr", None)
-        adamw_lr = args.lr if adamw_lr is None else float(adamw_lr)
-        adamw_optimizer = AdamW(adamw_groups, lr=adamw_lr, fused=use_fused)
-        return _MuonAdamWOptimizer(muon_optimizer, adamw_optimizer)
-
     supported, reason = _normuon_supported(device)
     if not supported:
         print(f"NorMuon unavailable ({reason}); falling back to AdamW.")
         param_groups = _build_weight_decay_param_groups(
             model,
-            args.weight_decay,
+            args.weight_decay,  
             attention_weight_decay,
             token_embedding_weight_decay,
             task_embedding_weight_decay,
@@ -858,14 +680,6 @@ def _build_optimizer(
     normuon_lr = 0.02 if normuon_lr is None else float(normuon_lr)
     normuon_momentum = float(getattr(args, "normuon_momentum", 0.95))
     normuon_beta2 = float(getattr(args, "normuon_beta2", 0.95))
-
-    if not adamw_groups:
-        return SingleDeviceNorMuon(
-            normuon_groups,
-            lr=normuon_lr,
-            momentum=normuon_momentum,
-            beta2=normuon_beta2,
-        )
 
     adamw_lr = getattr(args, "adamw_lr", None)
     adamw_lr = args.lr if adamw_lr is None else float(adamw_lr)
@@ -895,7 +709,6 @@ def maybe_save_model(
     epoch: Optional[int] = None,
     rng_state: Optional[Dict[str, Any]] = None,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
-    swa_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     if save_path is None:
         return
@@ -912,8 +725,6 @@ def maybe_save_model(
         checkpoint["optimizer_hparams"] = _optimizer_hparams_snapshot(optimizer)
     if scheduler is not None:  # <--- SAVE SCHEDULER
         checkpoint["scheduler_state"] = scheduler.state_dict()
-    if swa_state is not None:
-        checkpoint["swa_state"] = swa_state
     if global_step is not None:
         checkpoint["global_step"] = int(global_step)
     if epoch is not None:
@@ -1417,20 +1228,6 @@ def train_model(
     else:
         training_model = model
 
-    swa_model = None
-    swa_start_epoch = _swa_start_epoch(args.epochs)
-    enable_swa = bool(getattr(args, "enable_swa", False))
-    if enable_swa:
-        if AveragedModel is None:
-            print("SWA unavailable (torch.optim.swa_utils.AveragedModel missing).")
-        elif args.epochs > 0 and swa_start_epoch < args.epochs:
-            swa_model = AveragedModel(model)
-            if checkpoint and "swa_state" in checkpoint:
-                try:
-                    swa_model.load_state_dict(checkpoint["swa_state"])
-                    print("Restored SWA state from checkpoint.")
-                except (KeyError, ValueError, RuntimeError) as exc:
-                    print(f"Skipping SWA state restore ({exc}).")
 
     sanitized_augmentor = getattr(dataloader, "sanitized_augmentor", None)
     disable_color_aug_last_epochs = int(
@@ -1504,13 +1301,6 @@ def train_model(
             steps_per_epoch=steps_per_epoch,
         )
 
-        if swa_model is not None and epoch >= swa_start_epoch:
-            if epoch == swa_start_epoch:
-                print(
-                    f"Starting SWA averaging at epoch {epoch + 1}/{args.epochs}."
-                )
-            swa_model.update_parameters(model)
-
         # Run Validation
         if val_dataloader is not None:
             val_loss = validate_one_epoch(
@@ -1532,11 +1322,6 @@ def train_model(
             epoch_num = epoch + 1
             if epoch_num in checkpoint_schedule:
                 rng_state = _capture_rng_state(device)
-                swa_state = (
-                    swa_model.state_dict()
-                    if swa_model is not None and _swa_n_averaged(swa_model) > 0
-                    else None
-                )
                 epoch_save_path = _checkpoint_path_for_epoch(
                     save_path, epoch_num, args.epochs
                 )
@@ -1550,20 +1335,9 @@ def train_model(
                     epoch=epoch_num,
                     rng_state=rng_state,
                     scheduler=scheduler,
-                    swa_state=swa_state,
                 )
 
     rng_state = _capture_rng_state(device)
-    swa_state = None
-    if swa_model is not None:
-        swa_count = _swa_n_averaged(swa_model)
-        if swa_count > 0:
-            print(
-                "Applying SWA weights for final checkpoint "
-                f"(n_averaged={swa_count})."
-            )
-            model.load_state_dict(swa_model.module.state_dict())
-            swa_state = swa_model.state_dict()
     maybe_save_model(
         model,
         dataset,
@@ -1574,5 +1348,4 @@ def train_model(
         epoch=args.epochs,
         rng_state=rng_state,
         scheduler=scheduler,
-        swa_state=swa_state,
     )

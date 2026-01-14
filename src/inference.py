@@ -334,31 +334,19 @@ def _derive_initial_state_from_prompt(
     next_y = y
     next_z = z
 
-    next_x = torch.where(
-        last_tokens == NEXT_LINE_TOKEN_ID, torch.zeros_like(next_x), next_x
-    )
+    next_x = torch.where(last_tokens == NEXT_LINE_TOKEN_ID, torch.zeros_like(next_x), next_x)
     next_y = torch.where(last_tokens == NEXT_LINE_TOKEN_ID, y + 1, next_y)
 
-    next_x = torch.where(
-        last_tokens == IO_SEPARATOR_TOKEN_ID, torch.zeros_like(next_x), next_x
-    )
-    next_y = torch.where(
-        last_tokens == IO_SEPARATOR_TOKEN_ID, torch.zeros_like(next_y), next_y
-    )
-    next_z = torch.where(
-        last_tokens == IO_SEPARATOR_TOKEN_ID, torch.full_like(next_z, 3), next_z
-    )
+    next_x = torch.where(last_tokens == IO_SEPARATOR_TOKEN_ID, torch.zeros_like(next_x), next_x)
+    next_y = torch.where(last_tokens == IO_SEPARATOR_TOKEN_ID, torch.zeros_like(next_y), next_y)
+    next_z = torch.where(last_tokens == IO_SEPARATOR_TOKEN_ID, torch.full_like(next_z, 3), next_z)
 
     next_x = torch.where(last_tokens == END_TOKEN_ID, x, next_x)
     next_y = torch.where(last_tokens == END_TOKEN_ID, y, next_y)
     next_z = torch.where(last_tokens == END_TOKEN_ID, z, next_z)
 
-    next_x = torch.where(
-        last_tokens == START_TOKEN_ID, torch.zeros_like(next_x), next_x
-    )
-    next_y = torch.where(
-        last_tokens == START_TOKEN_ID, torch.zeros_like(next_y), next_y
-    )
+    next_x = torch.where(last_tokens == START_TOKEN_ID, torch.zeros_like(next_x), next_x)
+    next_y = torch.where(last_tokens == START_TOKEN_ID, torch.zeros_like(next_y), next_y)
     next_z = torch.where(last_tokens == START_TOKEN_ID, torch.ones_like(next_z), next_z)
 
     initial_state = torch.stack([next_x, next_y, next_z], dim=-1)
