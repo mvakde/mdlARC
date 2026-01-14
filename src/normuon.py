@@ -62,6 +62,13 @@ def normuon_update(
     update *= max(1, grad.size(-2) / grad.size(-1)) ** 0.5
     return update
 
+def adam_update(grad, buf1, buf2, step, betas, eps):
+    buf1.lerp_(grad, 1-betas[0])
+    buf2.lerp_(grad.square(), 1-betas[1])
+    buf1c = buf1 / (1 - betas[0]** step)
+    buf2c = buf2 / (1 - betas[1]** step)
+    return buf1c / (buf2c.sqrt() + eps)
+
 class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
     """
     Non-distributed counterpart to NorMuonWithAuxAdam.
