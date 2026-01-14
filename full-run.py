@@ -16,7 +16,6 @@ from typing import List, Optional
 
 # Dataset building
 BUILD_DATASETS = True
-AUGMENT_DIHEDRAL = False
 DATASET_NAMES = ["arc1", "conceptarc"]
 DATASET_SPLITS = ["train", "eval"]
 WITH_SOLUTIONS = True
@@ -77,19 +76,15 @@ ARGS = {
     "val_batch_size": 300,
     "enable_color_aug_train": True,
     "enable_color_on_aug_test_split_during_training": True,
-    "max_color_augments_train": 100,
     "max_sanitized_augments": 100,
     "color_aug_mode": "exclude_output_only",  # "input_only" | "exclude_output_only"
     "disable_color_aug_last_epochs": 1,
     "color_aug_seed": 42,
-    "color_aug_seed_eval": None,
     "enable_sanitized_aug_train": True,
     "sanitized_aug_seed": None,
     "disable_dihedral_aug_last_epochs": 0,
     "enable_dihedral_aug_train": True,
     "enable_dihedral_on_aug_test_split_during_training": True,
-    "enable_dihedral_aug_eval": True,
-    "dihedral_aug_seed": None,
     "optimizer": "normuon",  # "adamw" | "normuon"
     "normuon_lr": 0.02,
     "normuon_momentum": 0.95,
@@ -121,8 +116,8 @@ ARGS = {
 
 # Evaluation config
 PATH_BOTH = ARGS["data_path"]
-# aug_count = max_color_augments for non-sanitized, max_sanitized_augments when sanitized
-EVAL_CONFIGS = [("eval_100color_both", 100, PATH_BOTH)]
+# aug_count = max_sanitized_augments when sanitized (0 = no aug)
+EVAL_CONFIGS = [("eval_100sanitized_both", 100, PATH_BOTH)]
 EVAL_BATCH_SIZE = 900
 EVAL_SPLITS = ["test"]
 EVAL_CHECKPOINT_PATH = ARGS["save_path"]
@@ -166,10 +161,6 @@ def _build_datasets() -> None:
     if DATASET_CLEANUP:
         cmd.extend(["--cleanup", DATASET_CLEANUP])
     _run_command(cmd)
-    if AUGMENT_DIHEDRAL:
-        _run_command(
-            [sys.executable, "dataset_building_scripts/augment_dataset_dihedral.py"]
-        )
 
 
 def _sanitize_repo(project_root: Path) -> None:
@@ -280,9 +271,8 @@ def main() -> None:
             eval_data = eval_results[cfg_idx][1]
             test_results = eval_data.get("test", {}).get("results", [])
             eval_config = EVAL_CONFIGS[cfg_idx]
-            max_eval_aug = eval_config[1]
             dataset_path = eval_config[2]
-            dihedral_enabled = bool(getattr(cfg, "enable_dihedral_aug_eval", False))
+            dihedral_enabled = False
             color_mappings_by_task = None
 
             sanitized_ctx = eval_data.get("_sanitized", {})
@@ -292,23 +282,7 @@ def main() -> None:
                 ).get("test")
                 dihedral_enabled = sanitized_ctx.get(
                     "dihedral_augmented_by_split", {}
-                ).get("test", dihedral_enabled)
-
-            color_seed = getattr(cfg, "color_aug_seed_eval", None)
-            if color_seed is None:
-                color_seed = getattr(cfg, "color_aug_seed", None)
-            if color_seed is None:
-                color_seed = getattr(cfg, "seed", 42)
-
-            dihedral_seed = getattr(cfg, "dihedral_aug_seed", None)
-            if dihedral_seed is None:
-                dihedral_seed = getattr(cfg, "seed", 42)
-            dihedral_orders = None
-            if dihedral_enabled and color_mappings_by_task is None:
-                challenges = utils.load_challenges(dataset_path)
-                dihedral_orders = utils.generate_task_dihedral_orders(
-                    list(challenges.keys()), int(dihedral_seed)
-                )
+                ).get("test", False)
 
             aaivr.visualize_aaivr_flow(
                 test_results,
@@ -317,10 +291,7 @@ def main() -> None:
                 task_id=AAIVR_FLOW_TASK_ID,
                 task_index=AAIVR_FLOW_TASK_INDEX,
                 is_dihedral_augmented=dihedral_enabled,
-                max_color_augments=max_eval_aug,
-                color_aug_seed=color_seed,
                 color_mappings_by_task=color_mappings_by_task,
-                dihedral_orders_by_task=dihedral_orders,
             )
 
     if ENABLE_ARCHIVE and UPDATE_ARCHIVE_AFTER_EVAL:

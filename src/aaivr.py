@@ -9,10 +9,6 @@ import torch
 
 from utils import (
     apply_color_permutation_to_grid,
-    extract_task_input_colors,
-    generate_color_mapping_tensors,
-    generate_task_color_mappings,
-    load_challenges,
     plot_grids,
     split_grids_from_tokens,
 )
@@ -111,23 +107,6 @@ def apply_inverse_dihedral_transform(
     return _DIHEDRAL_TRANSFORMS[inverse_name](grid)
 
 
-def _resolve_dihedral_transform_index(
-    task_id: Optional[str],
-    dihedral_index: int,
-    dihedral_orders_by_task: Optional[Dict[str, Sequence[int]]],
-) -> int:
-    if dihedral_orders_by_task is None or task_id is None:
-        return int(dihedral_index)
-    order = dihedral_orders_by_task.get(task_id)
-    if not order:
-        return int(dihedral_index)
-    if dihedral_index < 0 or dihedral_index >= len(order):
-        raise ValueError(
-            f"Invalid dihedral index {dihedral_index} for task {task_id}."
-        )
-    return int(order[dihedral_index])
-
-
 def _grid_to_tuple(grid: Sequence[Sequence[int]]) -> Tuple[Tuple[int, ...], ...]:
     return tuple(tuple(int(val) for val in row) for row in grid)
 
@@ -157,9 +136,6 @@ def run_aaivr_on_results(
     rng: Optional[random.Random] = None,
     is_dihedral_augmented: bool = False,
     color_mappings_by_task: Optional[Dict[str, Sequence[Sequence[int]]]] = None,
-    color_aug_seed: Optional[int] = None,
-    max_color_augments: int = 0,
-    dihedral_orders_by_task: Optional[Dict[str, Sequence[int]]] = None,
 ) -> List[AAIVRSelection]:
     """Aggregate augmented predictions via AAIVR voting. (automated augmentation inverse)
 
@@ -171,7 +147,6 @@ def run_aaivr_on_results(
 
     # 1. Pre-calculate Inverse Color Mappings
     inverse_color_mappings_by_task: Dict[str, List[List[int]]] = {}
-    inverse_color_mappings_global: List[List[int]] = []
     if color_mappings_by_task is not None:
         for task_id, mappings in color_mappings_by_task.items():
             inv_list: List[List[int]] = []
@@ -185,13 +160,6 @@ def run_aaivr_on_results(
                 inv[fwd] = torch.arange(len(fwd), dtype=torch.long, device=fwd.device)
                 inv_list.append(inv.tolist())
             inverse_color_mappings_by_task[task_id] = inv_list
-    elif max_color_augments > 0:
-        seed = color_aug_seed if color_aug_seed is not None else 42
-        forward_tensors = generate_color_mapping_tensors(max_color_augments, seed)
-        for fwd in forward_tensors:
-            inv = torch.zeros_like(fwd)
-            inv[fwd] = torch.arange(len(fwd), dtype=torch.long, device=fwd.device)
-            inverse_color_mappings_global.append(inv.tolist())
 
     for res in results:
         task_id = res.get("task_id")
@@ -207,9 +175,6 @@ def run_aaivr_on_results(
             # Standard dataset: index is just the pair index
             base_pair_index = int(pair_index)
             transform_index = 0
-        transform_index = _resolve_dihedral_transform_index(
-            task_id, transform_index, dihedral_orders_by_task
-        )
 
         color_idx = res.get("color_permutation_index", 0)
 
@@ -240,10 +205,7 @@ def run_aaivr_on_results(
                     target_grid, transform_index
                 )
                 # Color Inverse
-                if color_mappings_by_task is not None:
-                    inv_list = inverse_color_mappings_by_task.get(task_id, [])
-                else:
-                    inv_list = inverse_color_mappings_global
+                inv_list = inverse_color_mappings_by_task.get(task_id, [])
                 if inv_list and color_idx > 0 and color_idx < len(inv_list):
                     norm_target = apply_color_permutation_to_grid(
                         norm_target, inv_list[color_idx]
@@ -270,10 +232,7 @@ def run_aaivr_on_results(
             )
 
             # Color Inverse
-            if color_mappings_by_task is not None:
-                inv_list = inverse_color_mappings_by_task.get(task_id, [])
-            else:
-                inv_list = inverse_color_mappings_global
+            inv_list = inverse_color_mappings_by_task.get(task_id, [])
             if inv_list and color_idx > 0 and color_idx < len(inv_list):
                 normalized_grid = apply_color_permutation_to_grid(
                     normalized_grid, inv_list[color_idx]
@@ -416,19 +375,6 @@ def _resolve_task_id(
     return task_order[task_index]
 
 
-def _load_task_color_mappings(
-    task_id: str, dataset_path: Path, max_color_augments: int, seed: int
-) -> List[torch.Tensor]:
-    challenges = load_challenges(dataset_path)
-    if task_id not in challenges:
-        raise ValueError(f"Task '{task_id}' not found in {dataset_path}")
-    colors = extract_task_input_colors(challenges[task_id])
-    mappings_by_task = generate_task_color_mappings(
-        {task_id: colors}, max_color_augments, seed
-    )
-    return list(mappings_by_task.get(task_id, []))
-
-
 def visualize_aaivr_flow(
     results: Sequence[Dict[str, object]],
     dataset_path: Optional[Path],
@@ -437,10 +383,7 @@ def visualize_aaivr_flow(
     task_id: Optional[str] = None,
     task_index: Optional[int] = None,
     is_dihedral_augmented: bool = False,
-    max_color_augments: int = 0,
-    color_aug_seed: Optional[int] = None,
     color_mappings_by_task: Optional[Dict[str, Sequence[Sequence[int]]]] = None,
-    dihedral_orders_by_task: Optional[Dict[str, Sequence[int]]] = None,
     rng: Optional[random.Random] = None,
 ) -> None:
     """Visualize augmented input/output pairs grouped by AAIVR-normalized outputs."""
@@ -462,17 +405,6 @@ def visualize_aaivr_flow(
         mappings = color_mappings_by_task.get(resolved_task_id, [])
         if mappings:
             inverse_color_mappings = _invert_color_mappings(mappings)
-    elif max_color_augments > 0:
-        if dataset_path is None:
-            print("dataset_path is required when max_color_augments > 0.")
-            return
-        seed = color_aug_seed if color_aug_seed is not None else 42
-        if color_aug_seed is None:
-            print("Warning: color_aug_seed not provided; defaulting to 42.")
-        mappings = _load_task_color_mappings(
-            resolved_task_id, Path(dataset_path), max_color_augments, seed
-        )
-        inverse_color_mappings = _invert_color_mappings(mappings)
 
     entries: List[Dict[str, object]] = []
     for res in results:
@@ -500,9 +432,7 @@ def visualize_aaivr_flow(
         normalized_key = None
         if is_rectangular_grid(output_grid):
             try:
-                transform_index = _resolve_dihedral_transform_index(
-                    resolved_task_id, dihedral_index, dihedral_orders_by_task
-                )
+                transform_index = int(dihedral_index)
                 normalized = apply_inverse_dihedral_transform(
                     output_grid, transform_index
                 )
@@ -562,9 +492,7 @@ def visualize_aaivr_flow(
     for _, group_entries in items:
         print(f"\nPreference order: {rank} | Count: {len(group_entries)}")
         for entry in group_entries:
-            transform_index = _resolve_dihedral_transform_index(
-                resolved_task_id, entry["dihedral_index"], dihedral_orders_by_task
-            )
+            transform_index = int(entry["dihedral_index"])
             dihedral_label = _DIHEDRAL_TRANSFORM_NAMES[transform_index % 8]
             title = (
                 f"{resolved_task_id} | input {entry['base_pair_index']} | "
@@ -582,9 +510,7 @@ def visualize_aaivr_flow(
             f"\nPreference order: {rank} | Count: {len(invalid_entries)} | Invalid outputs"
         )
         for entry in invalid_entries:
-            transform_index = _resolve_dihedral_transform_index(
-                resolved_task_id, entry["dihedral_index"], dihedral_orders_by_task
-            )
+            transform_index = int(entry["dihedral_index"])
             dihedral_label = _DIHEDRAL_TRANSFORM_NAMES[transform_index % 8]
             title = (
                 f"{resolved_task_id} | input {entry['base_pair_index']} | "

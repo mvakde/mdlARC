@@ -1,9 +1,5 @@
 import json
-import hashlib
-import random
-import math
 import functools
-import itertools
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,63 +36,6 @@ END_TOKEN_ID = TOKEN_TO_ID["<end>"]
 
 MAX_SEQ_LEN = 1863
 IGNORE_INDEX = -100
-
-
-def generate_color_permutations(
-    max_permutations: int, seed: int
-) -> List[Tuple[int, ...]]:
-    """Return up to `max_permutations` unique shuffles of colors 1-9.
-
-    Identity permutation is always included first (index 0 / permutation 1).
-    """
-    if max_permutations <= 0:
-        return []
-    rng = random.Random(seed)
-    digits = list(range(1, 10))
-    identity = tuple(digits)
-    permutations: List[Tuple[int, ...]] = [identity]
-    seen = {identity}
-    limit = math.factorial(9)
-    target = min(max_permutations, limit)
-    if target == 1:
-        return permutations
-
-    if target == limit:
-        # Generate all, shuffle, then force identity to stay first.
-        all_perms = list(itertools.permutations(digits))
-        rng.shuffle(all_perms)
-        deduped = [identity]
-        for perm in all_perms:
-            if perm == identity:
-                continue
-            deduped.append(perm)
-        return deduped[:target]
-
-    while len(permutations) < target:
-        perm = tuple(rng.sample(digits, len(digits)))
-        if perm in seen:
-            continue
-        seen.add(perm)
-        permutations.append(perm)
-    return permutations
-
-
-def color_permutation_to_mapping(perm: Sequence[int]) -> torch.Tensor:
-    """Build a token-id mapping tensor for a specific color permutation."""
-    mapping = torch.arange(VOCAB_SIZE, dtype=torch.long)
-    mapping[1:10] = torch.tensor(list(perm), dtype=torch.long)
-    return mapping
-
-
-def generate_color_mapping_tensors(
-    max_permutations: int, seed: int
-) -> List[torch.Tensor]:
-    perms = generate_color_permutations(max_permutations, seed)
-    return [color_permutation_to_mapping(perm) for perm in perms]
-
-
-def _normalize_input_colors(colors: Iterable[int]) -> List[int]:
-    return sorted({int(c) for c in colors if 1 <= int(c) <= 9})
 
 
 _COLOR_AUG_MODES = ("input_only", "exclude_output_only")
@@ -139,87 +78,6 @@ def extract_task_input_colors(
     output_colors = _extract_task_colors(task, "output")
     output_only = output_colors - input_colors
     return [color for color in range(1, 10) if color not in output_only]
-
-
-def _stable_hash(text: str) -> int:
-    digest = hashlib.sha256(text.encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "little")
-
-
-def _derive_task_seed(base_seed: int, task_id: str) -> int:
-    return (int(base_seed) + _stable_hash(task_id)) % (2**32)
-
-
-def generate_color_permutations_for_subset(
-    colors: Sequence[int], max_permutations: int, seed: int
-) -> List[Tuple[int, ...]]:
-    """Return up to `max_permutations` unique shuffles of the given color subset."""
-    if max_permutations <= 0:
-        return []
-    colors = _normalize_input_colors(colors)
-    if not colors:
-        return [tuple()]
-    rng = random.Random(seed)
-    identity = tuple(colors)
-    permutations: List[Tuple[int, ...]] = [identity]
-    seen = {identity}
-    limit = math.factorial(len(colors))
-    target = min(max_permutations, limit)
-    if target == 1:
-        return permutations
-
-    if target == limit:
-        all_perms = list(itertools.permutations(colors))
-        rng.shuffle(all_perms)
-        deduped = [identity]
-        for perm in all_perms:
-            if perm == identity:
-                continue
-            deduped.append(perm)
-        return deduped[:target]
-
-    while len(permutations) < target:
-        perm = tuple(rng.sample(colors, len(colors)))
-        if perm in seen:
-            continue
-        seen.add(perm)
-        permutations.append(perm)
-    return permutations
-
-
-def color_subset_permutation_to_mapping(
-    colors: Sequence[int], perm: Sequence[int]
-) -> torch.Tensor:
-    """Build a token-id mapping tensor for a specific subset permutation."""
-    mapping = torch.arange(VOCAB_SIZE, dtype=torch.long)
-    for src, dst in zip(colors, perm):
-        mapping[int(src)] = int(dst)
-    return mapping
-
-
-def generate_task_color_mapping_tensors(
-    input_colors: Sequence[int], max_permutations: int, seed: int
-) -> List[torch.Tensor]:
-    if max_permutations <= 0:
-        return []
-    colors = _normalize_input_colors(input_colors)
-    perms = generate_color_permutations_for_subset(colors, max_permutations, seed)
-    return [color_subset_permutation_to_mapping(colors, perm) for perm in perms]
-
-
-def generate_task_color_mappings(
-    task_input_colors: Dict[str, Sequence[int]], max_permutations: int, seed: int
-) -> Dict[str, List[torch.Tensor]]:
-    if max_permutations <= 0:
-        return {}
-    mappings_by_task: Dict[str, List[torch.Tensor]] = {}
-    for task_id, colors in task_input_colors.items():
-        task_seed = _derive_task_seed(seed, task_id)
-        mappings = generate_task_color_mapping_tensors(
-            colors, max_permutations, task_seed
-        )
-        mappings_by_task[task_id] = mappings
-    return mappings_by_task
 
 
 _DIHEDRAL_TRANSFORM_NAMES = [
@@ -293,17 +151,6 @@ def apply_dihedral_transform(
     return _DIHEDRAL_TRANSFORMS[transform_name](grid)
 
 
-def generate_task_dihedral_orders(
-    task_ids: Sequence[str], seed: int
-) -> Dict[str, List[int]]:
-    orders: Dict[str, List[int]] = {}
-    for task_id in task_ids:
-        task_seed = _derive_task_seed(seed, task_id)
-        rng = random.Random(task_seed)
-        order = list(range(8))
-        rng.shuffle(order)
-        orders[task_id] = order
-    return orders
 
 
 def apply_color_permutation_to_tokens(
@@ -321,120 +168,6 @@ def apply_color_permutation_to_grid(
         for row in grid
     ]
 
-
-class TaskColorAugmentor:
-    """Per-task color augmentation with epoch-based indexing."""
-
-    def __init__(
-        self,
-        mappings_by_task: Dict[str, Sequence[torch.Tensor]],
-        apply_to_test_split: bool = False,
-    ) -> None:
-        self.mappings_by_task = {
-            task_id: list(mappings) for task_id, mappings in mappings_by_task.items()
-        }
-        self.apply_to_test_split = apply_to_test_split
-        self._epoch = 0
-        self._enabled = True
-        self._max_permutations = max(
-            (len(mappings) for mappings in self.mappings_by_task.values()), default=0
-        )
-
-    @property
-    def max_permutations(self) -> int:
-        if not self._enabled:
-            return 0
-        return self._max_permutations
-
-    def set_enabled(self, enabled: bool) -> None:
-        self._enabled = bool(enabled)
-
-    def set_epoch(self, epoch: int) -> None:
-        self._epoch = max(0, int(epoch))
-
-    def _index_for_task(self, task_id: str) -> int:
-        mappings = self.mappings_by_task.get(task_id)
-        if not mappings:
-            return 0
-        return self._epoch % len(mappings)
-
-    def mapping_for_task(self, task_id: str, split: str) -> Optional[torch.Tensor]:
-        if not self._enabled:
-            return None
-        if split == "test" and not self.apply_to_test_split:
-            return None
-        mappings = self.mappings_by_task.get(task_id)
-        if not mappings:
-            return None
-        return mappings[self._index_for_task(task_id)]
-
-    def mapping_for_example(self, example: "SequenceExample") -> Optional[torch.Tensor]:
-        return self.mapping_for_task(example.task_id, example.split)
-
-    def mappings_for_task(self, task_id: str) -> Sequence[torch.Tensor]:
-        return self.mappings_by_task.get(task_id, [])
-
-
-class TaskDihedralAugmentor:
-    """Per-task dihedral augmentation with epoch-based indexing."""
-
-    def __init__(
-        self,
-        orders_by_task: Dict[str, Sequence[int]],
-        apply_to_test_split: bool = False,
-    ) -> None:
-        self.orders_by_task = {
-            task_id: list(order) for task_id, order in orders_by_task.items()
-        }
-        self.apply_to_test_split = apply_to_test_split
-        self._epoch = 0
-        self._enabled = True
-        self._max_transforms = max(
-            (len(order) for order in self.orders_by_task.values()), default=0
-        )
-
-    @property
-    def max_transforms(self) -> int:
-        if not self._enabled:
-            return 0
-        return self._max_transforms
-
-    def set_enabled(self, enabled: bool) -> None:
-        self._enabled = bool(enabled)
-
-    def set_epoch(self, epoch: int) -> None:
-        self._epoch = max(0, int(epoch))
-
-    def _index_for_task(self, task_id: str) -> Optional[int]:
-        order = self.orders_by_task.get(task_id)
-        if not order:
-            return None
-        return self._epoch % len(order)
-
-    def dihedral_index_for_task(self, task_id: str, split: str) -> Optional[int]:
-        if not self._enabled:
-            return None
-        if split == "test" and not self.apply_to_test_split:
-            return None
-        return self._index_for_task(task_id)
-
-    def transform_index_for_task(self, task_id: str, split: str) -> Optional[int]:
-        dihedral_index = self.dihedral_index_for_task(task_id, split)
-        if dihedral_index is None:
-            return None
-        order = self.orders_by_task.get(task_id)
-        if not order:
-            return None
-        return int(order[dihedral_index])
-
-    def transform_index_for_example(self, example: "SequenceExample") -> Optional[int]:
-        return self.transform_index_for_task(example.task_id, example.split)
-
-    def dihedral_index_for_example(self, example: "SequenceExample") -> Optional[int]:
-        return self.dihedral_index_for_task(example.task_id, example.split)
-
-    def order_for_task(self, task_id: str) -> Sequence[int]:
-        return self.orders_by_task.get(task_id, [])
 
 
 def _value_to_token_id(value: int) -> int:
@@ -1272,8 +1005,6 @@ class LengthBucketBatchSampler(Sampler[List[int]]):
 def collate_examples(
     batch: List[SequenceExample],
     pad_token_id: int = END_TOKEN_ID,
-    color_mapper: Optional[Callable[[SequenceExample], Optional[torch.Tensor]]] = None,
-    dihedral_mapper: Optional[Callable[[SequenceExample], Optional[int]]] = None,
     augment_selector: Optional[
         Callable[[SequenceExample], Tuple[Optional[torch.Tensor], Optional[int]]]
     ] = None,
@@ -1297,11 +1028,6 @@ def collate_examples(
         transform_index: Optional[int] = None
         if augment_selector is not None:
             mapping, transform_index = augment_selector(example)
-        else:
-            if dihedral_mapper is not None:
-                transform_index = dihedral_mapper(example)
-            if color_mapper is not None:
-                mapping = color_mapper(example)
         if transform_index is not None:
             tokens_by_dihedral = getattr(example, "tokens_by_dihedral", None)
             if tokens_by_dihedral:
@@ -1357,8 +1083,6 @@ def create_dataloader(
     shuffle: bool = True,
     num_workers: int = 0,
     bucket_size_multiplier: int = 4,
-    color_mapper: Optional[Callable[[SequenceExample], Optional[torch.Tensor]]] = None,
-    dihedral_mapper: Optional[Callable[[SequenceExample], Optional[int]]] = None,
     augment_selector: Optional[
         Callable[[SequenceExample], Tuple[Optional[torch.Tensor], Optional[int]]]
     ] = None,
@@ -1371,11 +1095,9 @@ def create_dataloader(
     batch_sampler = LengthBucketBatchSampler(
         lengths=lengths, batch_size=batch_size, shuffle=shuffle, bucket_size=bucket_size
     )
-    if augment_selector is not None or color_mapper is not None or dihedral_mapper is not None:
+    if augment_selector is not None:
         collate_fn = functools.partial(
             collate_examples,
-            color_mapper=color_mapper,
-            dihedral_mapper=dihedral_mapper,
             augment_selector=augment_selector,
         )
     else:

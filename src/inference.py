@@ -373,23 +373,6 @@ def _build_prompt_from_tokens(tokens: Sequence[int]) -> List[int]:
     return list(tokens[: sep_idx + 1])
 
 
-def _resolve_dihedral_transform_index(
-    task_id: Optional[str],
-    dihedral_index: Optional[int],
-    dihedral_orders_by_task: Optional[Dict[str, Sequence[int]]],
-) -> Optional[int]:
-    if dihedral_index is None:
-        return None
-    if dihedral_orders_by_task is None or task_id is None:
-        return int(dihedral_index)
-    order = dihedral_orders_by_task.get(task_id)
-    if not order:
-        return int(dihedral_index)
-    if dihedral_index < 0 or dihedral_index >= len(order):
-        raise ValueError(f"Invalid dihedral index {dihedral_index} for task {task_id}.")
-    return int(order[dihedral_index])
-
-
 def _select_tokens_for_example(
     example: object, transform_index: Optional[int]
 ) -> Tuple[List[int], Optional[torch.Tensor]]:
@@ -627,10 +610,6 @@ def run_split_inference(
     pair_index: Optional[int] = None,
     log_prompts: bool = False,
     include_targets: bool = True,
-    color_mappings: Optional[Sequence[Sequence[int]]] = None,
-    color_mappings_by_task: Optional[Dict[str, Sequence[Sequence[int]]]] = None,
-    color_apply_fn: Optional[Callable[[str], bool]] = None,
-    dihedral_orders_by_task: Optional[Dict[str, Sequence[int]]] = None,
     temperature: Optional[float] = None,
     top_k: Optional[int] = None,
 ) -> List[Dict[str, object]]:
@@ -646,74 +625,21 @@ def run_split_inference(
     if not examples:
         return []
 
-    # Flatten the workload: Create a job for every (Example, ColorMapping) pair
-    work_items = []
-    global_mappings = list(color_mappings) if color_mappings is not None else None
-    for ex in examples:
-        task_mappings = None
-        if color_mappings_by_task is not None:
-            task_mappings = color_mappings_by_task.get(getattr(ex, "task_id", None))
-        elif global_mappings is not None:
-            task_mappings = global_mappings
-        if not task_mappings:
-            task_mappings = [None]
-        task_id = getattr(ex, "task_id", None)
-        order = (
-            dihedral_orders_by_task.get(task_id)
-            if dihedral_orders_by_task is not None
-            else None
-        )
-        if order:
-            dihedral_indices = list(range(len(order)))
-        else:
-            dihedral_indices = [None]
-        for dihedral_index in dihedral_indices:
-            transform_index = _resolve_dihedral_transform_index(
-                task_id, dihedral_index, dihedral_orders_by_task
-            )
-            seq_len = _sequence_length_for_example(ex, transform_index)
-            pair_index = getattr(ex, "pair_index", None)
-            if dihedral_index is not None and pair_index is not None:
-                pair_index = int(pair_index) * 8 + int(dihedral_index)
-            for c_idx, mapping in enumerate(task_mappings):
-                work_items.append(
-                    (
-                        ex,
-                        dihedral_index,
-                        transform_index,
-                        c_idx,
-                        mapping,
-                        pair_index,
-                        seq_len,
-                    )
-                )
-
-    # Sort ALL work items by sequence length (descending) to minimize padding.
-    # Note: Color permutation maps digits 1-to-1, so seq_len stays invariant per dihedral.
-    work_items.sort(key=lambda item: item[-1], reverse=True)
+    work_items = [(ex, _sequence_length_for_example(ex, None)) for ex in examples]
+    work_items.sort(key=lambda item: item[1], reverse=True)
 
     all_results: List[Dict[str, object]] = []
 
     for start in range(0, len(work_items), batch_size):
         chunk = work_items[start : start + batch_size]
 
-        # Unzip the batch components
         batch_examples = [item[0] for item in chunk]
-        batch_dihedral_indices = [item[1] for item in chunk]
-        batch_transform_indices = [item[2] for item in chunk]
-        batch_c_indices = [item[3] for item in chunk]
-        batch_mappings = [item[4] for item in chunk]
-        batch_pair_indices = [item[5] for item in chunk]
 
         (prompts, example_ids, metadata, cached_positions, target_output_tokens) = (
             _prepare_examples_for_inference(
                 batch_examples,
                 include_targets=include_targets,
                 solutions=solutions,
-                color_mappings=batch_mappings,  # Pass the batch-specific mappings
-                color_apply_fn=color_apply_fn,
-                dihedral_transform_indices=batch_transform_indices,
-                pair_indices=batch_pair_indices,
             )
         )
         if log_prompts:
@@ -742,15 +668,6 @@ def run_split_inference(
         print(
             f"[{split}] Finished batch {start // batch_size + 1} / {(len(work_items) + batch_size - 1) // batch_size}"
         )
-
-        # Attach the correct color index to each result and collect
-        for res, c_idx, d_idx in zip(
-            batch_results, batch_c_indices, batch_dihedral_indices
-        ):
-            if color_mappings_by_task is not None or color_mappings is not None:
-                res["color_permutation_index"] = c_idx
-            if dihedral_orders_by_task is not None and d_idx is not None:
-                res["dihedral_index"] = d_idx
-            all_results.append(res)
+        all_results.extend(batch_results)
 
     return all_results
