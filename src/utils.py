@@ -475,6 +475,26 @@ def load_challenges(json_path: Path) -> Dict[str, dict]:
         return json.load(handle)
 
 
+def write_sft_challenges(
+    source_path: Path, output_path: Optional[Path] = None
+) -> Path:
+    """Write a challenges file filtered to tasks that have at least one test pair."""
+    source_path = Path(source_path)
+    challenges = load_challenges(source_path)
+    filtered = {
+        task_id: task
+        for task_id, task in challenges.items()
+        if task.get("test")
+    }
+    if output_path is None:
+        output_path = source_path.with_name("sft_challenges.json")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(filtered, indent=2))
+    print(f"Wrote {len(filtered)} tasks to {output_path}")
+    return output_path
+
+
 def tokens_to_grid(tokens: Sequence[int]) -> List[List[int]]:
     """Converts a flat sequence of tokens into a grid (list of rows)."""
     rows: List[List[int]] = []

@@ -192,6 +192,7 @@ def train_one_epoch(
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     epoch: Optional[int] = None,
     steps_per_epoch: Optional[int] = None,
+    loss_key: str = "loss",
 ) -> int:
     model.train()
     step = start_step
@@ -265,9 +266,12 @@ def train_one_epoch(
                 attention_mask=attention_mask,
                 positions_3d=positions_3d,
             )
-            loss = outputs["loss"]
+            loss = outputs.get(loss_key)
             inp_loss = outputs.get("input_loss")
             out_loss = outputs.get("output_loss")
+
+        if loss is None:
+            continue
 
         loss_value = loss.item()
         inp_loss_value = inp_loss.item() if inp_loss is not None else 0.0
