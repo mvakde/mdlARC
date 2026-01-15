@@ -866,7 +866,6 @@ def build_model_and_data(
         if getattr(args, "num_workers", 0) != 0:
             raise ValueError("Augmentation requires num_workers=0.")
         
-        # 'max_sanitized_augments' -> 'max_augments'
         max_augments = int(getattr(args, "max_augments", 0) or 0)
         
         augmentor = build_augmentor(

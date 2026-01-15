@@ -217,9 +217,7 @@ def run_evaluation_pipeline(
     Dict[str, object],
 ]:
     print(f"\n{'=' * 60}")
-    mode_label = (
-        "Sanitized" if getattr(cfg, "enable_sanitized_aug_train", False) else "No-aug"
-    )
+    mode_label = ("Augmented" if getattr(cfg, "enable_aug", False) else "No-aug")
     print(f"STARTING PIPELINE: {run_name} ({mode_label} augs: {max_eval_augments})")
     print(f"{'=' * 60}\n")
 
@@ -236,8 +234,7 @@ def run_evaluation_pipeline(
 
     prev_checkpoint = getattr(cfg, "checkpoint_path", None)
     prev_data_path = getattr(cfg, "data_path", None)
-    had_max_sanitized_aug = hasattr(cfg, "max_sanitized_augments")
-    prev_max_sanitized_aug = getattr(cfg, "max_sanitized_augments", None)
+    prev_aug = cfg.max_augments
 
     if checkpoint_path is None:
         checkpoint_path = getattr(cfg, "checkpoint_path", None)
@@ -346,10 +343,10 @@ def run_evaluation_pipeline(
 
     epochs = getattr(cfg, "epochs", None)
     epoch_label = f"{epochs}ep" if epochs is not None else "eval"
-    label = "sanitized" if use_sanitized else "no-aug"
+    label = "augments" if use_aug else "no-aug"
     log_eval(f"\n-- {epoch_label} {max_eval_augments}{label} --\n")
     dihedral_augmented = (
-        sanitized_dihedral_by_split.get("test", False) if use_sanitized else False
+        dihedral_by_split.get("test", False) if use_aug else False
     )
 
     for split in splits:
@@ -367,8 +364,8 @@ def run_evaluation_pipeline(
             log_eval(f"  [Correct Grids Details for {split}]")
 
             is_dihedral_split = (
-                sanitized_dihedral_by_split.get(split, dihedral_augmented)
-                if use_sanitized
+                dihedral_by_split.get(split, dihedral_augmented)
+                if use_aug
                 else False
             )
 
@@ -400,7 +397,7 @@ def run_evaluation_pipeline(
         aaivr_results: List[aaivr.AAIVRSelection] = []
         if test_results:
             aaivr_color_mappings = (
-                sanitized_color_mappings_by_split.get("test") if use_sanitized else None
+                color_mappings_by_split.get("test") if use_aug else None
             )
             aaivr_results = aaivr.run_aaivr_on_results(
                 test_results,
@@ -429,11 +426,7 @@ def run_evaluation_pipeline(
 
     cfg.checkpoint_path = prev_checkpoint
     cfg.data_path = prev_data_path
-    if had_max_sanitized_aug:
-        cfg.max_sanitized_augments = prev_max_sanitized_aug
-    else:
-        if hasattr(cfg, "max_sanitized_augments"):
-            delattr(cfg, "max_sanitized_augments")
+    cfg.max_augments = prev_aug
 
     return evaluation, aaivr_results, submission_path, state
 

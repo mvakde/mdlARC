@@ -449,7 +449,7 @@ def build_augmentor(
     if stats:
         avg = sum(stats) / len(stats)
         print(
-            "Sanitized augmentation: "
+            "Augmentation stats: "
             f"{len(stats)} sequences, avg augments={avg:.1f}, "
             f"min={min(stats)}, max={max(stats)}"
         )
