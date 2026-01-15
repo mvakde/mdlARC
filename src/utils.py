@@ -553,17 +553,6 @@ def visualize_submissions(
                     print(f"Skipping plot for {task_id} due to error: {exc}")
 
 
-def visualize_eval_submissions(
-    eval_sub_folder: str,
-    submission_base: Path = Path("runs"),
-    solutions_file: Optional[Path] = None,
-    mode: str = "submission",
-) -> None:
-    """Helper to visualize submissions from a runs/<folder>/submission.json."""
-    submission_file = Path(submission_base) / eval_sub_folder / "submission.json"
-    visualize_submissions(submission_file, solutions_file=solutions_file, mode=mode)
-
-
 def score_arc_submission(
     solutions_file: Path, submission_file: Path
 ) -> Dict[str, object]:

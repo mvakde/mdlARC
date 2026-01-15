@@ -157,238 +157,6 @@ def _compute_arc_style_score(
     return arc_score, max_score, pct
 
 
-def run_evaluation_pipeline(
-    cfg: argparse.Namespace,
-    run_name: str,
-    max_eval_augments: int,
-    dataset_path: Path,
-    *,
-    eval_batch_size: int = 1300,
-    splits: Sequence[str] = ("test",),
-    checkpoint_path: Optional[Path] = None,
-    include_targets: bool = False,
-    task_ids: Optional[Sequence[str]] = None,
-    log_correct_grids: bool = False,
-    state: Optional[Dict[str, object]] = None,
-) -> Tuple[
-    Dict[str, Dict[str, object]],
-    List[aaivr.AAIVRSelection],
-    Path,
-    Dict[str, object],
-]:
-    print(f"\n{'=' * 60}")
-    mode_label = ("Augmented" if getattr(cfg, "enable_aug", False) else "No-aug")
-    print(f"STARTING PIPELINE: {run_name} ({mode_label} augs: {max_eval_augments})")
-    print(f"{'=' * 60}\n")
-
-    if state is None:
-        state = {}
-    dataset_path = Path(dataset_path)
-
-    base_run_dir = Path("runs") / run_name
-    base_run_dir.mkdir(parents=True, exist_ok=True)
-
-    eval_log_path = base_run_dir / "eval_log.txt"
-    aaivr_log_path = base_run_dir / "aaivr.txt"
-    submission_path = base_run_dir / "submission.json"
-
-    prev_checkpoint = getattr(cfg, "checkpoint_path", None)
-    prev_data_path = getattr(cfg, "data_path", None)
-    prev_aug = cfg.max_augments
-
-    if checkpoint_path is None:
-        checkpoint_path = getattr(cfg, "checkpoint_path", None)
-    if checkpoint_path is None:
-        raise ValueError("checkpoint_path must be provided for evaluation.")
-
-    cfg.checkpoint_path = Path(checkpoint_path)
-    cfg.data_path = dataset_path
-    use_aug = bool(getattr(cfg, "enable_aug", False))
-    if use_aug:
-        cfg.max_augments = int(max_eval_augments)
-
-    reuse_dataset = None
-    prior_dataset = state.get("dataset")
-    if prior_dataset is not None:
-        prior_path = getattr(prior_dataset, "source_path", None)
-        if prior_path is not None and Path(prior_path) == dataset_path:
-            reuse_dataset = prior_dataset
-
-    checkpoint = state.get("checkpoint")
-    if checkpoint is None or state.get("checkpoint_path") != str(checkpoint_path):
-        checkpoint = torch.load(cfg.checkpoint_path, map_location="cpu", weights_only=False)
-        state["checkpoint"] = checkpoint
-        state["checkpoint_path"] = str(checkpoint_path)
-
-    print("Building model and dataloader for config...")
-    model, dataset, _, device, _ = train.build_model_and_data(
-        cfg, checkpoint=checkpoint, reuse_dataset=reuse_dataset
-    )
-    state["dataset"] = dataset
-
-    def log_eval(msg: str) -> None:
-        print(msg)
-        with eval_log_path.open("a") as handle:
-            handle.write(msg + "\n")
-
-    color_mappings_by_split: Dict[str, Dict[str, List[List[int]]]] = {}
-    dihedral_by_split: Dict[str, bool] = {}
-
-    if use_aug:
-        max_augments = int(getattr(cfg, "max_augments", 0) or 0)
-        augmentor = getattr(dataset, "augmentor", None)
-        if (
-            augmentor is None
-            or getattr(augmentor, "max_augments", None) != max_augments
-        ):
-            enable_color = bool(getattr(cfg, "enable_color_aug", False))
-            enable_dihedral = bool(getattr(cfg, "enable_dihedral_aug", False))
-            color_apply_to_test = bool(getattr(cfg, "color_apply_to_test", False))
-            dihedral_apply_to_test = bool(getattr(cfg, "dihedral_apply_to_test", False))
-
-            augmentor = build_augmentor(
-                dataset.examples,
-                dataset.task_input_colors,
-                max_augments=max_augments,
-                enable_color=enable_color,
-                enable_dihedral=enable_dihedral,
-                seed=int(cfg.seed),
-                color_apply_to_test_split=color_apply_to_test,
-                dihedral_apply_to_test_split=dihedral_apply_to_test,
-            )
-            dataset.augmentor = augmentor
-
-        evaluation: Dict[str, Dict[str, object]] = {}
-        for split in splits:
-            split_results, color_maps, dihedral_augmented = run_split_inference(
-                model=model,
-                dataset=dataset,
-                split=split,
-                device=device,
-                augmentor=augmentor,
-                batch_size=eval_batch_size,
-                max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
-                task_ids=task_ids,
-                include_targets=include_targets,
-                temperature=getattr(cfg, "inference_temperature", None),
-                top_k=getattr(cfg, "inference_top_k", None),
-            )
-            summary = summarize_split_results(split_results)
-            evaluation[split] = {"results": split_results, "summary": summary}
-            color_mappings_by_split[split] = color_maps
-            dihedral_by_split[split] = dihedral_augmented
-        evaluation["_aug"] = {
-            "color_mappings_by_split": color_mappings_by_split,
-            "dihedral_augmented_by_split": dihedral_by_split,
-        }
-    else:
-        evaluation: Dict[str, Dict[str, object]] = {}
-        for split in splits:
-            split_results, _, _ = run_split_inference(
-                model=model,
-                dataset=dataset,
-                split=split,
-                device=device,
-                batch_size=eval_batch_size,
-                max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
-                task_ids=task_ids,
-                include_targets=include_targets,
-                temperature=getattr(cfg, "inference_temperature", None),
-                top_k=getattr(cfg, "inference_top_k", None),
-            )
-            summary = summarize_split_results(split_results)
-            evaluation[split] = {"results": split_results, "summary": summary}
-
-    epochs = getattr(cfg, "epochs", None)
-    epoch_label = f"{epochs}ep" if epochs is not None else "eval"
-    label = "augments" if use_aug else "no-aug"
-    log_eval(f"\n-- {epoch_label} {max_eval_augments}{label} --\n")
-    dihedral_augmented = (
-        dihedral_by_split.get("test", False) if use_aug else False
-    )
-
-    for split in splits:
-        summary = evaluation.get(split, {}).get("summary", {})
-        total = summary.get("total_sequences", 0)
-        shape_ok = summary.get("num_shape_correct", 0)
-        fully_correct = summary.get("num_fully_correct", 0)
-        avg_pixel_acc = summary.get("avg_pixel_accuracy", 0.0)
-
-        log_eval(
-            f"Split: {split} | Seq: {total} | Shape OK: {shape_ok} | Fully Correct: {fully_correct} | Pixel Acc: {avg_pixel_acc:.4f}"
-        )
-
-        if log_correct_grids and fully_correct > 0:
-            log_eval(f"  [Correct Grids Details for {split}]")
-
-            is_dihedral_split = (
-                dihedral_by_split.get(split, dihedral_augmented)
-                if use_aug
-                else False
-            )
-
-            correct_results = summary.get("fully_correct_results", [])
-            for res in correct_results:
-                raw_idx = res.get("pair_index", 0)
-                if is_dihedral_split:
-                    pair_id = raw_idx // 8
-                    dihedral_id = raw_idx % 8
-                else:
-                    pair_id = raw_idx
-                    dihedral_id = 0
-
-                color_id = res.get("color_permutation_index", 0)
-                grid = res.get("output_grid", [])
-                log_eval(
-                    f"    T:{res.get('task_id')} | Pair:{pair_id} | Dihedral:{dihedral_id} | Color:{color_id} -> {grid}"
-                )
-
-    print(f"Running AAIVR for {run_name}...")
-    if hasattr(sys.stdout, "log"):
-        sys.stdout = sys.stdout.terminal
-    sys.stdout = TeeLogger(aaivr_log_path)
-
-    try:
-        test_results = evaluation.get("test", {}).get("results", [])
-        dataset_has_dihedral_augments = dihedral_augmented
-
-        aaivr_results: List[aaivr.AAIVRSelection] = []
-        if test_results:
-            aaivr_color_mappings = (
-                color_mappings_by_split.get("test") if use_aug else None
-            )
-            aaivr_results = aaivr.run_aaivr_on_results(
-                test_results,
-                is_dihedral_augmented=dataset_has_dihedral_augments,
-                color_mappings_by_task=aaivr_color_mappings,
-            )
-        else:
-            print("No test results for AAIVR.")
-
-        aaivr.summarize_aaivr_pass_at_k(aaivr_results)
-        arc_score, max_score, pct = _compute_arc_style_score(aaivr_results)
-        print(
-            f"Official ARC style scoring: {arc_score:.2f}/{max_score} ({pct:.2f}%)"
-        )
-    finally:
-        if hasattr(sys.stdout, "terminal"):
-            sys.stdout.close()
-            sys.stdout = sys.stdout.terminal
-
-    print(f"Generating submission.json for {run_name}...")
-    submission_data = _build_submission_from_aaivr(aaivr_results)
-    with submission_path.open("w") as handle:
-        json.dump(submission_data, handle)
-
-    print(f"Finished {run_name}. Submission saved to {submission_path}")
-
-    cfg.checkpoint_path = prev_checkpoint
-    cfg.data_path = prev_data_path
-    cfg.max_augments = prev_aug
-
-    return evaluation, aaivr_results, submission_path, state
-
-
 def run_evaluation_configs(
     cfg: argparse.Namespace,
     eval_configs: Sequence[Tuple[str, int, Path]],
@@ -406,31 +174,212 @@ def run_evaluation_configs(
     state: Dict[str, object] = {}
     results: List[Tuple[str, Dict[str, Dict[str, object]], Path]] = []
 
+    prev_checkpoint = getattr(cfg, "checkpoint_path", None)
+    prev_data_path = getattr(cfg, "data_path", None)
+    prev_aug = cfg.max_augments
+
+    resolved_checkpoint_path = checkpoint_path
+    if resolved_checkpoint_path is None:
+        resolved_checkpoint_path = getattr(cfg, "checkpoint_path", None)
+    if resolved_checkpoint_path is None:
+        raise ValueError("checkpoint_path must be provided for evaluation.")
+
     for config in eval_configs:
         if len(config) != 3:
             raise ValueError(
                 "eval_configs entries must be (name, aug_count, data_path)."
             )
-        name, aug_count, data_path = config
+        run_name, max_eval_augments, dataset_path = config
+        dataset_path = Path(dataset_path)
         t_start = perf_counter()
-        evaluation, _, submission_path, state = run_evaluation_pipeline(
-            cfg,
-            name,
-            aug_count,
-            data_path,
-            eval_batch_size=eval_batch_size,
-            splits=splits,
-            checkpoint_path=checkpoint_path,
-            include_targets=include_targets,
-            task_ids=task_ids,
-            log_correct_grids=log_correct_grids,
-            state=state,
+
+        print(f"\n{'=' * 60}")
+        mode_label = "Augmented" if getattr(cfg, "enable_aug", False) else "No-aug"
+        print(f"STARTING PIPELINE: {run_name} ({mode_label} augs: {max_eval_augments})")
+        print(f"{'=' * 60}\n")
+
+        base_run_dir = Path("runs") / run_name
+        base_run_dir.mkdir(parents=True, exist_ok=True)
+        eval_log_path = base_run_dir / "eval_log.txt"
+        aaivr_log_path = base_run_dir / "aaivr.txt"
+        submission_path = base_run_dir / "submission.json"
+
+        cfg.checkpoint_path = Path(resolved_checkpoint_path)
+        cfg.data_path = dataset_path
+        use_aug = bool(getattr(cfg, "enable_aug", False))
+        if use_aug:
+            cfg.max_augments = int(max_eval_augments)
+
+        reuse_dataset = None
+        prior_dataset = state.get("dataset")
+        if prior_dataset is not None:
+            prior_path = getattr(prior_dataset, "source_path", None)
+            if prior_path is not None and Path(prior_path) == dataset_path:
+                reuse_dataset = prior_dataset
+
+        checkpoint = state.get("checkpoint")
+        if checkpoint is None or state.get("checkpoint_path") != str(resolved_checkpoint_path):
+            checkpoint = torch.load(cfg.checkpoint_path, map_location="cpu", weights_only=False)
+            state["checkpoint"] = checkpoint
+            state["checkpoint_path"] = str(resolved_checkpoint_path)
+
+        print("Building model and dataloader for config...")
+        model, dataset, _, device, _ = train.build_model_and_data(
+            cfg, checkpoint=checkpoint, reuse_dataset=reuse_dataset
         )
+        state["dataset"] = dataset
+
+        def log_eval(msg: str) -> None:
+            print(msg)
+            with eval_log_path.open("a") as handle:
+                handle.write(msg + "\n")
+
+        color_mappings_by_split: Dict[str, Dict[str, List[List[int]]]] = {}
+        dihedral_by_split: Dict[str, bool] = {}
+
+        if use_aug:
+            max_augments = int(getattr(cfg, "max_augments", 0) or 0)
+            augmentor = getattr(dataset, "augmentor", None)
+            if (
+                augmentor is None
+                or getattr(augmentor, "max_augments", None) != max_augments
+            ):
+                enable_color = bool(getattr(cfg, "enable_color_aug", False))
+                enable_dihedral = bool(getattr(cfg, "enable_dihedral_aug", False))
+                color_apply_to_test = bool(getattr(cfg, "color_apply_to_test", False))
+                dihedral_apply_to_test = bool(getattr(cfg, "dihedral_apply_to_test", False))
+
+                augmentor = build_augmentor(
+                    dataset.examples,
+                    dataset.task_input_colors,
+                    max_augments=max_augments,
+                    enable_color=enable_color,
+                    enable_dihedral=enable_dihedral,
+                    seed=int(cfg.seed),
+                    color_apply_to_test_split=color_apply_to_test,
+                    dihedral_apply_to_test_split=dihedral_apply_to_test,
+                )
+                dataset.augmentor = augmentor
+
+            evaluation: Dict[str, Dict[str, object]] = {}
+            for split in splits:
+                split_results, color_maps, dihedral_augmented = run_split_inference(
+                    model=model,
+                    dataset=dataset,
+                    split=split,
+                    device=device,
+                    augmentor=augmentor,
+                    batch_size=eval_batch_size,
+                    max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+                    task_ids=task_ids,
+                    include_targets=include_targets,
+                    temperature=getattr(cfg, "inference_temperature", None),
+                    top_k=getattr(cfg, "inference_top_k", None),
+                )
+                summary = summarize_split_results(split_results)
+                evaluation[split] = {"results": split_results, "summary": summary}
+                color_mappings_by_split[split] = color_maps
+                dihedral_by_split[split] = dihedral_augmented
+            evaluation["_aug"] = {
+                "color_mappings_by_split": color_mappings_by_split,
+                "dihedral_augmented_by_split": dihedral_by_split,
+            }
+        else:
+            evaluation: Dict[str, Dict[str, object]] = {}
+            for split in splits:
+                split_results, _, _ = run_split_inference(
+                    model=model,
+                    dataset=dataset,
+                    split=split,
+                    device=device,
+                    batch_size=eval_batch_size,
+                    max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+                    task_ids=task_ids,
+                    include_targets=include_targets,
+                    temperature=getattr(cfg, "inference_temperature", None),
+                    top_k=getattr(cfg, "inference_top_k", None),
+                )
+                summary = summarize_split_results(split_results)
+                evaluation[split] = {"results": split_results, "summary": summary}
+
+        epochs = getattr(cfg, "epochs", None)
+        epoch_label = f"{epochs}ep" if epochs is not None else "eval"
+        label = "augments" if use_aug else "no-aug"
+        log_eval(f"\n-- {epoch_label} {max_eval_augments}{label} --\n")
+        dihedral_augmented = dihedral_by_split.get("test", False) if use_aug else False
+
+        for split in splits:
+            summary = evaluation.get(split, {}).get("summary", {})
+            total = summary.get("total_sequences", 0)
+            shape_ok = summary.get("num_shape_correct", 0)
+            fully_correct = summary.get("num_fully_correct", 0)
+            avg_pixel_acc = summary.get("avg_pixel_accuracy", 0.0)
+
+            log_eval(
+                f"Split: {split} | Seq: {total} | Shape OK: {shape_ok} | Fully Correct: {fully_correct} | Pixel Acc: {avg_pixel_acc:.4f}"
+            )
+
+            if log_correct_grids and fully_correct > 0:
+                log_eval(f"  [Correct Grids Details for {split}]")
+                is_dihedral_split = dihedral_by_split.get(split, dihedral_augmented) if use_aug else False
+
+                correct_results = summary.get("fully_correct_results", [])
+                for res in correct_results:
+                    raw_idx = res.get("pair_index", 0)
+                    if is_dihedral_split:
+                        pair_id = raw_idx // 8
+                        dihedral_id = raw_idx % 8
+                    else:
+                        pair_id = raw_idx
+                        dihedral_id = 0
+
+                    color_id = res.get("color_permutation_index", 0)
+                    grid = res.get("output_grid", [])
+                    log_eval(
+                        f"    T:{res.get('task_id')} | Pair:{pair_id} | Dihedral:{dihedral_id} | Color:{color_id} -> {grid}"
+                    )
+
+        print(f"Running AAIVR for {run_name}...")
+        if hasattr(sys.stdout, "log"):
+            sys.stdout = sys.stdout.terminal
+        sys.stdout = TeeLogger(aaivr_log_path)
+
+        try:
+            test_results = evaluation.get("test", {}).get("results", [])
+            aaivr_results: List[aaivr.AAIVRSelection] = []
+            if test_results:
+                aaivr_color_mappings = color_mappings_by_split.get("test") if use_aug else None
+                aaivr_results = aaivr.run_aaivr_on_results(
+                    test_results,
+                    is_dihedral_augmented=dihedral_augmented,
+                    color_mappings_by_task=aaivr_color_mappings,
+                )
+            else:
+                print("No test results for AAIVR.")
+
+            aaivr.summarize_aaivr_pass_at_k(aaivr_results)
+            arc_score, max_score, pct = _compute_arc_style_score(aaivr_results)
+            print(f"Official ARC style scoring: {arc_score:.2f}/{max_score} ({pct:.2f}%)")
+        finally:
+            if hasattr(sys.stdout, "terminal"):
+                sys.stdout.close()
+                sys.stdout = sys.stdout.terminal
+
+        print(f"Generating submission.json for {run_name}...")
+        submission_data = _build_submission_from_aaivr(aaivr_results)
+        with submission_path.open("w") as handle:
+            json.dump(submission_data, handle)
+
         t_duration = perf_counter() - t_start
-        print(f"Run {name} took {t_duration:.2f}s")
+        print(f"Finished {run_name}. Submission saved to {submission_path}")
+        print(f"Run {run_name} took {t_duration:.2f}s")
         with timing_path.open("a") as handle:
-            handle.write(f"Evaluation {name}: {t_duration:.4f} s\n")
-        results.append((name, evaluation, submission_path))
+            handle.write(f"Evaluation {run_name}: {t_duration:.4f} s\n")
+        results.append((run_name, evaluation, submission_path))
+
+    cfg.checkpoint_path = prev_checkpoint
+    cfg.data_path = prev_data_path
+    cfg.max_augments = prev_aug
 
     print("\nAll evaluation runs completed.")
     return results

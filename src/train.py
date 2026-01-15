@@ -452,10 +452,6 @@ def _param_groups_snapshot(
     return snapshot
 
 
-def _optimizer_hparams_snapshot(optimizer: torch.optim.Optimizer) -> Any:
-    return _param_groups_snapshot(optimizer.param_groups)
-
-
 def _checkpoint_optimizer_hparams(checkpoint: Dict[str, Any]) -> Optional[Any]:
     state_dict = checkpoint.get("optimizer_state")
     if isinstance(state_dict, dict) and "param_groups" in state_dict:
@@ -487,7 +483,7 @@ def _optimizer_hparams_changed(
         saved = _checkpoint_optimizer_hparams(checkpoint)
     if saved is None:
         return False
-    current = _optimizer_hparams_snapshot(optimizer)
+    current = _param_groups_snapshot(optimizer.param_groups)
     return not _optimizer_values_match(current, saved)
 
 
@@ -502,10 +498,6 @@ def _apply_param_group_hparams(
             continue
         for key, value in desired.items():
             group[key] = value
-
-
-def _apply_optimizer_hparams(optimizer: torch.optim.Optimizer, hparams: Any) -> None:
-    _apply_param_group_hparams(optimizer.param_groups, hparams)
 
 
 def _optimizer_switch_detected(
@@ -601,7 +593,7 @@ def maybe_save_model(
     if optimizer is not None:
         checkpoint["optimizer_state"] = optimizer.state_dict()
         checkpoint["optimizer_name"] = _optimizer_identity(optimizer)
-        checkpoint["optimizer_hparams"] = _optimizer_hparams_snapshot(optimizer)
+        checkpoint["optimizer_hparams"] = _param_groups_snapshot(optimizer.param_groups)
     if scheduler is not None:  # <--- SAVE SCHEDULER
         checkpoint["scheduler_state"] = scheduler.state_dict()
     if global_step is not None:
@@ -925,7 +917,7 @@ def train_model(
         token_embedding_weight_decay,
         task_embedding_weight_decay,
     )
-    desired_optimizer_hparams = _optimizer_hparams_snapshot(optimizer)
+    desired_optimizer_hparams = _param_groups_snapshot(optimizer.param_groups)
 
     batch_sampler = getattr(dataloader, "batch_sampler", None)
     if batch_sampler is not None and hasattr(batch_sampler, "drop_last"):
@@ -973,7 +965,7 @@ def train_model(
         )
         if restored:
             if optimizer_hparams_changed:
-                _apply_optimizer_hparams(optimizer, desired_optimizer_hparams)
+                _apply_param_group_hparams(optimizer.param_groups, desired_optimizer_hparams)
                 # Keep scheduler base LRs in sync with updated args after restore.
                 for group in optimizer.param_groups:
                     if "initial_lr" in group and "lr" in group:
