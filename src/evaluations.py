@@ -10,11 +10,7 @@ import torch
 import aaivr
 from augment import build_augmentor
 import train
-from inference import (
-    DEFAULT_MAX_NEW_TOKENS,
-    run_split_inference,
-    run_split_inference_augmented,
-)
+from inference import DEFAULT_MAX_NEW_TOKENS, run_split_inference
 from tinytransformer import TinyTransformer
 from utils import (
     END_TOKEN_ID,
@@ -92,43 +88,6 @@ def summarize_split_results(results: Sequence[Dict[str, object]]) -> Dict[str, o
         "num_fully_correct": num_fully_correct,
         "fully_correct_results": fully_correct_results,
     }
-
-
-def evaluate_model_on_dataset(
-    model: TinyTransformer,
-    dataset,
-    device: torch.device,
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
-    batch_size: int = 16,
-    splits: Sequence[str] = ("train", "test"),
-    task_ids: Optional[Sequence[str]] = None,
-    include_targets: bool = True,
-    temperature: Optional[float] = None,
-    top_k: Optional[int] = None,
-) -> Dict[str, Dict[str, object]]:
-    evaluation: Dict[str, Dict[str, object]] = {}
-    # Determine if we should look for targets for this specific split
-    # Usually we want targets for 'train' (to debug) but maybe not for 'test' if doing blind submission
-    split_include_targets = include_targets
-
-    # If the dataset split itself doesn't have outputs (like test) and we forced include_targets=True,
-    # run_split_inference will look for solutions.json. If we forced False, it won't.
-    for split in splits:
-        split_results = run_split_inference(
-            model=model,
-            dataset=dataset,
-            split=split,
-            device=device,
-            batch_size=batch_size,
-            max_new_tokens=max_new_tokens,
-            include_targets=split_include_targets,
-            task_ids=task_ids,
-            temperature=temperature,
-            top_k=top_k,
-        )
-        summary = summarize_split_results(split_results)
-        evaluation[split] = {"results": split_results, "summary": summary}
-    return evaluation
 
 
 class TeeLogger:
@@ -301,7 +260,7 @@ def run_evaluation_pipeline(
 
         evaluation: Dict[str, Dict[str, object]] = {}
         for split in splits:
-            split_results, color_maps, dihedral_augmented = run_split_inference_augmented(
+            split_results, color_maps, dihedral_augmented = run_split_inference(
                 model=model,
                 dataset=dataset,
                 split=split,
@@ -323,17 +282,22 @@ def run_evaluation_pipeline(
             "dihedral_augmented_by_split": dihedral_by_split,
         }
     else:
-        evaluation = evaluate_model_on_dataset(
-            model=model,
-            dataset=dataset,
-            device=device,
-            batch_size=eval_batch_size,
-            temperature=getattr(cfg, "inference_temperature", None),
-            top_k=getattr(cfg, "inference_top_k", None),
-            splits=splits,
-            task_ids=task_ids,
-            include_targets=include_targets,
-        )
+        evaluation: Dict[str, Dict[str, object]] = {}
+        for split in splits:
+            split_results, _, _ = run_split_inference(
+                model=model,
+                dataset=dataset,
+                split=split,
+                device=device,
+                batch_size=eval_batch_size,
+                max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+                task_ids=task_ids,
+                include_targets=include_targets,
+                temperature=getattr(cfg, "inference_temperature", None),
+                top_k=getattr(cfg, "inference_top_k", None),
+            )
+            summary = summarize_split_results(split_results)
+            evaluation[split] = {"results": split_results, "summary": summary}
 
     epochs = getattr(cfg, "epochs", None)
     epoch_label = f"{epochs}ep" if epochs is not None else "eval"

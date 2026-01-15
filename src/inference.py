@@ -664,7 +664,7 @@ def _build_color_mappings_by_task(
 
 
 @torch.inference_mode()
-def _run_split_inference(
+def run_split_inference(
     model: TinyTransformer,
     dataset,
     split: str,
@@ -676,7 +676,6 @@ def _run_split_inference(
     include_targets: bool = True,
     temperature: Optional[float] = None,
     top_k: Optional[int] = None,
-    log_prompts: bool = False,
     augmentor: Optional[Augmentor] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, List[List[int]]], bool]:
     solutions = _load_solutions_for_dataset(dataset) if include_targets else None
@@ -787,16 +786,6 @@ def _run_split_inference(
                     pair_indices=batch_pair_indices,
                 )
             )
-        if log_prompts:
-            for meta, prompt in zip(metadata, prompts):
-                print(
-                    "[prompt]",
-                    f"split={meta.get('split')}",
-                    f"task={meta.get('task_id')}",
-                    f"pair={meta.get('pair_index')}",
-                    "::",
-                    tokens_to_string(prompt),
-                )
         batch_results = _run_generation_batch(
             model=model,
             prompts=prompts,
@@ -825,69 +814,3 @@ def _run_split_inference(
 
     return all_results, color_mappings_by_task, dihedral_augmented
 
-
-@torch.inference_mode()
-def run_split_inference(
-    model: TinyTransformer,
-    dataset,
-    split: str,
-    device: torch.device,
-    batch_size: int = 16,
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
-    task_ids: Optional[Sequence[str]] = None,
-    pair_index: Optional[int] = None,
-    include_targets: bool = True,
-    temperature: Optional[float] = None,
-    top_k: Optional[int] = None,
-    log_prompts: bool = False,
-) -> List[Dict[str, object]]:
-    results, _, _ = _run_split_inference(
-        model=model,
-        dataset=dataset,
-        split=split,
-        device=device,
-        batch_size=batch_size,
-        max_new_tokens=max_new_tokens,
-        task_ids=task_ids,
-        pair_index=pair_index,
-        include_targets=include_targets,
-        temperature=temperature,
-        top_k=top_k,
-        log_prompts=log_prompts,
-        augmentor=None,
-    )
-    return results
-
-
-@torch.inference_mode()
-def run_split_inference_augmented(
-    model: TinyTransformer,
-    dataset,
-    split: str,
-    device: torch.device,
-    *,
-    augmentor: Augmentor,
-    batch_size: int = 16,
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
-    task_ids: Optional[Sequence[str]] = None,
-    pair_index: Optional[int] = None,
-    log_prompts: bool = False,
-    include_targets: bool = True,
-    temperature: Optional[float] = None,
-    top_k: Optional[int] = None,
-) -> Tuple[List[Dict[str, object]], Dict[str, List[List[int]]], bool]:
-    return _run_split_inference(
-        model=model,
-        dataset=dataset,
-        split=split,
-        device=device,
-        batch_size=batch_size,
-        max_new_tokens=max_new_tokens,
-        task_ids=task_ids,
-        pair_index=pair_index,
-        include_targets=include_targets,
-        temperature=temperature,
-        top_k=top_k,
-        log_prompts=log_prompts,
-        augmentor=augmentor,
-    )

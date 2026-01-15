@@ -308,43 +308,7 @@ def _collect_param_groups(
     return groups
 
 
-def _build_weight_decay_param_groups(
-    model: nn.Module,
-    weight_decay: float,
-    attention_weight_decay: float,
-    token_embedding_weight_decay: float,
-    task_embedding_weight_decay: float,
-) -> Any:
-    """Split parameters into decay groups for linear, attention, and embeddings."""
-    groups = _collect_param_groups(model, include_muon=False)
-
-    param_groups = []
-    if groups["decay"]:
-        param_groups.append({"params": groups["decay"], "weight_decay": weight_decay})
-    if groups["attention"]:
-        param_groups.append(
-            {"params": groups["attention"], "weight_decay": attention_weight_decay}
-        )
-    if groups["token_embed"]:
-        param_groups.append(
-            {
-                "params": groups["token_embed"],
-                "weight_decay": token_embedding_weight_decay,
-            }
-        )
-    if groups["task_embed"]:
-        param_groups.append(
-            {
-                "params": groups["task_embed"],
-                "weight_decay": task_embedding_weight_decay,
-            }
-        )
-    if groups["no_decay"]:
-        param_groups.append({"params": groups["no_decay"], "weight_decay": 0.0})
-    return param_groups
-
-
-def _build_muon_and_adamw_param_groups(
+def _build_param_groups(
     model: nn.Module,
     weight_decay: float,
     attention_weight_decay: float,
@@ -571,38 +535,25 @@ def _build_optimizer(
     optimizer_name = str(getattr(args, "optimizer", "adamw")).lower()
     use_fused = device.type == "cuda"
 
-    if optimizer_name not in {"normuon"}:
-        param_groups = _build_weight_decay_param_groups(
-            model,
-            args.weight_decay,
-            attention_weight_decay,
-            token_embedding_weight_decay,
-            task_embedding_weight_decay,
-        )
-        return AdamW(param_groups, lr=args.lr, fused=use_fused)
-
-    supported, reason = _normuon_supported(device)
-    if not supported:
-        print(f"NorMuon unavailable ({reason}); falling back to AdamW.")
-        param_groups = _build_weight_decay_param_groups(
-            model,
-            args.weight_decay,  
-            attention_weight_decay,
-            token_embedding_weight_decay,
-            task_embedding_weight_decay,
-        )
-        return AdamW(param_groups, lr=args.lr, fused=use_fused)
-
-    normuon_groups, adamw_groups = _build_muon_and_adamw_param_groups(
+    muon_groups, adamw_groups = _build_param_groups(
         model,
         args.weight_decay,
         attention_weight_decay,
         token_embedding_weight_decay,
         task_embedding_weight_decay,
     )
-    if not normuon_groups:
+
+    if optimizer_name not in {"normuon"}:
+        return AdamW(list(muon_groups) + list(adamw_groups), lr=args.lr, fused=use_fused)
+
+    supported, reason = _normuon_supported(device)
+    if not supported:
+        print(f"NorMuon unavailable ({reason}); falling back to AdamW.")
+        return AdamW(list(muon_groups) + list(adamw_groups), lr=args.lr, fused=use_fused)
+
+    if not muon_groups:
         print("NorMuon requested but no eligible linear weights found; using AdamW.")
-        return AdamW(adamw_groups, lr=args.lr, fused=use_fused)
+        return AdamW(list(adamw_groups), lr=args.lr, fused=use_fused)
 
     normuon_lr = getattr(args, "normuon_lr", None)
     normuon_lr = 0.02 if normuon_lr is None else float(normuon_lr)
@@ -612,7 +563,7 @@ def _build_optimizer(
     adamw_lr = getattr(args, "adamw_lr", None)
     adamw_lr = args.lr if adamw_lr is None else float(adamw_lr)
     normuon_param_groups = []
-    for group in normuon_groups:
+    for group in muon_groups:
         normuon_group = dict(group)
         normuon_group["use_muon"] = True
         normuon_group["lr"] = normuon_lr
