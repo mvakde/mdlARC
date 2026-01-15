@@ -696,19 +696,14 @@ def build_model_and_data(
     """
     set_seed(args.seed)
     device = resolve_device(getattr(args, "device", "cuda"))
-    checkpoint = (
-        checkpoint if checkpoint is not None else load_checkpoint(args.checkpoint_path)
-    )
+    checkpoint = checkpoint if checkpoint is not None else load_checkpoint(args.checkpoint_path)
 
     data_path = args.data_path
     if data_path is None:
         if checkpoint and "data_path" in checkpoint:
             data_path = Path(checkpoint["data_path"])
         else:
-            raise ValueError(
-                "--data-path is required when loading checkpoints that do not encode their source dataset. "
-                "Please re-run with the same dataset used for training."
-            )
+            raise ValueError("--data-path is required when loading checkpoints that do not encode their source dataset. Please re-run with the same dataset used for training.")
     data_path = Path(data_path)
 
     checkpoint_num_examples = infer_num_examples_from_checkpoint(checkpoint)
