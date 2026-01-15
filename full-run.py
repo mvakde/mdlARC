@@ -99,10 +99,6 @@ ARGS = {
     "n_heads": 12,
     "d_ff": 3072,
     "n_layers": 4,
-    # Visibility toggles
-    "log_train_strings": False,
-    "log_train_limit": 10,
-    "log_inference_prompt": False,
     "inference_temperature": None,
     "inference_top_k": None,
 }

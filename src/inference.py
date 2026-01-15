@@ -16,7 +16,6 @@ from utils import (
     extract_output_tokens,
     grid_to_tokens,
     tokens_to_grid,
-    tokens_to_string,
 )
 
 DEFAULT_MAX_NEW_TOKENS = 931
@@ -596,7 +595,6 @@ def run_split_inference(
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     task_ids: Optional[Sequence[str]] = None,
     pair_index: Optional[int] = None,
-    log_prompts: bool = False,
     include_targets: bool = True,
     temperature: Optional[float] = None,
     top_k: Optional[int] = None,
@@ -630,16 +628,6 @@ def run_split_inference(
                 solutions=solutions,
             )
         )
-        if log_prompts:
-            for meta, prompt in zip(metadata, prompts):
-                print(
-                    "[prompt]",
-                    f"split={meta.get('split')}",
-                    f"task={meta.get('task_id')}",
-                    f"pair={meta.get('pair_index')}",
-                    "::",
-                    tokens_to_string(prompt),
-                )
         batch_results = _run_generation_batch(
             model=model,
             prompts=prompts,

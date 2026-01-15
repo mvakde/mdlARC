@@ -18,7 +18,6 @@ from utils import (
     ARCExampleDataset,
     MAX_SEQ_LEN,
     create_dataloader,
-    tokens_to_string,
 )
 
 DEFAULT_DATA_PATH = Path("assets/challenges.json")
@@ -88,8 +87,6 @@ def train_one_epoch(
     grad_clip: float,
     gradient_accumulation_steps: int = 1,
     start_step: int = 0,
-    log_train_strings: bool = False,
-    log_train_limit: int = 0,
     log_file: Optional[Path] = None,
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     epoch: Optional[int] = None,
@@ -100,7 +97,6 @@ def train_one_epoch(
     total_loss = 0.0
     total_input_loss = 0.0
     total_output_loss = 0.0
-    logged = 0
     # Enable BF16 autocast only if on CUDA
     use_amp = device.type == "cuda"
 
@@ -171,26 +167,6 @@ def train_one_epoch(
         total_input_loss += inp_loss_value
         total_output_loss += out_loss_value
 
-        # Optional: log the exact serialized strings the model is trained on
-        if log_train_strings and logged < log_train_limit:
-            bs = input_ids.size(0)
-            to_log = min(log_train_limit - logged, bs)
-            task_ids = batch.get("task_ids", ["?"] * bs)
-            splits = batch.get("splits", ["?"] * bs)
-            for i in range(to_log):
-                seq_len = int(attention_mask[i].sum().item())
-                seq = input_ids[i, :seq_len].detach().cpu().tolist()
-                print(
-                    "[train string]",
-                    f"step={step}",
-                    f"split={splits[i]}",
-                    f"task={task_ids[i]}",
-                    "::",
-                    tokens_to_string(seq),
-                )
-                logged += 1
-                if logged >= log_train_limit:
-                    break
         if step % 10 == 0:
             avg_loss = total_loss / 10
             avg_inp = total_input_loss / 10
@@ -1196,8 +1172,6 @@ def train_model(
             grad_clip=args.grad_clip,
             gradient_accumulation_steps=getattr(args, "gradient_accumulation_steps", 1),
             start_step=step,
-            log_train_strings=args.log_train_strings,
-            log_train_limit=args.log_train_limit,
             log_file=log_file,
             scheduler=scheduler,
             epoch=epoch,

@@ -7,7 +7,7 @@ import torch
 import inference
 from augment import Augmentor, Augments
 from tinytransformer import TinyTransformer
-from utils import VOCAB_SIZE, tokens_to_string
+from utils import VOCAB_SIZE
 
 
 def _identity_mapping() -> List[int]:
@@ -98,7 +98,6 @@ def run_split_inference_augmented(
     max_new_tokens: int = inference.DEFAULT_MAX_NEW_TOKENS,
     task_ids: Optional[Sequence[str]] = None,
     pair_index: Optional[int] = None,
-    log_prompts: bool = False,
     include_targets: bool = True,
     temperature: Optional[float] = None,
     top_k: Optional[int] = None,
@@ -190,17 +189,6 @@ def run_split_inference_augmented(
                 pair_indices=batch_pair_indices,
             )
         )
-
-        if log_prompts:
-            for meta, prompt in zip(metadata, prompts):
-                print(
-                    "[prompt]",
-                    f"split={meta.get('split')}",
-                    f"task={meta.get('task_id')}",
-                    f"pair={meta.get('pair_index')}",
-                    "::",
-                    tokens_to_string(prompt),
-                )
 
         batch_results = inference._run_generation_batch(
             model=model,
