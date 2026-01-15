@@ -8,7 +8,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 
-from utils import IO_SEPARATOR_TOKEN_ID, VOCAB_SIZE, SequenceExample
+from common import IO_SEPARATOR_TOKEN_ID, VOCAB_SIZE, SequenceExample
 
 
 def _extract_input_tokens(tokens: Sequence[int]) -> List[int]:

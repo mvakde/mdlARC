@@ -4,8 +4,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 
 from augment import Augmentor, Augments
-from tinytransformer import TinyTransformer
-from utils import (
+from common import (
     END_TOKEN_ID,
     IO_SEPARATOR_TOKEN_ID,
     NEXT_LINE_TOKEN_ID,
@@ -19,6 +18,7 @@ from utils import (
     grid_to_tokens,
     tokens_to_grid,
 )
+from tinytransformer import TinyTransformer
 
 DEFAULT_MAX_NEW_TOKENS = 931
 

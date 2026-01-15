@@ -1,3 +1,9 @@
+"""Evaluation pipeline for the ARC transformer model.
+
+Contains: run_evaluation_configs, result summarization, submission building.
+For model/data building, see build.py.
+"""
+
 import argparse
 import json
 import sys
@@ -9,14 +15,14 @@ import torch
 
 import aaivr
 from augment import build_augmentor
-import train
-from inference import DEFAULT_MAX_NEW_TOKENS, run_split_inference
-from tinytransformer import TinyTransformer
-from utils import (
+from build import build_model_and_data
+from common import (
     END_TOKEN_ID,
     IO_SEPARATOR_TOKEN_ID,
     NEXT_LINE_TOKEN_ID,
 )
+from inference import DEFAULT_MAX_NEW_TOKENS, run_split_inference
+from tinytransformer import TinyTransformer
 
 
 def _has_correct_shape(
@@ -224,7 +230,7 @@ def run_evaluation_configs(
             state["checkpoint_path"] = str(resolved_checkpoint_path)
 
         print("Building model and dataloader for config...")
-        model, dataset, _, device, _ = train.build_model_and_data(
+        model, dataset, _, device, _ = build_model_and_data(
             cfg, checkpoint=checkpoint, reuse_dataset=reuse_dataset
         )
         state["dataset"] = dataset

@@ -18,10 +18,12 @@ mdlARC is a lightweight (~60M parameter) transformer model designed to solve ARC
 ```
 mdlARC/
 ├── src/                              # Core source code
-│   ├── train.py                      # Training pipeline
-│   ├── utils.py                      # Dataset, tokenization, encoding utilities
+│   ├── common.py                     # Shared utilities (vocab, tokenization, dataset, transforms)
+│   ├── build.py                      # Model and data building (build_model_and_data)
+│   ├── train.py                      # Training pipeline (train_model)
+│   ├── evaluate.py                   # Evaluation pipeline (run_evaluation_configs)
+│   ├── utils.py                      # Visualization, scoring, memory cleanup
 │   ├── tinytransformer.py            # Transformer model architecture
-│   ├── evaluations.py                # Evaluation and inference orchestration
 │   ├── inference.py                  # Token generation with KV caching
 │   ├── augment.py                    # Color and dihedral augmentation system
 │   ├── aaivr.py                      # Augmentation inverse voting
@@ -38,6 +40,14 @@ mdlARC/
 ├── interactive-run.ipynb             # Main execution notebook
 └── requirements.txt                  # Dependencies
 ```
+
+**File Organization:**
+The codebase is organized around 3 main functionalities:
+1. **build.py** - Building model and data (`build_model_and_data`)
+2. **train.py** - Training loop (`train_model`)
+3. **evaluate.py** - Evaluation pipeline (`run_evaluation_configs`)
+
+Shared code used by multiple modules lives in **common.py**, while **utils.py** contains standalone utilities (visualization, scoring, memory cleanup).
 
 ---
 
@@ -63,8 +73,9 @@ Downloads and builds the ARC datasets.
 ### Cell 3: Training Setup & Execution
 Configures all hyperparameters and builds model/data:
 ```python
+from build import build_model_and_data
 cfg = argparse.Namespace(**args)
-model, dataset, dataloader, device, data_path = train.build_model_and_data(cfg)
+model, dataset, dataloader, device, data_path = build_model_and_data(cfg)
 ```
 
 ### Cell 4: Training Loop
@@ -79,7 +90,8 @@ utils.cleanup_memory(globals())
 
 ### Cell 6: Evaluation
 ```python
-eval_results = evaluations.run_evaluation_configs(cfg, EVAL_CONFIGS, ...)
+import evaluate
+eval_results = evaluate.run_evaluation_configs(cfg, EVAL_CONFIGS, ...)
 ```
 
 ### Cell 7: Visualization
@@ -96,34 +108,9 @@ score = utils.score_arc_submission(SOLUTIONS_FILE, SUBMISSION_FILE)
 
 ## Source Modules
 
-### train.py - Training Pipeline
+### common.py - Shared Utilities
 
-**Purpose:** Orchestrates the full training loop with checkpoint management, optimizer handling, and validation.
-
-**Key Functions:**
-
-| Function | Description |
-|----------|-------------|
-| `build_model_and_data(cfg)` | Builds model, dataset, dataloader from config |
-| `train_model(cfg, model, dataloader, dataset, device, data_path)` | Full training loop |
-| `train_one_epoch(model, dataloader, optimizer, scheduler, scaler, device, epoch, cfg)` | Single epoch training |
-| `validate_one_epoch(model, val_dataloader, device)` | Validation pass |
-| `load_checkpoint(cfg, model, device)` | Load model from checkpoint |
-| `maybe_save_model(...)` | Conditional checkpoint saving |
-| `set_seed(seed)` | Set all random seeds for reproducibility |
-
-**Features:**
-- Automatic Mixed Precision (AMP) with bfloat16
-- Gradient clipping and accumulation
-- WSD learning rate schedule (warmup, stable, decay)
-- NorMuon + AdamW hybrid optimizer support
-- Comprehensive RNG state management
-
----
-
-### utils.py - Core Utilities
-
-**Purpose:** Tokenization, grid encoding/decoding, dataset handling, batching, and visualization.
+**Purpose:** Central module containing all shared code used by build, train, and evaluate modules.
 
 **Vocabulary & Constants:**
 
@@ -136,6 +123,7 @@ SPECIAL_TOKENS = {
     "<end>": 13
 }
 MAX_SEQ_LEN = 1863
+IGNORE_INDEX = -100
 ```
 
 **Key Functions:**
@@ -145,13 +133,17 @@ MAX_SEQ_LEN = 1863
 | `encode_example(input_grid, output_grid)` | Convert grid pair to token sequence |
 | `grid_to_tokens(grid)` | Flatten 2D grid to 1D token sequence |
 | `tokens_to_grid(tokens)` | Reconstruct grid from tokens |
-| `compute_positions_3d(tokens)` | Compute (x,y,z) coordinates per token |
+| `compute_positions_3d(tokens)` | Compute (x,y,z) coordinates per token (Numba JIT) |
 | `apply_dihedral_transform(grid, transform_id)` | Apply geometric transformation |
-| `apply_color_permutation_to_tokens(tokens, mapping)` | Apply color remapping |
+| `apply_inverse_dihedral_transform(grid, transform_id)` | Reverse geometric transformation |
+| `apply_color_permutation_to_tokens(tokens, mapping)` | Apply color remapping to tokens |
+| `apply_color_permutation_to_grid(grid, mapping)` | Apply color remapping to grid |
 | `load_challenges(path)` | Load JSON dataset |
-| `plot_grids(grids)` | Visualize grids with matplotlib |
-| `score_arc_submission(solutions, submission)` | Compute ARC score |
-| `visualize_submissions(submission, solutions, mode)` | Visual comparison |
+| `extract_output_tokens(tokens)` | Extract output portion from token sequence |
+| `set_seed(seed)` | Set all random seeds for reproducibility |
+| `resolve_device(device_str)` | Resolve device string to torch.device |
+| `capture_rng_state(device)` | Capture current RNG state for checkpointing |
+| `restore_rng_state(state, device)` | Restore RNG state from checkpoint |
 
 **Dihedral Transforms (8 operations):**
 - `identity`, `rot90`, `rot180`, `rot270`
@@ -160,6 +152,8 @@ MAX_SEQ_LEN = 1863
 
 **Dataset Classes:**
 
+`SequenceExample` - Dataclass representing a single tokenized example
+
 `ARCExampleDataset` - Main dataset class:
 - Loads from ARC JSON format
 - Pre-computes all 8 dihedral variants
@@ -167,6 +161,69 @@ MAX_SEQ_LEN = 1863
 - Supports task whitelist filtering
 
 `LengthBucketBatchSampler` - Groups examples by sequence length for efficient batching
+
+`collate_examples` - Collate function for DataLoader
+
+`create_dataloader` - Factory for creating DataLoaders with proper batching
+
+---
+
+### build.py - Model and Data Building
+
+**Purpose:** Constructs dataset, dataloader, and model from configuration. Entry point for setup.
+
+**Key Functions:**
+
+| Function | Description |
+|----------|-------------|
+| `build_model_and_data(cfg, checkpoint, reuse_dataset, is_eval)` | Main builder function |
+| `load_checkpoint(checkpoint_path)` | Load model checkpoint from disk |
+| `infer_num_examples_from_checkpoint(checkpoint)` | Extract task count from checkpoint |
+
+**Usage:**
+```python
+from build import build_model_and_data
+model, dataset, dataloader, device, data_path = build_model_and_data(cfg)
+```
+
+---
+
+### train.py - Training Pipeline
+
+**Purpose:** Orchestrates the full training loop with checkpoint management, optimizer handling, and validation.
+
+**Key Functions:**
+
+| Function | Description |
+|----------|-------------|
+| `train_model(cfg, model, dataloader, dataset, device, data_path)` | Full training loop |
+| `train_one_epoch(...)` | Single epoch training |
+| `validate_one_epoch(model, dataloader, device)` | Validation pass |
+| `maybe_save_model(...)` | Conditional checkpoint saving |
+
+**Features:**
+- Automatic Mixed Precision (AMP) with bfloat16
+- Gradient clipping and accumulation
+- WSD learning rate schedule (warmup, stable, decay)
+- NorMuon + AdamW hybrid optimizer support
+- Comprehensive RNG state management
+
+---
+
+### utils.py - Standalone Utilities
+
+**Purpose:** Visualization, scoring, and memory cleanup functions.
+
+**Key Functions:**
+
+| Function | Description |
+|----------|-------------|
+| `plot_grids(grids)` | Visualize grids with matplotlib |
+| `visualize_submissions(submission, solutions, mode)` | Visual comparison of predictions |
+| `score_arc_submission(solutions, submission)` | Compute official ARC score |
+| `cleanup_memory(globals_dict)` | Free GPU memory and clean caches |
+
+**Note:** For backward compatibility, common.py exports are re-exported from utils.py
 
 ---
 
@@ -220,7 +277,7 @@ logits = model.forward_generate(tokens, positions_3d, example_id, caches, decode
 
 ---
 
-### evaluations.py - Evaluation Pipeline
+### evaluate.py - Evaluation Pipeline
 
 **Purpose:** Run inference across dataset splits, aggregate results, compute metrics.
 
@@ -229,8 +286,6 @@ logits = model.forward_generate(tokens, positions_3d, example_id, caches, decode
 | Function | Description |
 |----------|-------------|
 | `run_evaluation_configs(cfg, eval_configs, ...)` | Main evaluation orchestrator |
-| `_build_submission_from_aaivr(aaivr_results)` | Convert to submission.json format |
-| `_compute_arc_style_score(results)` | Official ARC scoring |
 | `summarize_split_results(results)` | Aggregate metrics per split |
 
 **Evaluation Config Format:**
@@ -558,6 +613,7 @@ The token and task embeddings are summed before being passed through the transfo
 
 ```python
 import train
+from build import build_model_and_data
 from pathlib import Path
 import argparse
 
@@ -573,21 +629,21 @@ args = {
 }
 cfg = argparse.Namespace(**args)
 
-model, dataset, dataloader, device, data_path = train.build_model_and_data(cfg)
+model, dataset, dataloader, device, data_path = build_model_and_data(cfg)
 train.train_model(cfg, model, dataloader, dataset, device, data_path)
 ```
 
 ### Running Evaluation
 
 ```python
-import evaluations
+import evaluate
 from pathlib import Path
 
 EVAL_CONFIGS = [
     ("eval_100aug", 100, Path("assets/challenges.json")),
 ]
 
-eval_results = evaluations.run_evaluation_configs(
+eval_results = evaluate.run_evaluation_configs(
     cfg,
     EVAL_CONFIGS,
     eval_batch_size=1300,

@@ -1,80 +1,33 @@
+"""Training pipeline for the ARC transformer model.
+
+Contains: optimizer building, training loop, validation, checkpointing.
+For model/data building, see build.py.
+"""
+
 import argparse
-from dataclasses import asdict
 import math
 import numbers
-import random
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Set, Tuple
 
 import torch
 from torch import nn
 from torch.optim import AdamW
-import numpy as np
 
-from augment import build_augmentor
-from normuon import SingleDeviceNorMuonWithAuxAdam
-from tinytransformer import RMSNorm, TinyTransformer, TinyTransformerConfig
-from utils import (
+from common import (
     ARCExampleDataset,
     MAX_SEQ_LEN,
+    capture_rng_state,
     create_dataloader,
 )
-
-def set_seed(seed: int) -> None:
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+from normuon import SingleDeviceNorMuonWithAuxAdam
+from tinytransformer import RMSNorm, TinyTransformer
 
 
-def resolve_device(device_str: str) -> torch.device:
-    device_str = str(device_str or "cuda").lower()
-    if not device_str.startswith("cuda"):
-        raise ValueError("Only CUDA is supported. Set device='cuda'.")
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required but not available.")
-    # Prefer TF32 on capable CUDA hardware using the new fp32_precision API.
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    return torch.device(device_str)
-
-
-def _capture_rng_state(device: torch.device) -> Dict[str, Any]:
-    """Capture Python/numpy/torch RNG states so training can resume deterministically."""
-    state: Dict[str, Any] = {
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-    }
-    state["torch"] = torch.get_rng_state()
-    if torch.cuda.is_available() and device.type == "cuda":
-        try:
-            state["cuda"] = torch.cuda.get_rng_state_all()
-        except Exception:
-            pass
-    return state
-
-
-def _restore_rng_state(state: Optional[Dict[str, Any]], device: torch.device) -> None:
-    """Restore RNG state saved in a checkpoint; safe to call with None."""
-    if not state:
-        return
-    try:
-        random.setstate(state["python"])
-    except Exception:
-        pass
-    try:
-        np.random.set_state(state["numpy"])
-    except Exception:
-        pass
-    try:
-        torch.set_rng_state(state["torch"])
-    except Exception:
-        pass
-    if "cuda" in state and torch.cuda.is_available() and device.type == "cuda":
-        try:
-            torch.cuda.set_rng_state_all(state["cuda"])
-        except Exception:
-            pass
-
+# =============================================================================
+# Training One Epoch
+# =============================================================================
 
 def train_one_epoch(
     model: TinyTransformer,
@@ -94,7 +47,6 @@ def train_one_epoch(
     total_loss = 0.0
     total_input_loss = 0.0
     total_output_loss = 0.0
-    # Enable BF16 autocast only if on CUDA
     use_amp = device.type == "cuda"
 
     if steps_per_epoch is None:
@@ -111,13 +63,11 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(dataloader):
         last_batch_idx = batch_idx
         step += 1
-        # print(f"DEBUG: Step {step} sequence index: {batch['example_ids'][0].item()}")
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
         positions_3d = batch["positions_3d"].to(device)
         if accum_index == 0:
-            # (set_to_none is slightly faster)
             optimizer.zero_grad(set_to_none=True)
             if dataloader_length is not None:
                 remaining = dataloader_length - batch_idx
@@ -201,6 +151,56 @@ def train_one_epoch(
     return step
 
 
+# =============================================================================
+# Validation
+# =============================================================================
+
+@torch.no_grad()
+def validate_one_epoch(
+    model: TinyTransformer,
+    dataloader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> float:
+    """Calculates validation loss (Output Loss) on the test set."""
+    model.eval()
+    total_loss_sum = 0.0
+    total_tokens = 0
+
+    for batch in dataloader:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        example_ids = batch["example_ids"].to(device)
+        positions_3d = batch["positions_3d"].to(device)
+
+        if not any(batch["has_output"]):
+            continue
+
+        outputs = model(
+            input_ids,
+            example_ids,
+            attention_mask=attention_mask,
+            positions_3d=positions_3d,
+        )
+
+        out_loss = outputs.get("output_loss")
+        num_tokens = outputs.get("num_output_tokens")
+
+        if out_loss is not None and num_tokens is not None:
+            n = num_tokens.item()
+            if n > 0:
+                total_loss_sum += out_loss.item() * n
+                total_tokens += n
+
+    if total_tokens == 0:
+        return 0.0
+
+    return total_loss_sum / total_tokens
+
+
+# =============================================================================
+# Optimizer Building
+# =============================================================================
+
 def _is_norm_module(module: nn.Module) -> bool:
     return isinstance(
         module,
@@ -239,7 +239,6 @@ def _is_muon_candidate(
     if not name.endswith(".weight"):
         return False
     return param.ndim == 2
-
 
 
 def _normuon_supported(device: torch.device) -> Tuple[bool, str]:
@@ -356,7 +355,6 @@ def _build_param_groups(
     return muon_groups, adamw_groups
 
 
-
 def _move_optimizer_state(
     optimizer: torch.optim.Optimizer, device: torch.device
 ) -> None:
@@ -364,6 +362,7 @@ def _move_optimizer_state(
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
                 state[k] = v.to(device)
+
 
 def _load_optimizer_state(
     optimizer: torch.optim.Optimizer,
@@ -507,12 +506,9 @@ def _optimizer_switch_detected(
     checkpoint_name = checkpoint.get("optimizer_name")
     if checkpoint_name:
         return str(checkpoint_name).lower() != _optimizer_identity(optimizer)
-    # If we are loading an old checkpoint that had the Muon/AdamW split,
-    # but we are now using a standard/Normuon optimizer, assume a switch occurred.
     state_dict = checkpoint.get("optimizer_state")
     if isinstance(state_dict, dict) and "muon" in state_dict and "adamw" in state_dict:
         return True
-        
     return False
 
 
@@ -570,6 +566,10 @@ def _build_optimizer(
     return SingleDeviceNorMuonWithAuxAdam(normuon_param_groups)
 
 
+# =============================================================================
+# Checkpointing
+# =============================================================================
+
 def maybe_save_model(
     model: TinyTransformer,
     dataset: ARCExampleDataset,
@@ -594,7 +594,7 @@ def maybe_save_model(
         checkpoint["optimizer_state"] = optimizer.state_dict()
         checkpoint["optimizer_name"] = _optimizer_identity(optimizer)
         checkpoint["optimizer_hparams"] = _param_groups_snapshot(optimizer.param_groups)
-    if scheduler is not None:  # <--- SAVE SCHEDULER
+    if scheduler is not None:
         checkpoint["scheduler_state"] = scheduler.state_dict()
     if global_step is not None:
         checkpoint["global_step"] = int(global_step)
@@ -653,200 +653,9 @@ def _checkpoint_path_for_epoch(
     return save_path.with_name(f"{stem}.epoch{epoch:0{width}d}{suffix}")
 
 
-def load_checkpoint(checkpoint_path: Optional[Path]) -> Optional[Dict[str, Any]]:
-    if checkpoint_path is None:
-        return None
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint {checkpoint_path} does not exist.")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if "model_state" not in checkpoint:
-        checkpoint = {"model_state": checkpoint}
-    checkpoint["__path__"] = str(checkpoint_path)
-    print(f"Loaded checkpoint from {checkpoint_path}")
-    return checkpoint
-
-
-def infer_num_examples_from_checkpoint(
-    checkpoint: Optional[Dict[str, Any]],
-) -> Optional[int]:
-    if not checkpoint:
-        return None
-    config = checkpoint.get("config")
-    if config and "num_examples" in config:
-        return int(config["num_examples"])
-    state_dict = checkpoint.get("model_state", {})
-    weight = state_dict.get("example_embedding.weight")
-    if weight is not None:
-        return int(weight.shape[0])
-    return None
-
-
-def build_model_and_data(
-    args: argparse.Namespace,
-    checkpoint: Optional[Dict[str, Any]] = None,
-    reuse_dataset: Optional[ARCExampleDataset] = None,
-    is_eval: bool = False,
-) -> Tuple[
-    TinyTransformer, ARCExampleDataset, torch.utils.data.DataLoader, torch.device, Path
-]:
-    """Construct dataset, dataloader, and model for a given arg namespace.
-
-    Shared by CLI entrypoints and notebooks so that training, evaluation,
-    and inference can be orchestrated independently.
-    """
-    set_seed(args.seed)
-    device = resolve_device(getattr(args, "device", "cuda"))
-    checkpoint = checkpoint if checkpoint is not None else load_checkpoint(args.checkpoint_path)
-
-    data_path = args.data_path
-    if data_path is None:
-        if checkpoint and "data_path" in checkpoint:
-            data_path = Path(checkpoint["data_path"])
-        else:
-            raise ValueError("--data-path is required when loading checkpoints that do not encode their source dataset. Please re-run with the same dataset used for training.")
-    data_path = Path(data_path)
-
-    checkpoint_num_examples = infer_num_examples_from_checkpoint(checkpoint)
-
-    task_whitelist = None
-    if checkpoint and "task_ids" in checkpoint:
-        task_whitelist = checkpoint["task_ids"]
-
-    if reuse_dataset is not None:
-        print("Reusing existing dataset from RAM (skipping 3D pre-computation).")
-        dataset = reuse_dataset
-    else:
-        dataset = ARCExampleDataset(
-            json_path=data_path,
-            splits=("train", "test"),
-            include_outputs=True,
-            max_seq_len=MAX_SEQ_LEN,
-            task_whitelist=task_whitelist,
-        )
-
-    use_aug = bool(getattr(args, "enable_aug", False) and not is_eval)
-    augmentor = None
-
-    if use_aug:
-        max_augments = int(getattr(args, "max_augments", 0) or 0)
-        
-        augmentor = build_augmentor(
-            dataset.examples,
-            dataset.task_input_colors,
-            max_augments=max_augments,
-            enable_color=bool(getattr(args, "enable_color_aug", False)),
-            enable_dihedral=bool(getattr(args, "enable_dihedral_aug", False)),
-            seed=args.seed,
-            color_apply_to_test_split=bool(getattr(args, "color_apply_to_test", False)),
-            dihedral_apply_to_test_split=bool(getattr(args, "dihedral_apply_to_test", False)),
-        )
-        dataset.augmentor = augmentor
-
-    # We always recreate the dataloader because batch_size might have changed in args
-    collate_augment_selector = None
-    if augmentor is not None:
-        collate_augment_selector = augmentor.select_for_example
-    dataloader = create_dataloader(
-        dataset=dataset,
-        batch_size=args.batch_size,
-        shuffle=not getattr(args, "eval_only", False),
-        augment_selector=collate_augment_selector,
-    )
-    if augmentor is not None:
-        dataloader.augmentor = augmentor
-
-    if (
-        checkpoint_num_examples is not None
-        and dataset.num_examples != checkpoint_num_examples
-    ):
-        raise ValueError(
-            "Dataset task-count mismatch: "
-            f"checkpoint was trained with {checkpoint_num_examples} unique examples but the provided dataset "
-            f"currently exposes {dataset.num_examples}. Pass the original --data-path or retrain."
-        )
-
-    if checkpoint and "config" in checkpoint:
-        config = TinyTransformerConfig(**checkpoint["config"])
-    else:
-        num_examples = checkpoint_num_examples or max(1, dataset.num_examples)
-        d_model = getattr(args, "d_model", 128)
-        n_heads = getattr(args, "n_heads", 4)
-        d_ff = getattr(args, "d_ff", 512)
-        n_layers = getattr(args, "n_layers", 4)
-        dropout = getattr(args, "dropout", 0.1)
-        config = TinyTransformerConfig(
-            num_examples=num_examples,
-            d_model=d_model,
-            n_heads=n_heads,
-            d_ff=d_ff,
-            n_layers=n_layers,
-            dropout=dropout,
-        )
-
-    if dataset.num_examples != config.num_examples:
-        raise ValueError(
-            f"Dataset provides {dataset.num_examples} examples but model expects "
-            f"{config.num_examples}. Please ensure the dataset/task whitelist matches the checkpoint."
-        )
-
-    model = TinyTransformer(config).to(device)
-
-    if checkpoint:
-        state_dict = checkpoint["model_state"]
-        model.load_state_dict(state_dict, strict=False)
-        _restore_rng_state(checkpoint.get("rng_state"), device)
-
-    # Stash checkpoint for downstream consumers (e.g., so train_model can restore the optimizer).
-    model._loaded_checkpoint = checkpoint
-
-    return model, dataset, dataloader, device, data_path
-
-
-@torch.no_grad()
-def validate_one_epoch(
-    model: TinyTransformer,
-    dataloader: torch.utils.data.DataLoader,
-    device: torch.device,
-) -> float:
-    """Calculates validation loss (Output Loss) on the test set."""
-    model.eval()
-    total_loss_sum = 0.0
-    total_tokens = 0
-
-    for batch in dataloader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        example_ids = batch["example_ids"].to(device)
-        positions_3d = batch["positions_3d"].to(device)
-
-        # We only care about validation on examples that actually have outputs
-        # (The val_dataset should be constructed such that has_output is True)
-        if not any(batch["has_output"]):
-            continue
-
-        outputs = model(
-            input_ids,
-            example_ids,
-            attention_mask=attention_mask,
-            positions_3d=positions_3d,
-        )
-
-        # 'output_loss' is the specific loss on tokens AFTER the separator
-        out_loss = outputs.get("output_loss")
-        num_tokens = outputs.get("num_output_tokens")
-
-        if out_loss is not None and num_tokens is not None:
-            n = num_tokens.item()
-            if n > 0:
-                # Reconstruct sum: batch_avg * batch_count
-                total_loss_sum += out_loss.item() * n
-                total_tokens += n
-
-    if total_tokens == 0:
-        return 0.0
-
-    return total_loss_sum / total_tokens
-
+# =============================================================================
+# Main Training Loop
+# =============================================================================
 
 def train_model(
     args: argparse.Namespace,
@@ -867,18 +676,14 @@ def train_model(
     if do_validate:
         val_batch_size = getattr(args, "val_batch_size", args.batch_size)
         print(f"Building validation dataloader (batch_size={val_batch_size})...")
-
-        # Create a separate Validation Dataset/Loader that accesses solutions.json
-        # We only include the 'test' split here to calculate validation loss.
-        # STRICT SEPARATION: This is the ONLY place load_test_solutions=True is used.
         print("Building validation dataloader (reading hidden solutions)...")
         val_dataset = ARCExampleDataset(
             json_path=data_path,
-            splits=("test",),  # Only test split for validation
-            include_outputs=True,  # We need outputs to calculate loss
-            load_test_solutions=True,  # <--- Loads solutions.json
+            splits=("test",),
+            include_outputs=True,
+            load_test_solutions=True,
             max_seq_len=MAX_SEQ_LEN,
-            task_whitelist=dataset.task_ids,  # Keep ID mapping consistent
+            task_whitelist=dataset.task_ids,
         )
 
         val_dataloader = create_dataloader(
@@ -890,7 +695,6 @@ def train_model(
     else:
         print("Validation disabled (skipping solutions.json load).")
 
-    # Extract log file from args if it exists
     log_file = getattr(args, "train_log_file", None)
 
     save_path = getattr(args, "save_path", None)
@@ -953,7 +757,6 @@ def train_model(
         resume_warmup = True
         print("Detected optimizer hyperparameter change; applying new settings.")
 
-    # Restore optimizer state if available so momentum/adam moments resume.
     if checkpoint and "optimizer_state" in checkpoint:
         restored = _load_optimizer_state(
             optimizer, checkpoint["optimizer_state"], device
@@ -961,7 +764,6 @@ def train_model(
         if restored:
             if optimizer_hparams_changed:
                 _apply_param_group_hparams(optimizer.param_groups, desired_optimizer_hparams)
-                # Keep scheduler base LRs in sync with updated args after restore.
                 for group in optimizer.param_groups:
                     if "initial_lr" in group and "lr" in group:
                         group["initial_lr"] = group.get("lr", group["initial_lr"])
@@ -973,10 +775,7 @@ def train_model(
         resume_warmup = True
         print("No optimizer state in checkpoint; starting with fresh optimizer.")
 
-    # print(f"DEBUG CHECK: Optimizer state size = {len(optimizer.state)} (0 = Fresh/Reset, >0 = Restored)")
-
-    # Linear warmup + WSD (warmup, stable, decay) schedule with linear decay tail.
-    # Schedule uses epoch progress so it is insensitive to batch size changes.
+    # Linear warmup + WSD schedule
     total_epochs = max(0.0, float(args.epochs))
     steps_per_epoch = max(1, steps_per_epoch)
     warmup_pct = float(getattr(args, "warmup_pct", 0.02))
@@ -1031,7 +830,6 @@ def train_model(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Restore scheduler if resuming (unless we intentionally reset the schedule).
     scheduler_restored = False
     if checkpoint and "scheduler_state" in checkpoint and not resume_warmup:
         scheduler_state = checkpoint["scheduler_state"]
@@ -1062,15 +860,12 @@ def train_model(
         else:
             scheduler.step(float(start_epoch))
 
-    # Compile a specific reference for training execution only.
-    # We do this AFTER optimizer loading to ensure parameter consistency.
-    # Guard on CUDA because training is CUDA-only and compilation is backend-specific.
+    # Compile model for training speedup
     if hasattr(torch, "compile") and device.type == "cuda":
         print("Compiling model for training speedup...")
         training_model = torch.compile(model)
     else:
         training_model = model
-
 
     augmentor = getattr(dataloader, "augmentor", None)
 
@@ -1079,7 +874,6 @@ def train_model(
         if augmentor is not None:
             augmentor.set_epoch(epoch)
 
-        # Run Training
         step = train_one_epoch(
             model=training_model,
             dataloader=dataloader,
@@ -1094,10 +888,9 @@ def train_model(
             steps_per_epoch=steps_per_epoch,
         )
 
-        # Run Validation
         if val_dataloader is not None:
             val_loss = validate_one_epoch(
-                model=model,  # Use the base model (not compiled) or compiled one, usually base is safer for eval switch
+                model=model,
                 dataloader=val_dataloader,
                 device=device,
             )
@@ -1114,7 +907,7 @@ def train_model(
         if checkpoint_schedule and save_path is not None:
             epoch_num = epoch + 1
             if epoch_num in checkpoint_schedule:
-                rng_state = _capture_rng_state(device)
+                rng_state = capture_rng_state(device)
                 epoch_save_path = _checkpoint_path_for_epoch(
                     save_path, epoch_num, args.epochs
                 )
@@ -1130,7 +923,7 @@ def train_model(
                     scheduler=scheduler,
                 )
 
-    rng_state = _capture_rng_state(device)
+    rng_state = capture_rng_state(device)
     maybe_save_model(
         model,
         dataset,

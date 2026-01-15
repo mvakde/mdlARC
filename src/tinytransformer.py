@@ -5,12 +5,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import (
+from common import (
     IGNORE_INDEX,
+    IO_SEPARATOR_TOKEN_ID,
     MAX_SEQ_LEN,
     VOCAB_SIZE,
     compute_positions_3d,
-    IO_SEPARATOR_TOKEN_ID,
 )
 
 

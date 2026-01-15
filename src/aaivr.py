@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from utils import (
+from common import (
     apply_color_permutation_to_grid,
     apply_inverse_dihedral_transform,
     is_rectangular_grid,
