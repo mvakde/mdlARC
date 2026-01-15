@@ -20,9 +20,6 @@ from utils import (
     create_dataloader,
 )
 
-DEFAULT_DATA_PATH = Path("assets/challenges.json")
-
-
 def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -254,6 +251,63 @@ def _normuon_supported(device: torch.device) -> Tuple[bool, str]:
     return True, ""
 
 
+def _collect_param_groups(
+    model: nn.Module, *, include_muon: bool
+) -> Dict[str, list[nn.Parameter]]:
+    groups: Dict[str, list[nn.Parameter]] = {
+        "decay": [],
+        "attention": [],
+        "token_embed": [],
+        "task_embed": [],
+        "no_decay": [],
+        "muon": [],
+        "muon_attention": [],
+    }
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        module_name = name.rsplit(".", 1)[0] if "." in name else ""
+        module = model.get_submodule(module_name) if module_name else model
+        is_attention = _is_attention_param(name)
+
+        if include_muon and _is_muon_candidate(module, name, param):
+            if is_attention:
+                groups["muon_attention"].append(param)
+            else:
+                groups["muon"].append(param)
+            continue
+
+        if name.endswith(".bias"):
+            groups["no_decay"].append(param)
+            continue
+
+        if _is_norm_module(module) or _is_positional_embedding_param(name):
+            groups["no_decay"].append(param)
+            continue
+
+        if isinstance(module, nn.Embedding):
+            if name.startswith("token_embedding."):
+                groups["token_embed"].append(param)
+            elif name.startswith("example_embedding."):
+                groups["task_embed"].append(param)
+            else:
+                groups["no_decay"].append(param)
+            continue
+
+        if is_attention:
+            groups["attention"].append(param)
+            continue
+
+        if isinstance(module, nn.Linear):
+            groups["decay"].append(param)
+        else:
+            groups["no_decay"].append(param)
+
+    return groups
+
+
 def _build_weight_decay_param_groups(
     model: nn.Module,
     weight_decay: float,
@@ -262,67 +316,31 @@ def _build_weight_decay_param_groups(
     task_embedding_weight_decay: float,
 ) -> Any:
     """Split parameters into decay groups for linear, attention, and embeddings."""
-    decay_params = []
-    attention_params = []
-    token_embed_params = []
-    task_embed_params = []
-    no_decay_params = []
-
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if name.endswith(".bias"):
-            no_decay_params.append(param)
-            continue
-
-        module_name = name.rsplit(".", 1)[0] if "." in name else ""
-        module = model.get_submodule(module_name) if module_name else model
-
-        if _is_norm_module(module) or _is_positional_embedding_param(name):
-            no_decay_params.append(param)
-            continue
-
-        if isinstance(module, nn.Embedding):
-            if name.startswith("token_embedding."):
-                token_embed_params.append(param)
-            elif name.startswith("example_embedding."):
-                task_embed_params.append(param)
-            else:
-                no_decay_params.append(param)
-            continue
-
-        if _is_attention_param(name):
-            attention_params.append(param)
-            continue
-
-        if isinstance(module, nn.Linear):
-            decay_params.append(param)
-        else:
-            no_decay_params.append(param)
+    groups = _collect_param_groups(model, include_muon=False)
 
     param_groups = []
-    if decay_params:
-        param_groups.append({"params": decay_params, "weight_decay": weight_decay})
-    if attention_params:
+    if groups["decay"]:
+        param_groups.append({"params": groups["decay"], "weight_decay": weight_decay})
+    if groups["attention"]:
         param_groups.append(
-            {"params": attention_params, "weight_decay": attention_weight_decay}
+            {"params": groups["attention"], "weight_decay": attention_weight_decay}
         )
-    if token_embed_params:
+    if groups["token_embed"]:
         param_groups.append(
             {
-                "params": token_embed_params,
+                "params": groups["token_embed"],
                 "weight_decay": token_embedding_weight_decay,
             }
         )
-    if task_embed_params:
+    if groups["task_embed"]:
         param_groups.append(
             {
-                "params": task_embed_params,
+                "params": groups["task_embed"],
                 "weight_decay": task_embedding_weight_decay,
             }
         )
-    if no_decay_params:
-        param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    if groups["no_decay"]:
+        param_groups.append({"params": groups["no_decay"], "weight_decay": 0.0})
     return param_groups
 
 
@@ -334,82 +352,42 @@ def _build_muon_and_adamw_param_groups(
     task_embedding_weight_decay: float,
 ) -> Tuple[Sequence[Dict[str, Any]], Sequence[Dict[str, Any]]]:
     """Split params for Muon (linear weights only) and AdamW (everything else)."""
-    muon_params = []
-    muon_attention_params = []
-    decay_params = []
-    attention_params = []
-    token_embed_params = []
-    task_embed_params = []
-    no_decay_params = []
-
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-
-        module_name = name.rsplit(".", 1)[0] if "." in name else ""
-        module = model.get_submodule(module_name) if module_name else model
-
-        if _is_muon_candidate(module, name, param):
-            if _is_attention_param(name):
-                muon_attention_params.append(param)
-            else:
-                muon_params.append(param)
-            continue
-
-        if name.endswith(".bias"):
-            no_decay_params.append(param)
-            continue
-
-        if _is_norm_module(module) or _is_positional_embedding_param(name):
-            no_decay_params.append(param)
-            continue
-
-        if isinstance(module, nn.Embedding):
-            if name.startswith("token_embedding."):
-                token_embed_params.append(param)
-            elif name.startswith("example_embedding."):
-                task_embed_params.append(param)
-            else:
-                no_decay_params.append(param)
-            continue
-
-        if _is_attention_param(name):
-            attention_params.append(param)
-            continue
-
-        if isinstance(module, nn.Linear):
-            decay_params.append(param)
-        else:
-            no_decay_params.append(param)
+    groups = _collect_param_groups(model, include_muon=True)
 
     muon_groups = []
-    if muon_params:
-        muon_groups.append({"params": muon_params, "weight_decay": weight_decay})
-    if muon_attention_params:
+    if groups["muon"]:
+        muon_groups.append({"params": groups["muon"], "weight_decay": weight_decay})
+    if groups["muon_attention"]:
         muon_groups.append(
-            {"params": muon_attention_params, "weight_decay": attention_weight_decay}
+            {
+                "params": groups["muon_attention"],
+                "weight_decay": attention_weight_decay,
+            }
         )
 
     adamw_groups = []
-    if decay_params:
-        adamw_groups.append({"params": decay_params, "weight_decay": weight_decay})
-    if attention_params:
+    if groups["decay"]:
+        adamw_groups.append({"params": groups["decay"], "weight_decay": weight_decay})
+    if groups["attention"]:
         adamw_groups.append(
-            {"params": attention_params, "weight_decay": attention_weight_decay}
+            {"params": groups["attention"], "weight_decay": attention_weight_decay}
         )
-    if token_embed_params:
+    if groups["token_embed"]:
         adamw_groups.append(
             {
-                "params": token_embed_params,
+                "params": groups["token_embed"],
                 "weight_decay": token_embedding_weight_decay,
             }
         )
-    if task_embed_params:
+    if groups["task_embed"]:
         adamw_groups.append(
-            {"params": task_embed_params, "weight_decay": task_embedding_weight_decay}
+            {
+                "params": groups["task_embed"],
+                "weight_decay": task_embedding_weight_decay,
+            }
         )
-    if no_decay_params:
-        adamw_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    if groups["no_decay"]:
+        adamw_groups.append({"params": groups["no_decay"], "weight_decay": 0.0})
 
     return muon_groups, adamw_groups
 

@@ -8,10 +8,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 
 import aaivr
-import augment_eval
 from augment import build_augmentor
 import train
-from inference import DEFAULT_MAX_NEW_TOKENS, run_split_inference
+from inference import (
+    DEFAULT_MAX_NEW_TOKENS,
+    run_split_inference,
+    run_split_inference_augmented,
+)
 from tinytransformer import TinyTransformer
 from utils import (
     END_TOKEN_ID,
@@ -298,20 +301,18 @@ def run_evaluation_pipeline(
 
         evaluation: Dict[str, Dict[str, object]] = {}
         for split in splits:
-            split_results, color_maps, dihedral_augmented = (
-                augment_eval.run_split_inference_augmented(
-                    model=model,
-                    dataset=dataset,
-                    split=split,
-                    device=device,
-                    augmentor=augmentor,
-                    batch_size=eval_batch_size,
-                    max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
-                    task_ids=task_ids,
-                    include_targets=include_targets,
-                    temperature=getattr(cfg, "inference_temperature", None),
-                    top_k=getattr(cfg, "inference_top_k", None),
-                )
+            split_results, color_maps, dihedral_augmented = run_split_inference_augmented(
+                model=model,
+                dataset=dataset,
+                split=split,
+                device=device,
+                augmentor=augmentor,
+                batch_size=eval_batch_size,
+                max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+                task_ids=task_ids,
+                include_targets=include_targets,
+                temperature=getattr(cfg, "inference_temperature", None),
+                top_k=getattr(cfg, "inference_top_k", None),
             )
             summary = summarize_split_results(split_results)
             evaluation[split] = {"results": split_results, "summary": summary}
