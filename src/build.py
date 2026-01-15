@@ -9,8 +9,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from augment import build_augmentor
 from common import (
+    build_augmentor,
     ARCExampleDataset,
     MAX_SEQ_LEN,
     create_dataloader,

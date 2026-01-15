@@ -18,16 +18,12 @@ mdlARC is a lightweight (~60M parameter) transformer model designed to solve ARC
 ```
 mdlARC/
 ├── src/                              # Core source code
-│   ├── common.py                     # Shared utilities (vocab, tokenization, dataset, transforms)
+│   ├── common.py                     # Shared utilities (vocab, tokenization, dataset, transforms, augmentation)
 │   ├── build.py                      # Model and data building (build_model_and_data)
-│   ├── train.py                      # Training pipeline (train_model)
-│   ├── evaluate.py                   # Evaluation pipeline (run_evaluation_configs)
+│   ├── train.py                      # Training pipeline (train_model, NorMuon optimizer)
+│   ├── evaluate.py                   # Evaluation pipeline (inference, AAIVR voting, metrics)
 │   ├── utils.py                      # Visualization, scoring, memory cleanup
-│   ├── tinytransformer.py            # Transformer model architecture
-│   ├── inference.py                  # Token generation with KV caching
-│   ├── augment.py                    # Color and dihedral augmentation system
-│   ├── aaivr.py                      # Augmentation inverse voting
-│   └── normuon.py                    # NorMuon optimizer (Muon + AdamW hybrid)
+│   └── tinytransformer.py            # Transformer model architecture
 ├── dataset_building_scripts/
 │   └── build_datasets.py             # Dataset downloader and builder
 ├── assets/                           # Dataset files (after building)
@@ -44,10 +40,10 @@ mdlARC/
 **File Organization:**
 The codebase is organized around 3 main functionalities:
 1. **build.py** - Building model and data (`build_model_and_data`)
-2. **train.py** - Training loop (`train_model`)
-3. **evaluate.py** - Evaluation pipeline (`run_evaluation_configs`)
+2. **train.py** - Training loop (`train_model`) + NorMuon optimizer
+3. **evaluate.py** - Evaluation pipeline (`run_evaluation_configs`) + inference + AAIVR voting
 
-Shared code used by multiple modules lives in **common.py**, while **utils.py** contains standalone utilities (visualization, scoring, memory cleanup).
+Shared code used by multiple modules lives in **common.py** (including augmentation system), while **utils.py** contains standalone utilities (visualization, scoring, memory cleanup).
 
 ---
 
@@ -110,7 +106,7 @@ score = utils.score_arc_submission(SOLUTIONS_FILE, SUBMISSION_FILE)
 
 ### common.py - Shared Utilities
 
-**Purpose:** Central module containing all shared code used by build, train, and evaluate modules.
+**Purpose:** Central module containing all shared code used by build, train, and evaluate modules, including the augmentation system.
 
 **Vocabulary & Constants:**
 
@@ -166,6 +162,31 @@ IGNORE_INDEX = -100
 
 `create_dataloader` - Factory for creating DataLoaders with proper batching
 
+**Augmentation System:**
+
+| Function/Class | Description |
+|----------------|-------------|
+| `build_augmentor(examples, task_input_colors, ...)` | Factory function to create an Augmentor |
+| `Augmentor` | Manages augment selection per example |
+| `Augments` | Dataclass storing augment indices and color maps |
+
+**Color Permutation Strategy:**
+- Permutes colors 1-9 (0 = background is fixed)
+- Uses unranking algorithm for permutation enumeration
+- Filters duplicates via hashing
+- Respects "output-only colors" that don't appear in inputs
+
+**Dihedral Augmentation:**
+- All 8 geometric operations available
+- Configurable application to test examples
+
+**Selection:**
+```python
+augmentor.select_for_example(example, epoch, index)
+# Returns: (color_mapping, dihedral_index)
+```
+Epoch-aware selection ensures different augments per epoch, consistent within epoch.
+
 ---
 
 ### build.py - Model and Data Building
@@ -190,7 +211,7 @@ model, dataset, dataloader, device, data_path = build_model_and_data(cfg)
 
 ### train.py - Training Pipeline
 
-**Purpose:** Orchestrates the full training loop with checkpoint management, optimizer handling, and validation.
+**Purpose:** Orchestrates the full training loop with checkpoint management, optimizer handling, and validation. Includes the NorMuon optimizer implementation.
 
 **Key Functions:**
 
@@ -207,6 +228,26 @@ model, dataset, dataloader, device, data_path = build_model_and_data(cfg)
 - WSD learning rate schedule (warmup, stable, decay)
 - NorMuon + AdamW hybrid optimizer support
 - Comprehensive RNG state management
+
+**NorMuon Optimizer:**
+
+NorMuon combines Muon (for linear weights) + AdamW (for other params).
+
+Key features:
+- Splits params: Muon-eligible (2D linear weights) vs. others (AdamW)
+- Muon: orthogonal updates via Newton-Schulz iteration
+- Per-group learning rates and weight decay
+- SVD-free orthogonalization for efficiency
+
+```python
+optimizer = SingleDeviceNorMuonWithAuxAdam(
+    muon_params=linear_weights,
+    adam_params=other_params,
+    lr=1.66e-3,
+    momentum=0.95,
+    beta2=0.95,
+)
+```
 
 ---
 
@@ -279,9 +320,9 @@ logits = model.forward_generate(tokens, positions_3d, example_id, caches, decode
 
 ### evaluate.py - Evaluation Pipeline
 
-**Purpose:** Run inference across dataset splits, aggregate results, compute metrics.
+**Purpose:** Complete evaluation module including inference generation, AAIVR voting, and metrics aggregation.
 
-**Key Functions:**
+**Key Functions - Evaluation:**
 
 | Function | Description |
 |----------|-------------|
@@ -301,100 +342,35 @@ EVAL_CONFIGS = [
 - Full correctness (exact match)
 - Per-task pass rate (ARC official metric)
 
----
-
-### inference.py - Token Generation
-
-**Purpose:** Autoregressive generation with KV caching for efficient inference.
-
-**Key Functions:**
+**Key Functions - Inference Generation:**
 
 | Function | Description |
 |----------|-------------|
 | `run_split_inference(model, dataset, split, cfg, augmentor)` | Inference on dataset split |
+| `batched_greedy_generate(...)` | Batched token generation with KV caching |
 | `DEFAULT_MAX_NEW_TOKENS = 931` | Maximum tokens to generate |
 
-**Features:**
+**Inference Features:**
 - Compiled grid state tracking (`@torch.compile`)
 - Color permutation + dihedral transforms during inference
 - Temperature and top-k sampling support
 - Batch generation with early stopping
 
----
-
-### augment.py - Augmentation System
-
-**Purpose:** Color permutation and dihedral augmentation with intelligent deduplication.
-
-**Key Exports:**
-
-| Function/Class | Description |
-|----------------|-------------|
-| `build_augmentor(dataset, cfg)` | Factory function |
-| `Augmentor` | Manages augment selection per example |
-| `Augments` | Dataclass storing augment indices and color maps |
-
-**Color Permutation Strategy:**
-- Permutes colors 1-9 (0 = background is fixed)
-- Uses unranking algorithm for permutation enumeration
-- Filters duplicates via hashing
-- Respects "output-only colors" that don't appear in inputs
-
-**Dihedral Augmentation:**
-- All 8 geometric operations available
-- Configurable application to test examples
-
-**Selection:**
-```python
-augmentor.select_for_example(example, epoch, index)
-# Returns: (color_mapping, dihedral_index)
-```
-Epoch-aware selection ensures different augments per epoch, consistent within epoch.
-
----
-
-### aaivr.py - Augmentation Inverse Voting
-
-**Purpose:** Aggregate predictions from augmented variants through voting.
-
-AAIVR = Automated Augmentation Inverse Voting and Ranking
-
-**Key Functions:**
+**Key Functions - AAIVR (Augmentation Inverse Voting):**
 
 | Function | Description |
 |----------|-------------|
 | `run_aaivr_on_results(results, ...)` | Main voting aggregation |
 | `AAIVRSelection` | Dataclass with selected outputs + ranking |
+| `summarize_aaivr_pass_at_k(...)` | Compute Pass@K metrics |
 
-**Process:**
+**AAIVR Process:**
 1. Invert dihedral transforms on predictions
 2. Invert color permutations if mappings provided
 3. Filter to rectangular grids only
 4. Optionally discard input copies
 5. Vote across augmented variants
 6. Select top-2 candidates (Pass@2)
-
----
-
-### normuon.py - Optimizer
-
-**Purpose:** NorMuon optimizer combining Muon (for linear weights) + AdamW (for other params).
-
-**Key Features:**
-- Splits params: Muon-eligible (2D linear weights) vs. others (AdamW)
-- Muon: orthogonal updates via Newton-Schulz iteration
-- Per-group learning rates and weight decay
-- SVD-free orthogonalization for efficiency
-
-```python
-optimizer = SingleDeviceNorMuonWithAuxAdam(
-    muon_params=linear_weights,
-    adam_params=other_params,
-    lr=1.66e-3,
-    momentum=0.95,
-    beta2=0.95,
-)
-```
 
 ---
 
