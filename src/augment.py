@@ -126,7 +126,7 @@ def _mapping_from_permutation(
 
 
 @dataclass
-class SanitizedAugments:
+class Augments:
     color_maps: torch.Tensor
     dihedral_indices: List[int]
     color_map_indices: List[int]
@@ -136,19 +136,19 @@ class SanitizedAugments:
     order_seed: int = 0
 
 
-class SanitizedAugmentor:
+class Augmentor:
     def __init__(
         self,
-        augments_by_key: Dict[Tuple[str, str, int], SanitizedAugments],
+        augments_by_key: Dict[Tuple[str, str, int], Augments],
         *,
         color_apply_to_test_split: bool,
         dihedral_apply_to_test_split: bool,
-        max_sanitized_augments: int = 0,
+        max_augments: int = 0,
     ) -> None:
         self.augments_by_key = augments_by_key
         self.color_apply_to_test_split = bool(color_apply_to_test_split)
         self.dihedral_apply_to_test_split = bool(dihedral_apply_to_test_split)
-        self.max_sanitized_augments = int(max_sanitized_augments)
+        self.max_augments = int(max_augments)
         self._enabled = True
         self._color_enabled = True
         self._dihedral_enabled = True
@@ -175,7 +175,7 @@ class SanitizedAugmentor:
         return color_enabled, dihedral_enabled
 
     def _select_index_for_epoch(
-        self, augments: SanitizedAugments, *, color_enabled: bool, dihedral_enabled: bool
+        self, augments: Augments, *, color_enabled: bool, dihedral_enabled: bool
     ) -> int:
         if not color_enabled and not dihedral_enabled:
             return augments.identity_tuple_index
@@ -213,21 +213,21 @@ class SanitizedAugmentor:
         return mapping, dihedral_idx
 
 
-def build_sanitized_augmentor(
+def build_augmentor(
     dataset: Iterable[SequenceExample],
     task_input_colors: Dict[str, Sequence[int]],
     *,
-    max_sanitized_augments: int,
+    max_augments: int,
     enable_color: bool,
     enable_dihedral: bool,
     seed: int,
     color_apply_to_test_split: bool,
     dihedral_apply_to_test_split: bool,
-) -> SanitizedAugmentor:
+) -> Augmentor:
     rng = random.Random(int(seed))
-    max_sanitized_augments = int(max_sanitized_augments)
-    if max_sanitized_augments <= 0:
-        max_sanitized_augments = 1
+    max_augments = int(max_augments)
+    if max_augments <= 0:
+        max_augments = 1
     max_dihedral = 8 if enable_dihedral else 1
 
     examples_by_task: Dict[str, List[Tuple[str, str, int]]] = {}
@@ -249,7 +249,7 @@ def build_sanitized_augmentor(
         input_colors_by_key[key] = _colors_from_tokens(input_tokens_by_dihedral[0])
         examples_by_task.setdefault(example.task_id, []).append(key)
 
-    augments_by_key: Dict[Tuple[str, str, int], SanitizedAugments] = {}
+    augments_by_key: Dict[Tuple[str, str, int], Augments] = {}
     stats: List[int] = []
 
     for task_id, keys in examples_by_task.items():
@@ -282,7 +282,7 @@ def build_sanitized_augmentor(
                 max_possible = max_color_x * max_dihedral
             else:
                 max_possible = max_dihedral
-            augment_limit = min(max_sanitized_augments, max_possible)
+            augment_limit = min(max_augments, max_possible)
             if augment_limit <= 0:
                 augment_limit = 1
             order_seed = _derive_order_seed(seed, key)
@@ -434,7 +434,7 @@ def build_sanitized_augmentor(
                 idx for idx, d in enumerate(state["dihedral_indices"]) if d == 0
             ]
 
-            augments = SanitizedAugments(
+            augments = Augments(
                 color_maps=color_maps_tensor,
                 dihedral_indices=state["dihedral_indices"],
                 color_map_indices=state["color_map_indices"],
@@ -454,9 +454,9 @@ def build_sanitized_augmentor(
             f"min={min(stats)}, max={max(stats)}"
         )
 
-    return SanitizedAugmentor(
+    return Augmentor(
         augments_by_key,
         color_apply_to_test_split=color_apply_to_test_split,
         dihedral_apply_to_test_split=dihedral_apply_to_test_split,
-        max_sanitized_augments=max_sanitized_augments,
+        max_augments=max_augments,
     )

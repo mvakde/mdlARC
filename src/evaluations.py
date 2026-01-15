@@ -8,10 +8,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 
 import aaivr
-import sanitized_eval
+import augment_eval
+from augment import build_augmentor
 import train
 from inference import DEFAULT_MAX_NEW_TOKENS, run_split_inference
-from sanitized_augment import build_sanitized_augmentor
 from tinytransformer import TinyTransformer
 from utils import (
     END_TOKEN_ID,
@@ -246,9 +246,9 @@ def run_evaluation_pipeline(
 
     cfg.checkpoint_path = Path(checkpoint_path)
     cfg.data_path = dataset_path
-    use_sanitized = bool(getattr(cfg, "enable_sanitized_aug_train", False))
-    if use_sanitized:
-        cfg.max_sanitized_augments = int(max_eval_augments)
+    use_aug = bool(getattr(cfg, "enable_aug", False))
+    if use_aug:
+        cfg.max_augments = int(max_eval_augments)
 
     reuse_dataset = None
     prior_dataset = state.get("dataset")
@@ -274,54 +274,45 @@ def run_evaluation_pipeline(
         with eval_log_path.open("a") as handle:
             handle.write(msg + "\n")
 
-    sanitized_color_mappings_by_split: Dict[str, Dict[str, List[List[int]]]] = {}
-    sanitized_dihedral_by_split: Dict[str, bool] = {}
+    color_mappings_by_split: Dict[str, Dict[str, List[List[int]]]] = {}
+    dihedral_by_split: Dict[str, bool] = {}
 
-    if use_sanitized:
-        max_sanitized_augments = int(
-            getattr(cfg, "max_sanitized_augments", 0) or 0
-        )
-        sanitized_augmentor = getattr(dataset, "sanitized_augmentor", None)
+    if use_aug:
+        max_augments = int(getattr(cfg, "max_augments", 0) or 0)
+        augmentor = getattr(dataset, "augmentor", None)
         if (
-            sanitized_augmentor is None
-            or getattr(sanitized_augmentor, "max_sanitized_augments", None)
-            != max_sanitized_augments
+            augmentor is None
+            or getattr(augmentor, "max_augments", None) != max_augments
         ):
-            enable_color_train = bool(getattr(cfg, "enable_color_aug_train", False))
-            enable_dihedral_train = bool(
-                getattr(cfg, "enable_dihedral_aug_train", False)
-            )
-            color_apply_to_test = bool(
-                getattr(cfg, "enable_color_on_aug_test_split_during_training", False)
-            )
-            dihedral_apply_to_test = bool(
-                getattr(cfg, "enable_dihedral_on_aug_test_split_during_training", False)
-            )
-            seed = getattr(cfg, "sanitized_aug_seed", None)
-            if seed is None:
-                seed = getattr(cfg, "color_aug_seed", None)
+            enable_color = bool(getattr(cfg, "enable_color_aug", False))
+            enable_dihedral = bool(getattr(cfg, "enable_dihedral_aug", False))
+            color_apply_to_test = bool(getattr(cfg, "color_apply_to_test", False))
+            dihedral_apply_to_test = bool(getattr(cfg, "dihedral_apply_to_test", False))
+            seed = getattr(cfg, "aug_seed", None)
             if seed is None:
                 seed = getattr(cfg, "seed", 42)
-            sanitized_augmentor = build_sanitized_augmentor(
+
+            augmentor = build_augmentor(
                 dataset.examples,
                 dataset.task_input_colors,
-                max_sanitized_augments=max_sanitized_augments,
-                enable_color=enable_color_train,
-                enable_dihedral=enable_dihedral_train,
+                max_augments=max_augments,
+                enable_color=enable_color,
+                enable_dihedral=enable_dihedral,
                 seed=int(seed),
                 color_apply_to_test_split=color_apply_to_test,
                 dihedral_apply_to_test_split=dihedral_apply_to_test,
             )
-            dataset.sanitized_augmentor = sanitized_augmentor
+            dataset.augmentor = augmentor
+
         evaluation: Dict[str, Dict[str, object]] = {}
         for split in splits:
             split_results, color_maps, dihedral_augmented = (
-                sanitized_eval.run_split_inference_sanitized(
+                augment_eval.run_split_inference_augmented(
                     model=model,
                     dataset=dataset,
                     split=split,
                     device=device,
-                    augmentor=sanitized_augmentor,
+                    augmentor=augmentor,
                     batch_size=eval_batch_size,
                     max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
                     task_ids=task_ids,
@@ -333,11 +324,11 @@ def run_evaluation_pipeline(
             )
             summary = summarize_split_results(split_results)
             evaluation[split] = {"results": split_results, "summary": summary}
-            sanitized_color_mappings_by_split[split] = color_maps
-            sanitized_dihedral_by_split[split] = dihedral_augmented
-        evaluation["_sanitized"] = {
-            "color_mappings_by_split": sanitized_color_mappings_by_split,
-            "dihedral_augmented_by_split": sanitized_dihedral_by_split,
+            color_mappings_by_split[split] = color_maps
+            dihedral_by_split[split] = dihedral_augmented
+        evaluation["_aug"] = {
+            "color_mappings_by_split": color_mappings_by_split,
+            "dihedral_augmented_by_split": dihedral_by_split,
         }
     else:
         evaluation = evaluate_model_on_dataset(

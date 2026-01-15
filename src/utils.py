@@ -1108,3 +1108,33 @@ def create_dataloader(
         num_workers=num_workers,
         collate_fn=collate_fn,
     )
+
+_DIHEDRAL_INVERSES = {
+    "identity": "identity",
+    "rot90": "rot270",
+    "rot180": "rot180",
+    "rot270": "rot90",
+    "flip_horizontal": "flip_horizontal",
+    "flip_vertical": "flip_vertical",
+    "flip_main_diagonal": "flip_main_diagonal",
+    "flip_anti_diagonal": "flip_anti_diagonal",
+}
+
+def apply_inverse_dihedral_transform(
+    grid: Sequence[Sequence[int]], transform_index: int
+) -> List[List[int]]:
+    """Undo a dihedral transform using the known augmentation index (mod 8)."""
+    if transform_index < 0:
+        raise ValueError("transform_index must be non-negative.")
+    transform_name = _DIHEDRAL_TRANSFORM_NAMES[transform_index % 8]
+    inverse_name = _DIHEDRAL_INVERSES[transform_name]
+    return _DIHEDRAL_TRANSFORMS[inverse_name](grid)
+
+def is_rectangular_grid(grid: Sequence[Sequence[int]]) -> bool:
+    """Return True if all rows have the same non-zero length."""
+    if not grid:
+        return False
+    first_row_len = len(grid[0])
+    if first_row_len == 0:
+        return False
+    return all(len(row) == first_row_len for row in grid)

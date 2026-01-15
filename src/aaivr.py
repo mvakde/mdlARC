@@ -11,101 +11,10 @@ from utils import (
     apply_color_permutation_to_grid,
     plot_grids,
     split_grids_from_tokens,
+    apply_inverse_dihedral_transform, # Imported from utils now
+    is_rectangular_grid,              # Imported from utils now
+    _DIHEDRAL_TRANSFORM_NAMES,        # Imported for visualization labels
 )
-
-_DIHEDRAL_TRANSFORM_NAMES = [
-    "identity",
-    "rot90",
-    "rot180",
-    "rot270",
-    "flip_horizontal",
-    "flip_vertical",
-    "flip_main_diagonal",
-    "flip_anti_diagonal",
-]
-
-
-def _dihedral_copy(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    return [list(row) for row in grid]
-
-
-def _dihedral_rot90(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    if not grid:
-        return []
-    return [list(row) for row in zip(*grid[::-1])]
-
-
-def _dihedral_rot180(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    return [list(reversed(row)) for row in reversed(grid)]
-
-
-def _dihedral_rot270(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    if not grid:
-        return []
-    return [list(row) for row in zip(*grid)][::-1]
-
-
-def _dihedral_flip_horizontal(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    return [list(reversed(row)) for row in grid]
-
-
-def _dihedral_flip_vertical(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    return [list(row) for row in reversed(grid)]
-
-
-def _dihedral_flip_main_diagonal(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    if not grid:
-        return []
-    return [list(row) for row in zip(*grid)]
-
-
-def _dihedral_flip_anti_diagonal(grid: Sequence[Sequence[int]]) -> List[List[int]]:
-    return _dihedral_flip_vertical(_dihedral_rot90(grid))
-
-
-_DIHEDRAL_TRANSFORMS = {
-    "identity": _dihedral_copy,
-    "rot90": _dihedral_rot90,
-    "rot180": _dihedral_rot180,
-    "rot270": _dihedral_rot270,
-    "flip_horizontal": _dihedral_flip_horizontal,
-    "flip_vertical": _dihedral_flip_vertical,
-    "flip_main_diagonal": _dihedral_flip_main_diagonal,
-    "flip_anti_diagonal": _dihedral_flip_anti_diagonal,
-}
-
-_DIHEDRAL_INVERSES = {
-    "identity": "identity",
-    "rot90": "rot270",
-    "rot180": "rot180",
-    "rot270": "rot90",
-    "flip_horizontal": "flip_horizontal",
-    "flip_vertical": "flip_vertical",
-    "flip_main_diagonal": "flip_main_diagonal",
-    "flip_anti_diagonal": "flip_anti_diagonal",
-}
-
-
-def is_rectangular_grid(grid: Sequence[Sequence[int]]) -> bool:
-    """Return True if all rows have the same non-zero length."""
-    if not grid:
-        return False
-    first_row_len = len(grid[0])
-    if first_row_len == 0:
-        return False
-    return all(len(row) == first_row_len for row in grid)
-
-
-def apply_inverse_dihedral_transform(
-    grid: Sequence[Sequence[int]], transform_index: int
-) -> List[List[int]]:
-    """Undo a dihedral transform using the known augmentation index (mod 8)."""
-    if transform_index < 0:
-        raise ValueError("transform_index must be non-negative.")
-    transform_name = _DIHEDRAL_TRANSFORM_NAMES[transform_index % 8]
-    inverse_name = _DIHEDRAL_INVERSES[transform_name]
-    return _DIHEDRAL_TRANSFORMS[inverse_name](grid)
-
 
 def _grid_to_tuple(grid: Sequence[Sequence[int]]) -> Tuple[Tuple[int, ...], ...]:
     return tuple(tuple(int(val) for val in row) for row in grid)

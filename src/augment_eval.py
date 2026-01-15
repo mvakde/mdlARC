@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 
 import inference
-from sanitized_augment import SanitizedAugmentor, SanitizedAugments
+from augment import Augmentor, Augments
 from tinytransformer import TinyTransformer
 from utils import VOCAB_SIZE, tokens_to_string
 
@@ -14,20 +14,20 @@ def _identity_mapping() -> List[int]:
     return list(range(VOCAB_SIZE))
 
 
-def _split_allows_color(augmentor: SanitizedAugmentor, split: str) -> bool:
+def _split_allows_color(augmentor: Augmentor, split: str) -> bool:
     if split == "test":
         return bool(augmentor.color_apply_to_test_split)
     return True
 
 
-def _split_allows_dihedral(augmentor: SanitizedAugmentor, split: str) -> bool:
+def _split_allows_dihedral(augmentor: Augmentor, split: str) -> bool:
     if split == "test":
         return bool(augmentor.dihedral_apply_to_test_split)
     return True
 
 
 def _allowed_tuple_indices(
-    augments: SanitizedAugments, *, allow_color: bool, allow_dihedral: bool
+    augments: Augments, *, allow_color: bool, allow_dihedral: bool
 ) -> List[int]:
     indices: List[int] = []
     for idx, (d_idx, c_idx) in enumerate(
@@ -45,7 +45,7 @@ def _allowed_tuple_indices(
 
 def _build_color_mappings_by_task(
     examples: Sequence[object],
-    augmentor: SanitizedAugmentor,
+    augmentor: Augmentor,
     split: str,
 ) -> Tuple[Dict[str, List[List[int]]], Dict[str, Dict[Tuple[int, ...], int]]]:
     mappings_by_task: Dict[str, List[List[int]]] = {}
@@ -87,13 +87,13 @@ def _build_color_mappings_by_task(
 
 
 @torch.inference_mode()
-def run_split_inference_sanitized(
+def run_split_inference_augmented(
     model: TinyTransformer,
     dataset,
     split: str,
     device: torch.device,
     *,
-    augmentor: SanitizedAugmentor,
+    augmentor: Augmentor,
     batch_size: int = 16,
     max_new_tokens: int = inference.DEFAULT_MAX_NEW_TOKENS,
     task_ids: Optional[Sequence[str]] = None,
