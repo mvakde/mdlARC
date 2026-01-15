@@ -874,7 +874,7 @@ def build_model_and_data(
             max_augments=max_augments,
             enable_color=bool(getattr(args, "enable_color_aug", False)),
             enable_dihedral=bool(getattr(args, "enable_dihedral_aug", False)),
-            seed=int(getattr(args, "aug_seed", args.seed) or args.seed),
+            seed=args.seed,
             color_apply_to_test_split=bool(getattr(args, "color_apply_to_test", False)),
             dihedral_apply_to_test_split=bool(getattr(args, "dihedral_apply_to_test", False)),
         )

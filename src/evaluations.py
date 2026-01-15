@@ -285,9 +285,6 @@ def run_evaluation_pipeline(
             enable_dihedral = bool(getattr(cfg, "enable_dihedral_aug", False))
             color_apply_to_test = bool(getattr(cfg, "color_apply_to_test", False))
             dihedral_apply_to_test = bool(getattr(cfg, "dihedral_apply_to_test", False))
-            seed = getattr(cfg, "aug_seed", None)
-            if seed is None:
-                seed = getattr(cfg, "seed", 42)
 
             augmentor = build_augmentor(
                 dataset.examples,
@@ -295,7 +292,7 @@ def run_evaluation_pipeline(
                 max_augments=max_augments,
                 enable_color=enable_color,
                 enable_dihedral=enable_dihedral,
-                seed=int(seed),
+                seed=int(cfg.seed),
                 color_apply_to_test_split=color_apply_to_test,
                 dihedral_apply_to_test_split=dihedral_apply_to_test,
             )
