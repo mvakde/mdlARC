@@ -284,18 +284,15 @@ def _sequence_length_for_example(example: object, transform_index: Optional[int]
 
 def _prepare_examples_for_inference(
     examples: Sequence[object],
-    include_targets: bool = False,
-    solutions: Optional[Dict[Tuple[str, int], List[List[int]]]] = None,
     color_mappings: Optional[Sequence[Optional[Sequence[int]]]] = None,
     color_apply_fn: Optional[Callable[[str], bool]] = None,
     dihedral_transform_indices: Optional[Sequence[Optional[int]]] = None,
     pair_indices: Optional[Sequence[int]] = None,
-) -> Tuple[List[List[int]], List[int], List[Dict[str, object]], List[Optional[torch.Tensor]], List[List[int]]]:
+) -> Tuple[List[List[int]], List[int], List[Dict[str, object]], List[Optional[torch.Tensor]]]:
     prompts: List[List[int]] = []
     example_ids: List[int] = []
     metadata: List[Dict[str, object]] = []
     cached_positions: List[Optional[torch.Tensor]] = []
-    target_tokens: List[List[int]] = []
 
     for idx, ex in enumerate(examples):
         if not hasattr(ex, "tokens"):
@@ -314,19 +311,6 @@ def _prepare_examples_for_inference(
         else:
             cached_positions.append(None)
 
-        targets: List[int] = []
-        if include_targets and getattr(ex, "has_output", False):
-            targets = extract_output_tokens(tokens)
-        elif include_targets and solutions is not None:
-            key = (getattr(ex, "task_id", None), getattr(ex, "pair_index", None))
-            if key in solutions and solutions[key] is not None:
-                target_grid = solutions[key]
-                if transform_index is not None:
-                    target_grid = apply_dihedral_transform(target_grid, transform_index)
-                if should_color:
-                    target_grid = apply_color_permutation_to_grid(target_grid, mapping)
-                targets = grid_to_tokens(target_grid)
-        target_tokens.append(targets)
         pair_index = pair_indices[idx] if pair_indices is not None else getattr(ex, "pair_index", None)
         metadata.append({
             "task_id": getattr(ex, "task_id", None),
@@ -335,20 +319,18 @@ def _prepare_examples_for_inference(
             "split": getattr(ex, "split", None),
         })
 
-    return prompts, example_ids, metadata, cached_positions, target_tokens
+    return prompts, example_ids, metadata, cached_positions
 
 
 def _build_generation_results(
     sequences: Sequence[Sequence[int]],
     metadata: Sequence[Dict[str, object]],
     prompts: Sequence[Sequence[int]],
-    target_output_tokens: Sequence[Sequence[int]],
 ) -> List[Dict[str, object]]:
     results: List[Dict[str, object]] = []
-    for seq, meta, prompt, target in zip(sequences, metadata, prompts, target_output_tokens):
+    for seq, meta, prompt in zip(sequences, metadata, prompts):
         output_tokens = extract_output_tokens(seq)
         predicted_grid = tokens_to_grid(output_tokens)
-        target_grid = tokens_to_grid(target) if target else []
         result = {
             "task_id": meta.get("task_id"),
             "pair_index": meta.get("pair_index"),
@@ -358,8 +340,6 @@ def _build_generation_results(
             "sequence": list(seq),
             "output_tokens": output_tokens,
             "output_grid": predicted_grid,
-            "target_output_tokens": list(target),
-            "target_grid": target_grid,
         }
         results.append(result)
     return results
@@ -375,52 +355,23 @@ def _run_generation_batch(
     max_new_tokens: int,
     temperature: Optional[float] = None,
     top_k: Optional[int] = None,
-    target_output_tokens: Optional[Sequence[Sequence[int]]] = None,
 ) -> List[Dict[str, object]]:
     sequences = batched_greedy_generate(
         model=model, prompts=prompts, example_ids=example_ids, device=device,
         max_new_tokens=max_new_tokens, cached_positions=cached_positions,
         temperature=temperature, top_k=top_k,
     )
-    return _build_generation_results(
-        sequences=sequences, metadata=metadata, prompts=prompts,
-        target_output_tokens=target_output_tokens if target_output_tokens is not None else [[] for _ in prompts],
-    )
-
-
-def _load_solutions_for_dataset(dataset) -> Dict[Tuple[str, int], List[List[int]]]:
-    solutions_map: Dict[Tuple[str, int], List[List[int]]] = {}
-    source_path = getattr(dataset, "source_path", None)
-    if source_path is None:
-        return solutions_map
-    solutions_path = Path(source_path).with_name("solutions.json")
-    if not solutions_path.exists():
-        return solutions_map
-    try:
-        data = json.loads(solutions_path.read_text())
-        for task_id, outputs in data.items():
-            if not isinstance(outputs, list):
-                continue
-            for idx, grid in enumerate(outputs):
-                if grid is not None:
-                    solutions_map[(task_id, idx)] = grid
-    except Exception:
-        return solutions_map
-    return solutions_map
+    return _build_generation_results(sequences=sequences, metadata=metadata, prompts=prompts)
 
 
 def _gather_examples_for_split(
     dataset, split: str, task_ids: Optional[Sequence[str]] = None, pair_index: Optional[int] = None,
-    require_outputs: bool = False, solutions: Optional[Dict[Tuple[str, int], List[List[int]]]] = None,
 ):
     examples = []
     for example in dataset.iter_examples(split=split):
         if task_ids is not None and example.task_id not in task_ids:
             continue
         if pair_index is not None and example.pair_index != pair_index:
-            continue
-        has_solution = solutions is not None and ((example.task_id, example.pair_index) in solutions)
-        if require_outputs and not example.has_output and not has_solution:
             continue
         examples.append(example)
     return examples
@@ -498,13 +449,11 @@ def run_split_inference(
     model: TinyTransformer, dataset, split: str, device: torch.device,
     batch_size: int = 16, max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     task_ids: Optional[Sequence[str]] = None, pair_index: Optional[int] = None,
-    include_targets: bool = True, temperature: Optional[float] = None, top_k: Optional[int] = None,
+    temperature: Optional[float] = None, top_k: Optional[int] = None,
     augmentor: Optional[Augmentor] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, List[List[int]]], bool]:
-    solutions = _load_solutions_for_dataset(dataset) if include_targets else None
     examples = _gather_examples_for_split(
         dataset, split=split, task_ids=task_ids, pair_index=pair_index,
-        require_outputs=include_targets, solutions=solutions,
     )
     if not examples:
         return [], {}, False
@@ -561,12 +510,10 @@ def run_split_inference(
                 batch_pair_indices.append(base_pair_index)
 
         if augmentor is None:
-            prompts, example_ids, metadata, cached_positions, target_output_tokens = _prepare_examples_for_inference(
-                batch_examples, include_targets=include_targets, solutions=solutions,
-            )
+            prompts, example_ids, metadata, cached_positions = _prepare_examples_for_inference(batch_examples)
         else:
-            prompts, example_ids, metadata, cached_positions, target_output_tokens = _prepare_examples_for_inference(
-                batch_examples, include_targets=include_targets, solutions=solutions,
+            prompts, example_ids, metadata, cached_positions = _prepare_examples_for_inference(
+                batch_examples,
                 color_mappings=batch_mappings, color_apply_fn=None,
                 dihedral_transform_indices=batch_transform_indices, pair_indices=batch_pair_indices,
             )
@@ -575,7 +522,6 @@ def run_split_inference(
             model=model, prompts=prompts, example_ids=example_ids, metadata=metadata,
             cached_positions=cached_positions, device=device, max_new_tokens=max_new_tokens,
             temperature=temperature, top_k=top_k,
-            target_output_tokens=target_output_tokens if include_targets else None,
         )
 
         print(f"[{split}] Finished batch {start // batch_size + 1} / {(len(work_items) + batch_size - 1) // batch_size}")
@@ -613,8 +559,6 @@ class AAIVRSelection:
     num_valid: int
     discarded_non_rectangular: int
     discarded_input_copies: int
-    target_grid: Optional[List[List[int]]] = None
-    pass_at_k: Optional[bool] = None
 
 
 def run_aaivr_on_results(
@@ -661,21 +605,9 @@ def run_aaivr_on_results(
 
         key = (task_id, base_pair_index)
         if key not in case_map:
-            case_map[key] = {"counts": {}, "generated": 0, "valid": 0, "dropped_rect": 0, "dropped_input": 0, "target_grid": None}
+            case_map[key] = {"counts": {}, "generated": 0, "valid": 0, "dropped_rect": 0, "dropped_input": 0}
         stats = case_map[key]
         stats["generated"] += 1
-
-        target_grid = res.get("target_grid", [])
-        if stats["target_grid"] is None and is_rectangular_grid(target_grid):
-            try:
-                norm_target = apply_inverse_dihedral_transform(target_grid, transform_index)
-                inv_list = inverse_color_mappings_by_task.get(task_id, [])
-                if inv_list and color_idx > 0 and color_idx < len(inv_list):
-                    norm_target = apply_color_permutation_to_grid(norm_target, inv_list[color_idx])
-                if is_rectangular_grid(norm_target):
-                    stats["target_grid"] = norm_target
-            except Exception:
-                pass
 
         if not is_rectangular_grid(predicted_grid):
             stats["dropped_rect"] += 1
@@ -711,120 +643,22 @@ def run_aaivr_on_results(
         ranked_candidates = [{"grid": _tuple_to_grid(grid_key), "count": count} for grid_key, count in items]
         selected_outputs = [entry["grid"] for entry in ranked_candidates[:top_k]]
 
-        target_grid = stats.get("target_grid")
-        pass_at_k = None
-        if target_grid is not None:
-            pass_at_k = any(grid == target_grid for grid in selected_outputs)
-
         selections.append(AAIVRSelection(
             task_id=task_id, original_pair_index=base_idx, selected_outputs=selected_outputs,
             ranked_candidates=ranked_candidates, num_generated=stats["generated"], num_valid=stats["valid"],
             discarded_non_rectangular=stats["dropped_rect"], discarded_input_copies=stats["dropped_input"],
-            target_grid=target_grid, pass_at_k=pass_at_k,
         ))
 
     return selections
-
-
-def summarize_aaivr_pass_at_k(selections: Sequence[AAIVRSelection]) -> Dict[str, int]:
-    """Return counts for how many tasks have ALL their pairs in top-k."""
-    tasks: Dict[str, List[AAIVRSelection]] = {}
-    for sel in selections:
-        tasks.setdefault(sel.task_id, []).append(sel)
-
-    total_tasks = len(tasks)
-    solved_tasks = 0
-    failures = []
-
-    for task_id, pairs in tasks.items():
-        is_solved = True
-        pair_failures = []
-        for p in pairs:
-            if p.pass_at_k is None:
-                is_solved = False
-                pair_failures.append(f"Pair {p.original_pair_index}: Target missing/unknown")
-            elif not p.pass_at_k:
-                is_solved = False
-                if p.num_valid == 0:
-                    reason = f"No valid candidates generated (tried {p.num_generated})"
-                else:
-                    reason = "Top-k candidates incorrect"
-                pair_failures.append(f"Pair {p.original_pair_index}: {reason}")
-
-        if is_solved and len(pairs) > 0:
-            solved_tasks += 1
-        else:
-            failures.append(f"Task {task_id}: {', '.join(pair_failures)}")
-
-    if failures:
-        print(f"\nAAIVR Failures ({len(failures)}/{total_tasks} tasks):")
-        for f in failures:
-            print(f"  - {f}")
-
-    return {"evaluated": total_tasks, "hits": solved_tasks}
 
 
 # =============================================================================
 # Evaluation Pipeline
 # =============================================================================
 
-def _has_correct_shape(sequence: Sequence[int], predicted_tokens: Sequence[int], target_tokens: Sequence[int]) -> bool:
-    if not target_tokens:
-        return False
-    if len(predicted_tokens) != len(target_tokens):
-        return False
-    target_newlines = [idx for idx, tok in enumerate(target_tokens) if tok == NEXT_LINE_TOKEN_ID]
-    predicted_newlines = [idx for idx, tok in enumerate(predicted_tokens) if tok == NEXT_LINE_TOKEN_ID]
-    if target_newlines != predicted_newlines:
-        return False
-    try:
-        sep_idx = sequence.index(IO_SEPARATOR_TOKEN_ID)
-        end_idx = sequence.index(END_TOKEN_ID, sep_idx + 1)
-    except ValueError:
-        return False
-    return (end_idx - (sep_idx + 1)) == len(target_tokens)
-
-
-def _pixel_accuracy(predicted_tokens: Sequence[int], target_tokens: Sequence[int]) -> Optional[float]:
-    predicted_digits = [tok for tok in predicted_tokens if 0 <= tok <= 9]
-    target_digits = [tok for tok in target_tokens if 0 <= tok <= 9]
-    if not target_digits or len(predicted_digits) != len(target_digits):
-        return None
-    correct = sum(1 for p, t in zip(predicted_digits, target_digits) if p == t)
-    return correct / len(target_digits)
-
-
 def summarize_split_results(results: Sequence[Dict[str, object]]) -> Dict[str, object]:
-    num_shape_correct = 0
-    num_fully_correct = 0
-    accuracies: List[float] = []
-    fully_correct_results: List[Dict[str, object]] = []
-
-    for res in results:
-        predicted_tokens = res.get("output_tokens", [])
-        target_tokens = res.get("target_output_tokens", [])
-        sequence = res.get("sequence", [])
-        shape_ok = _has_correct_shape(sequence, predicted_tokens, target_tokens)
-        res["shape_correct"] = shape_ok
-        if not shape_ok:
-            continue
-        num_shape_correct += 1
-        acc = _pixel_accuracy(predicted_tokens, target_tokens)
-        if acc is not None:
-            res["pixel_accuracy"] = acc
-            accuracies.append(acc)
-        if predicted_tokens == target_tokens:
-            num_fully_correct += 1
-            fully_correct_results.append(res)
-
-    avg_pixel_accuracy = sum(accuracies) / len(accuracies) if accuracies else 0.0
-    return {
-        "total_sequences": len(results),
-        "num_shape_correct": num_shape_correct,
-        "avg_pixel_accuracy": avg_pixel_accuracy,
-        "num_fully_correct": num_fully_correct,
-        "fully_correct_results": fully_correct_results,
-    }
+    """Return basic statistics about generated results."""
+    return {"total_sequences": len(results)}
 
 
 class TeeLogger:
@@ -866,209 +700,157 @@ def _build_submission_from_aaivr(selections: Sequence[AAIVRSelection]) -> Dict[s
     return submission_data
 
 
-def _compute_arc_style_score(selections: Sequence[AAIVRSelection]) -> Tuple[float, int, float]:
-    tasks_map: Dict[str, List[AAIVRSelection]] = {}
-    for res in selections:
-        tasks_map.setdefault(res.task_id, []).append(res)
-
-    arc_score = 0.0
-    total_tasks = len(tasks_map)
-    for pairs in tasks_map.values():
-        n_pairs = len(pairs)
-        if n_pairs > 0:
-            n_solved = sum(1 for p in pairs if p.pass_at_k)
-            arc_score += n_solved / n_pairs
-
-    max_score = total_tasks
-    pct = (arc_score / max_score * 100) if max_score > 0 else 0.0
-    return arc_score, max_score, pct
-
-
-def run_evaluation_configs(
+def run_evaluation(
     cfg: argparse.Namespace,
-    eval_configs: Sequence[Tuple[str, int, Path]],
     *,
-    eval_batch_size: int = 1300,
+    run_name: str,
+    max_augments: int,
+    data_path: Path,
+    checkpoint_path: Path,
+    batch_size: int = 1300,
     splits: Sequence[str] = ("test",),
-    checkpoint_path: Optional[Path] = None,
-    include_targets: bool = False,
     task_ids: Optional[Sequence[str]] = None,
-    log_correct_grids: bool = False,
     timing_path: Path = Path("runs/timing.txt"),
-) -> List[Tuple[str, Dict[str, Dict[str, object]], Path]]:
+) -> Tuple[str, Dict[str, Dict[str, object]], Path]:
+    """Run evaluation on a single configuration, generating submission.json.
+
+    Args:
+        cfg: Training config namespace (used for augmentation settings).
+        run_name: Name for this evaluation run (creates runs/<run_name>/ directory).
+        max_augments: Number of augmented variants per example for test-time augmentation (TTA).
+            Higher values = more diverse predictions for AAIVR voting, but slower inference.
+        data_path: Path to challenges.json file.
+        checkpoint_path: Path to model checkpoint (.pt file).
+        batch_size: Batch size for inference.
+        splits: Dataset splits to evaluate (default: ["test"]).
+        task_ids: Optional list of specific task IDs to evaluate (None = all tasks).
+        timing_path: Path to write timing information.
+
+    Returns:
+        Tuple of (run_name, evaluation_results, submission_path).
+    """
     timing_path = Path(timing_path)
     timing_path.parent.mkdir(parents=True, exist_ok=True)
-    state: Dict[str, object] = {}
-    results: List[Tuple[str, Dict[str, Dict[str, object]], Path]] = []
 
+    checkpoint_path = Path(checkpoint_path)
+    data_path = Path(data_path)
+    t_start = perf_counter()
+
+    print(f"\n{'=' * 60}")
+    mode_label = "Augmented" if getattr(cfg, "enable_aug", False) else "No-aug"
+    print(f"STARTING EVALUATION: {run_name} ({mode_label} augs: {max_augments})")
+    print(f"{'=' * 60}\n")
+
+    base_run_dir = Path("runs") / run_name
+    base_run_dir.mkdir(parents=True, exist_ok=True)
+    eval_log_path = base_run_dir / "eval_log.txt"
+    aaivr_log_path = base_run_dir / "aaivr.txt"
+    submission_path = base_run_dir / "submission.json"
+
+    # Temporarily override cfg values for this evaluation
     prev_checkpoint = getattr(cfg, "checkpoint_path", None)
     prev_data_path = getattr(cfg, "data_path", None)
-    prev_aug = cfg.max_augments
+    prev_aug = getattr(cfg, "max_augments", 0)
 
-    resolved_checkpoint_path = checkpoint_path
-    if resolved_checkpoint_path is None:
-        resolved_checkpoint_path = getattr(cfg, "checkpoint_path", None)
-    if resolved_checkpoint_path is None:
-        raise ValueError("checkpoint_path must be provided for evaluation.")
+    cfg.checkpoint_path = checkpoint_path
+    cfg.data_path = data_path
+    use_aug = bool(getattr(cfg, "enable_aug", False))
+    if use_aug:
+        cfg.max_augments = int(max_augments)
 
-    for config in eval_configs:
-        if len(config) != 3:
-            raise ValueError("eval_configs entries must be (name, aug_count, data_path).")
-        run_name, max_eval_augments, dataset_path = config
-        dataset_path = Path(dataset_path)
-        t_start = perf_counter()
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-        print(f"\n{'=' * 60}")
-        mode_label = "Augmented" if getattr(cfg, "enable_aug", False) else "No-aug"
-        print(f"STARTING PIPELINE: {run_name} ({mode_label} augs: {max_eval_augments})")
-        print(f"{'=' * 60}\n")
+    print("Building model and dataloader...")
+    model, dataset, _, device, _ = build_model_and_data(cfg, checkpoint=checkpoint)
 
-        base_run_dir = Path("runs") / run_name
-        base_run_dir.mkdir(parents=True, exist_ok=True)
-        eval_log_path = base_run_dir / "eval_log.txt"
-        aaivr_log_path = base_run_dir / "aaivr.txt"
-        submission_path = base_run_dir / "submission.json"
+    def log_eval(msg: str) -> None:
+        print(msg)
+        with eval_log_path.open("a") as handle:
+            handle.write(msg + "\n")
 
-        cfg.checkpoint_path = Path(resolved_checkpoint_path)
-        cfg.data_path = dataset_path
-        use_aug = bool(getattr(cfg, "enable_aug", False))
-        if use_aug:
-            cfg.max_augments = int(max_eval_augments)
+    color_mappings_by_split: Dict[str, Dict[str, List[List[int]]]] = {}
+    dihedral_by_split: Dict[str, bool] = {}
 
-        reuse_dataset = None
-        prior_dataset = state.get("dataset")
-        if prior_dataset is not None:
-            prior_path = getattr(prior_dataset, "source_path", None)
-            if prior_path is not None and Path(prior_path) == dataset_path:
-                reuse_dataset = prior_dataset
+    if use_aug:
+        augmentor = getattr(dataset, "augmentor", None)
+        if augmentor is None or getattr(augmentor, "max_augments", None) != max_augments:
+            enable_color = bool(getattr(cfg, "enable_color_aug", False))
+            enable_dihedral = bool(getattr(cfg, "enable_dihedral_aug", False))
+            color_apply_to_test = bool(getattr(cfg, "color_apply_to_test", False))
+            dihedral_apply_to_test = bool(getattr(cfg, "dihedral_apply_to_test", False))
 
-        checkpoint = state.get("checkpoint")
-        if checkpoint is None or state.get("checkpoint_path") != str(resolved_checkpoint_path):
-            checkpoint = torch.load(cfg.checkpoint_path, map_location="cpu", weights_only=False)
-            state["checkpoint"] = checkpoint
-            state["checkpoint_path"] = str(resolved_checkpoint_path)
+            augmentor = build_augmentor(
+                dataset.examples, dataset.task_input_colors, max_augments=max_augments,
+                enable_color=enable_color, enable_dihedral=enable_dihedral, seed=int(cfg.seed),
+                color_apply_to_test_split=color_apply_to_test, dihedral_apply_to_test_split=dihedral_apply_to_test,
+            )
+            dataset.augmentor = augmentor
 
-        print("Building model and dataloader for config...")
-        model, dataset, _, device, _ = build_model_and_data(cfg, checkpoint=checkpoint, reuse_dataset=reuse_dataset)
-        state["dataset"] = dataset
-
-        def log_eval(msg: str) -> None:
-            print(msg)
-            with eval_log_path.open("a") as handle:
-                handle.write(msg + "\n")
-
-        color_mappings_by_split: Dict[str, Dict[str, List[List[int]]]] = {}
-        dihedral_by_split: Dict[str, bool] = {}
-
-        if use_aug:
-            max_augments = int(getattr(cfg, "max_augments", 0) or 0)
-            augmentor = getattr(dataset, "augmentor", None)
-            if augmentor is None or getattr(augmentor, "max_augments", None) != max_augments:
-                enable_color = bool(getattr(cfg, "enable_color_aug", False))
-                enable_dihedral = bool(getattr(cfg, "enable_dihedral_aug", False))
-                color_apply_to_test = bool(getattr(cfg, "color_apply_to_test", False))
-                dihedral_apply_to_test = bool(getattr(cfg, "dihedral_apply_to_test", False))
-
-                augmentor = build_augmentor(
-                    dataset.examples, dataset.task_input_colors, max_augments=max_augments,
-                    enable_color=enable_color, enable_dihedral=enable_dihedral, seed=int(cfg.seed),
-                    color_apply_to_test_split=color_apply_to_test, dihedral_apply_to_test_split=dihedral_apply_to_test,
-                )
-                dataset.augmentor = augmentor
-
-            evaluation: Dict[str, Dict[str, object]] = {}
-            for split in splits:
-                split_results, color_maps, dihedral_augmented = run_split_inference(
-                    model=model, dataset=dataset, split=split, device=device, augmentor=augmentor,
-                    batch_size=eval_batch_size, max_new_tokens=DEFAULT_MAX_NEW_TOKENS, task_ids=task_ids,
-                    include_targets=include_targets, temperature=getattr(cfg, "inference_temperature", None),
-                    top_k=getattr(cfg, "inference_top_k", None),
-                )
-                summary = summarize_split_results(split_results)
-                evaluation[split] = {"results": split_results, "summary": summary}
-                color_mappings_by_split[split] = color_maps
-                dihedral_by_split[split] = dihedral_augmented
-            evaluation["_aug"] = {"color_mappings_by_split": color_mappings_by_split, "dihedral_augmented_by_split": dihedral_by_split}
-        else:
-            evaluation: Dict[str, Dict[str, object]] = {}
-            for split in splits:
-                split_results, _, _ = run_split_inference(
-                    model=model, dataset=dataset, split=split, device=device, batch_size=eval_batch_size,
-                    max_new_tokens=DEFAULT_MAX_NEW_TOKENS, task_ids=task_ids, include_targets=include_targets,
-                    temperature=getattr(cfg, "inference_temperature", None), top_k=getattr(cfg, "inference_top_k", None),
-                )
-                summary = summarize_split_results(split_results)
-                evaluation[split] = {"results": split_results, "summary": summary}
-
-        epochs = getattr(cfg, "epochs", None)
-        epoch_label = f"{epochs}ep" if epochs is not None else "eval"
-        label = "augments" if use_aug else "no-aug"
-        log_eval(f"\n-- {epoch_label} {max_eval_augments}{label} --\n")
-        dihedral_augmented = dihedral_by_split.get("test", False) if use_aug else False
-
+        evaluation: Dict[str, Dict[str, object]] = {}
         for split in splits:
-            summary = evaluation.get(split, {}).get("summary", {})
-            total = summary.get("total_sequences", 0)
-            shape_ok = summary.get("num_shape_correct", 0)
-            fully_correct = summary.get("num_fully_correct", 0)
-            avg_pixel_acc = summary.get("avg_pixel_accuracy", 0.0)
-            log_eval(f"Split: {split} | Seq: {total} | Shape OK: {shape_ok} | Fully Correct: {fully_correct} | Pixel Acc: {avg_pixel_acc:.4f}")
+            split_results, color_maps, dihedral_augmented = run_split_inference(
+                model=model, dataset=dataset, split=split, device=device, augmentor=augmentor,
+                batch_size=batch_size, max_new_tokens=DEFAULT_MAX_NEW_TOKENS, task_ids=task_ids,
+                temperature=getattr(cfg, "inference_temperature", None), top_k=getattr(cfg, "inference_top_k", None),
+            )
+            summary = summarize_split_results(split_results)
+            evaluation[split] = {"results": split_results, "summary": summary}
+            color_mappings_by_split[split] = color_maps
+            dihedral_by_split[split] = dihedral_augmented
+        evaluation["_aug"] = {"color_mappings_by_split": color_mappings_by_split, "dihedral_augmented_by_split": dihedral_by_split}
+    else:
+        evaluation: Dict[str, Dict[str, object]] = {}
+        for split in splits:
+            split_results, _, _ = run_split_inference(
+                model=model, dataset=dataset, split=split, device=device, batch_size=batch_size,
+                max_new_tokens=DEFAULT_MAX_NEW_TOKENS, task_ids=task_ids,
+                temperature=getattr(cfg, "inference_temperature", None), top_k=getattr(cfg, "inference_top_k", None),
+            )
+            summary = summarize_split_results(split_results)
+            evaluation[split] = {"results": split_results, "summary": summary}
 
-            if log_correct_grids and fully_correct > 0:
-                log_eval(f"  [Correct Grids Details for {split}]")
-                is_dihedral_split = dihedral_by_split.get(split, dihedral_augmented) if use_aug else False
-                correct_results = summary.get("fully_correct_results", [])
-                for res in correct_results:
-                    raw_idx = res.get("pair_index", 0)
-                    if is_dihedral_split:
-                        pair_id = raw_idx // 8
-                        dihedral_id = raw_idx % 8
-                    else:
-                        pair_id = raw_idx
-                        dihedral_id = 0
-                    color_id = res.get("color_permutation_index", 0)
-                    grid = res.get("output_grid", [])
-                    log_eval(f"    T:{res.get('task_id')} | Pair:{pair_id} | Dihedral:{dihedral_id} | Color:{color_id} -> {grid}")
+    dihedral_augmented = dihedral_by_split.get("test", False) if use_aug else False
 
-        print(f"Running AAIVR for {run_name}...")
-        if hasattr(sys.stdout, "log"):
+    for split in splits:
+        summary = evaluation.get(split, {}).get("summary", {})
+        total = summary.get("total_sequences", 0)
+        log_eval(f"Split: {split} | Generated {total} sequences")
+
+    print(f"Running AAIVR for {run_name}...")
+    if hasattr(sys.stdout, "log"):
+        sys.stdout = sys.stdout.terminal
+    sys.stdout = TeeLogger(aaivr_log_path)
+
+    try:
+        test_results = evaluation.get("test", {}).get("results", [])
+        aaivr_results: List[AAIVRSelection] = []
+        if test_results:
+            aaivr_color_mappings = color_mappings_by_split.get("test") if use_aug else None
+            aaivr_results = run_aaivr_on_results(
+                test_results, is_dihedral_augmented=dihedral_augmented, color_mappings_by_task=aaivr_color_mappings,
+            )
+            print(f"AAIVR aggregated {len(test_results)} predictions into {len(aaivr_results)} submission entries")
+        else:
+            print("No test results for AAIVR.")
+    finally:
+        if hasattr(sys.stdout, "terminal"):
+            sys.stdout.close()
             sys.stdout = sys.stdout.terminal
-        sys.stdout = TeeLogger(aaivr_log_path)
 
-        try:
-            test_results = evaluation.get("test", {}).get("results", [])
-            aaivr_results: List[AAIVRSelection] = []
-            if test_results:
-                aaivr_color_mappings = color_mappings_by_split.get("test") if use_aug else None
-                aaivr_results = run_aaivr_on_results(
-                    test_results, is_dihedral_augmented=dihedral_augmented, color_mappings_by_task=aaivr_color_mappings,
-                )
-            else:
-                print("No test results for AAIVR.")
+    print(f"Generating submission.json for {run_name}...")
+    submission_data = _build_submission_from_aaivr(aaivr_results)
+    with submission_path.open("w") as handle:
+        json.dump(submission_data, handle)
 
-            summarize_aaivr_pass_at_k(aaivr_results)
-            arc_score, max_score, pct = _compute_arc_style_score(aaivr_results)
-            print(f"Official ARC style scoring: {arc_score:.2f}/{max_score} ({pct:.2f}%)")
-        finally:
-            if hasattr(sys.stdout, "terminal"):
-                sys.stdout.close()
-                sys.stdout = sys.stdout.terminal
+    t_duration = perf_counter() - t_start
+    print(f"Finished {run_name}. Submission saved to {submission_path}")
+    print(f"Evaluation took {t_duration:.2f}s")
+    with timing_path.open("a") as handle:
+        handle.write(f"Evaluation {run_name}: {t_duration:.4f} s\n")
 
-        print(f"Generating submission.json for {run_name}...")
-        submission_data = _build_submission_from_aaivr(aaivr_results)
-        with submission_path.open("w") as handle:
-            json.dump(submission_data, handle)
-
-        t_duration = perf_counter() - t_start
-        print(f"Finished {run_name}. Submission saved to {submission_path}")
-        print(f"Run {run_name} took {t_duration:.2f}s")
-        with timing_path.open("a") as handle:
-            handle.write(f"Evaluation {run_name}: {t_duration:.4f} s\n")
-        results.append((run_name, evaluation, submission_path))
-
+    # Restore cfg values
     cfg.checkpoint_path = prev_checkpoint
     cfg.data_path = prev_data_path
     cfg.max_augments = prev_aug
 
-    print("\nAll evaluation runs completed.")
-    return results
+    return (run_name, evaluation, submission_path)

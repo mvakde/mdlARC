@@ -41,7 +41,7 @@ mdlARC/
 The codebase is organized around 3 main functionalities:
 1. **build.py** - Building model and data (`build_model_and_data`)
 2. **train.py** - Training loop (`train_model`) + NorMuon optimizer
-3. **evaluate.py** - Evaluation pipeline (`run_evaluation_configs`) + inference + AAIVR voting
+3. **evaluate.py** - Evaluation pipeline (`run_evaluation`) + inference + AAIVR voting
 
 Shared code used by multiple modules lives in **common.py** (including augmentation system), while **utils.py** contains standalone utilities (visualization, scoring, memory cleanup).
 
@@ -87,7 +87,7 @@ utils.cleanup_memory(globals())
 ### Cell 6: Evaluation
 ```python
 import evaluate
-eval_results = evaluate.run_evaluation_configs(cfg, EVAL_CONFIGS, ...)
+eval_result = evaluate.run_evaluation(cfg, run_name=EVAL_NAME, max_augments=EVAL_MAX_AUGMENTS, ...)
 ```
 
 ### Cell 7: Visualization
@@ -320,33 +320,33 @@ logits = model.forward_generate(tokens, positions_3d, example_id, caches, decode
 
 ### evaluate.py - Evaluation Pipeline
 
-**Purpose:** Complete evaluation module including inference generation, AAIVR voting, and metrics aggregation.
+**Purpose:** Complete evaluation module including inference generation, AAIVR voting, and submission generation.
 
 **Key Functions - Evaluation:**
 
 | Function | Description |
 |----------|-------------|
-| `run_evaluation_configs(cfg, eval_configs, ...)` | Main evaluation orchestrator |
-| `summarize_split_results(results)` | Aggregate metrics per split |
+| `run_evaluation(cfg, run_name, max_augments, data_path, checkpoint_path, ...)` | Main evaluation function |
+| `run_split_inference(model, dataset, split, device, augmentor, ...)` | Inference on dataset split |
+| `run_aaivr_on_results(results, ...)` | AAIVR voting aggregation |
 
-**Evaluation Config Format:**
+**Evaluation Parameters:**
 ```python
-EVAL_CONFIGS = [
-    ("eval_100color_both", 100, PATH_BOTH),  # (name, max_augments, dataset_path)
-]
+run_evaluation(
+    cfg,
+    run_name="eval_100aug",           # Name for output folder (runs/<run_name>/)
+    max_augments=100,                 # TTA augment count (higher = more voting candidates)
+    data_path=Path("assets/challenges.json"),
+    checkpoint_path=Path("runs/tiny.pt"),
+)
 ```
 
-**Output Metrics:**
-- Shape correctness (dimensions match)
-- Pixel accuracy (correct cells / total cells)
-- Full correctness (exact match)
-- Per-task pass rate (ARC official metric)
+**Output:** Generates `runs/<run_name>/submission.json` with top-2 predictions per test pair.
 
 **Key Functions - Inference Generation:**
 
 | Function | Description |
 |----------|-------------|
-| `run_split_inference(model, dataset, split, cfg, augmentor)` | Inference on dataset split |
 | `batched_greedy_generate(...)` | Batched token generation with KV caching |
 | `DEFAULT_MAX_NEW_TOKENS = 931` | Maximum tokens to generate |
 
@@ -356,13 +356,12 @@ EVAL_CONFIGS = [
 - Temperature and top-k sampling support
 - Batch generation with early stopping
 
-**Key Functions - AAIVR (Augmentation Inverse Voting):**
+**Key Classes - AAIVR:**
 
-| Function | Description |
-|----------|-------------|
-| `run_aaivr_on_results(results, ...)` | Main voting aggregation |
+| Class/Function | Description |
+|----------------|-------------|
 | `AAIVRSelection` | Dataclass with selected outputs + ranking |
-| `summarize_aaivr_pass_at_k(...)` | Compute Pass@K metrics |
+| `run_aaivr_on_results(results, ...)` | Main voting aggregation |
 
 **AAIVR Process:**
 1. Invert dihedral transforms on predictions
@@ -370,7 +369,7 @@ EVAL_CONFIGS = [
 3. Filter to rectangular grids only
 4. Optionally discard input copies
 5. Vote across augmented variants
-6. Select top-2 candidates (Pass@2)
+6. Select top-2 candidates for submission
 
 ---
 
@@ -470,16 +469,26 @@ args = {
 ### Evaluation Configuration
 
 ```python
-EVAL_CONFIGS = [
-    ("eval_100color_both", 100, PATH_BOTH),  # (name, max_augments, path)
-]
+# Run name: creates output folder at runs/<EVAL_NAME>/
+EVAL_NAME = "eval_100aug"
 
+# Max augments: TTA augment count (higher = more voting candidates, slower inference)
+EVAL_MAX_AUGMENTS = 100
+
+# Path to dataset (challenges.json)
+EVAL_DATA_PATH = Path("assets/challenges.json")
+
+# Path to model checkpoint
+EVAL_CHECKPOINT_PATH = Path("runs/tiny.pt")
+
+# Batch size for inference
 EVAL_BATCH_SIZE = 1300
-SPLITS = ["test"]
-CHECKPOINT_PATH = Path("runs/tiny.pt")
-SOLUTIONS_PRESENT = False  # True if solutions.json available
-EVAL_TASK_IDS = None  # None for all, or ["00576224", ...] for specific tasks
-LOG_CORRECT_GRIDS = False
+
+# Splits to evaluate
+EVAL_SPLITS = ["test"]
+
+# Specific task IDs to evaluate (None = all tasks)
+EVAL_TASK_IDS = None
 ```
 
 ---
@@ -615,17 +624,14 @@ train.train_model(cfg, model, dataloader, dataset, device, data_path)
 import evaluate
 from pathlib import Path
 
-EVAL_CONFIGS = [
-    ("eval_100aug", 100, Path("assets/challenges.json")),
-]
-
-eval_results = evaluate.run_evaluation_configs(
+eval_result = evaluate.run_evaluation(
     cfg,
-    EVAL_CONFIGS,
-    eval_batch_size=1300,
-    splits=["test"],
+    run_name="eval_100aug",
+    max_augments=100,
+    data_path=Path("assets/challenges.json"),
     checkpoint_path=Path("runs/model.pt"),
-    include_targets=False,
+    batch_size=1300,
+    splits=["test"],
 )
 ```
 
@@ -691,7 +697,7 @@ matplotlib     # Grid visualization
 
 2. **Checkpointing**: Set `checkpoint_epochs` to a list for specific epochs or an integer for periodic saving.
 
-3. **Augmentation Tuning**: Higher `max_augments` increases diversity but slows training. 10-100 is typical.
+3. **Augmentation Tuning**: Higher `max_augments` increases diversity but slows training. 100 is typical.
 
 4. **Validation**: Enable `do_validate` and provide `solutions.json` to monitor output loss during training.
 
