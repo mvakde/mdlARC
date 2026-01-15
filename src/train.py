@@ -31,21 +31,15 @@ def set_seed(seed: int) -> None:
 
 
 def resolve_device(device_str: str) -> torch.device:
-    device_str = device_str.lower()
-    if device_str == "cuda":
-        if torch.cuda.is_available():
-            # Prefer TF32 on capable CUDA hardware using the new fp32_precision API.
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            return torch.device("cuda")
-        print("CUDA not available, falling back to CPU.")
-        return torch.device("cpu")
-    if device_str == "mps":
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return torch.device("mps")
-        print("MPS not available, falling back to CPU.")
-        return torch.device("cpu")
-    return torch.device("cpu" if device_str not in {"cpu"} else "cpu")
+    device_str = str(device_str or "cuda").lower()
+    if not device_str.startswith("cuda"):
+        raise ValueError("Only CUDA is supported. Set device='cuda'.")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required but not available.")
+    # Prefer TF32 on capable CUDA hardware using the new fp32_precision API.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    return torch.device(device_str)
 
 
 def _capture_rng_state(device: torch.device) -> Dict[str, Any]:
@@ -58,15 +52,6 @@ def _capture_rng_state(device: torch.device) -> Dict[str, Any]:
     if torch.cuda.is_available() and device.type == "cuda":
         try:
             state["cuda"] = torch.cuda.get_rng_state_all()
-        except Exception:
-            pass
-    if (
-        hasattr(torch, "mps")
-        and torch.backends.mps.is_available()
-        and device.type == "mps"
-    ):
-        try:
-            state["mps"] = torch.mps.get_rng_state()
         except Exception:
             pass
     return state
@@ -91,16 +76,6 @@ def _restore_rng_state(state: Optional[Dict[str, Any]], device: torch.device) ->
     if "cuda" in state and torch.cuda.is_available() and device.type == "cuda":
         try:
             torch.cuda.set_rng_state_all(state["cuda"])
-        except Exception:
-            pass
-    if (
-        "mps" in state
-        and hasattr(torch, "mps")
-        and torch.backends.mps.is_available()
-        and device.type == "mps"
-    ):
-        try:
-            torch.mps.set_rng_state(state["mps"])
         except Exception:
             pass
 
@@ -295,12 +270,11 @@ def _is_muon_candidate(
 
 
 def _normuon_supported(device: torch.device) -> Tuple[bool, str]:
-    if device.type == "mps":
-        return False, "NorMuon uses bfloat16 orthogonalization which is unsupported on MPS"
-    if device.type == "cuda":
-        bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
-        if callable(bf16_supported) and not bf16_supported():
-            return False, "NorMuon requires CUDA bfloat16 support"
+    if device.type != "cuda":
+        return False, "NorMuon requires CUDA."
+    bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
+    if callable(bf16_supported) and not bf16_supported():
+        return False, "NorMuon requires CUDA bfloat16 support"
     return True, ""
 
 
@@ -824,7 +798,7 @@ def build_model_and_data(
     and inference can be orchestrated independently.
     """
     set_seed(args.seed)
-    device = resolve_device(args.device)
+    device = resolve_device(getattr(args, "device", "cuda"))
     checkpoint = (
         checkpoint if checkpoint is not None else load_checkpoint(args.checkpoint_path)
     )
@@ -856,16 +830,12 @@ def build_model_and_data(
             include_outputs=True,
             max_seq_len=MAX_SEQ_LEN,
             task_whitelist=task_whitelist,
-            color_aug_mode=getattr(args, "color_aug_mode", None),
         )
 
     use_aug = bool(getattr(args, "enable_aug", False) and not is_eval)
     augmentor = None
 
     if use_aug:
-        if getattr(args, "num_workers", 0) != 0:
-            raise ValueError("Augmentation requires num_workers=0.")
-        
         max_augments = int(getattr(args, "max_augments", 0) or 0)
         
         augmentor = build_augmentor(
@@ -888,7 +858,6 @@ def build_model_and_data(
         dataset=dataset,
         batch_size=args.batch_size,
         shuffle=not getattr(args, "eval_only", False),
-        num_workers=args.num_workers,
         augment_selector=collate_augment_selector,
     )
     if augmentor is not None:
@@ -1018,14 +987,12 @@ def train_model(
             load_test_solutions=True,  # <--- Loads solutions.json
             max_seq_len=MAX_SEQ_LEN,
             task_whitelist=dataset.task_ids,  # Keep ID mapping consistent
-            color_aug_mode=getattr(args, "color_aug_mode", None),
         )
 
         val_dataloader = create_dataloader(
             dataset=val_dataset,
             batch_size=val_batch_size,
             shuffle=False,
-            num_workers=args.num_workers,
         )
         print(f"Validation dataset size: {len(val_dataset)}")
     else:
@@ -1205,7 +1172,7 @@ def train_model(
 
     # Compile a specific reference for training execution only.
     # We do this AFTER optimizer loading to ensure parameter consistency.
-    # We check for CUDA because compile support on MPS/CPU can be flaky or slower.
+    # Guard on CUDA because training is CUDA-only and compilation is backend-specific.
     if hasattr(torch, "compile") and device.type == "cuda":
         print("Compiling model for training speedup...")
         training_model = torch.compile(model)
@@ -1214,57 +1181,9 @@ def train_model(
 
 
     augmentor = getattr(dataloader, "augmentor", None)
-    disable_color_aug_last_epochs = int(
-        getattr(args, "disable_color_aug_last_epochs", 0) or 0
-    )
-    disable_color_aug_last_epochs = max(0, disable_color_aug_last_epochs)
-    disable_color_aug_start = (
-        max(0, args.epochs - disable_color_aug_last_epochs)
-        if disable_color_aug_last_epochs > 0
-        else None
-    )
-    disable_dihedral_aug_last_epochs = int(
-        getattr(args, "disable_dihedral_aug_last_epochs", 0) or 0
-    )
-    disable_dihedral_aug_last_epochs = max(0, disable_dihedral_aug_last_epochs)
-    disable_dihedral_aug_start = (
-        max(0, args.epochs - disable_dihedral_aug_last_epochs)
-        if disable_dihedral_aug_last_epochs > 0
-        else None
-    )
-    prev_color_aug_enabled = None
-    prev_dihedral_aug_enabled = None
 
     for epoch in range(start_epoch, args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
-        color_aug_enabled = (
-            True if disable_color_aug_start is None else epoch < disable_color_aug_start
-        )
-        if augmentor is not None:
-            if (
-                prev_color_aug_enabled is None
-                or color_aug_enabled != prev_color_aug_enabled
-            ):
-                augmentor.set_color_enabled(color_aug_enabled)
-                if prev_color_aug_enabled is not None or not color_aug_enabled:
-                    state = "enabled" if color_aug_enabled else "disabled"
-                    print(f"Color augmentation {state} for epoch {epoch + 1}.")
-                prev_color_aug_enabled = color_aug_enabled
-        dihedral_aug_enabled = (
-            True
-            if disable_dihedral_aug_start is None
-            else epoch < disable_dihedral_aug_start
-        )
-        if augmentor is not None:
-            if (
-                prev_dihedral_aug_enabled is None
-                or dihedral_aug_enabled != prev_dihedral_aug_enabled
-            ):
-                augmentor.set_dihedral_enabled(dihedral_aug_enabled)
-                if prev_dihedral_aug_enabled is not None or not dihedral_aug_enabled:
-                    state = "enabled" if dihedral_aug_enabled else "disabled"
-                    print(f"Dihedral augmentation {state} for epoch {epoch + 1}.")
-                prev_dihedral_aug_enabled = dihedral_aug_enabled
         if augmentor is not None:
             augmentor.set_epoch(epoch)
 

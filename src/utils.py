@@ -38,21 +38,6 @@ MAX_SEQ_LEN = 1863
 IGNORE_INDEX = -100
 
 
-_COLOR_AUG_MODES = ("input_only", "exclude_output_only")
-
-
-def _normalize_color_aug_mode(mode: Optional[str]) -> str:
-    if mode is None:
-        return "exclude_output_only"
-    mode_str = str(mode)
-    if mode_str not in _COLOR_AUG_MODES:
-        raise ValueError(
-            f"Unknown color augmentation mode '{mode_str}'. "
-            f"Expected one of: {', '.join(_COLOR_AUG_MODES)}."
-        )
-    return mode_str
-
-
 def _extract_task_colors(task: Dict[str, object], key: str) -> Set[int]:
     colors: Set[int] = set()
     for split in ("train", "test"):
@@ -67,14 +52,9 @@ def _extract_task_colors(task: Dict[str, object], key: str) -> Set[int]:
     return colors
 
 
-def extract_task_input_colors(
-    task: Dict[str, object], mode: Optional[str] = None
-) -> List[int]:
-    """Return sorted colors (1-9) eligible for permutation."""
-    mode = _normalize_color_aug_mode(mode)
+def extract_task_input_colors(task: Dict[str, object]) -> List[int]:
+    """Return sorted colors (1-9) eligible for permutation, excluding output-only colors."""
     input_colors = _extract_task_colors(task, "input")
-    if mode == "input_only":
-        return sorted(input_colors)
     output_colors = _extract_task_colors(task, "output")
     output_only = output_colors - input_colors
     return [color for color in range(1, 10) if color not in output_only]
@@ -784,7 +764,6 @@ class ARCExampleDataset(Dataset):
         drop_long_sequences: bool = False,
         task_whitelist: Optional[Sequence[str]] = None,
         load_test_solutions: bool = False,
-        color_aug_mode: Optional[str] = None,
     ) -> None:
         available_splits = {"train", "test"}
         for split in splits:
@@ -797,7 +776,6 @@ class ARCExampleDataset(Dataset):
         self.max_seq_len = max_seq_len
         self.drop_long_sequences = drop_long_sequences
         self.include_outputs = include_outputs
-        self.color_aug_mode = _normalize_color_aug_mode(color_aug_mode)
 
         challenges = load_challenges(self.source_path)
 
@@ -827,9 +805,7 @@ class ARCExampleDataset(Dataset):
         for example_id, task_id in enumerate(task_ids):
             self.task_id_to_example_id[task_id] = example_id
             task = challenges[task_id]
-            self.task_input_colors[task_id] = extract_task_input_colors(
-                task, mode=self.color_aug_mode
-            )
+            self.task_input_colors[task_id] = extract_task_input_colors(task)
             for split in splits:
                 pairs = task.get(split, [])
                 for pair_index, pair in enumerate(pairs):
@@ -1081,7 +1057,6 @@ def create_dataloader(
     dataset: ARCExampleDataset,
     batch_size: int,
     shuffle: bool = True,
-    num_workers: int = 0,
     bucket_size_multiplier: int = 4,
     augment_selector: Optional[
         Callable[[SequenceExample], Tuple[Optional[torch.Tensor], Optional[int]]]
@@ -1105,7 +1080,7 @@ def create_dataloader(
     return DataLoader(
         dataset,
         batch_sampler=batch_sampler,
-        num_workers=num_workers,
+        num_workers=0,
         collate_fn=collate_fn,
     )
 

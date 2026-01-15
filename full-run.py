@@ -58,8 +58,7 @@ MOUNT_FOLDER = str(PROJECT_ROOT / "archives").lstrip("/")
 # Model + training config (mirrors interactive-run.ipynb).
 ARGS = {
     # run config
-    "num_workers": 0,
-    "device": "cuda",  # "cuda" | "mps" | "cpu"
+    "device": "cuda",  # CUDA only
     "do_validate": True,
     "name": "arc1-37M-bs32-101ep-100color-ccdb",
     "GPU": "A100",  # logging only
@@ -74,17 +73,12 @@ ARGS = {
     "batch_size": 32,
     "gradient_accumulation_steps": 1,
     "val_batch_size": 300,
-    "enable_color_aug_train": True,
-    "enable_color_on_aug_test_split_during_training": True,
-    "max_sanitized_augments": 100,
-    "color_aug_mode": "exclude_output_only",  # "input_only" | "exclude_output_only"
-    "disable_color_aug_last_epochs": 1,
-    "color_aug_seed": 42,
-    "enable_sanitized_aug_train": True,
-    "sanitized_aug_seed": None,
-    "disable_dihedral_aug_last_epochs": 0,
-    "enable_dihedral_aug_train": True,
-    "enable_dihedral_on_aug_test_split_during_training": True,
+    "enable_aug": True,
+    "max_augments": 100,
+    "enable_color_aug": True,
+    "color_apply_to_test": True,
+    "enable_dihedral_aug": True,
+    "dihedral_apply_to_test": True,
     "optimizer": "normuon",  # "adamw" | "normuon"
     "normuon_lr": 0.02,
     "normuon_momentum": 0.95,
@@ -115,8 +109,8 @@ ARGS = {
 
 # Evaluation config
 PATH_BOTH = ARGS["data_path"]
-# aug_count = max_sanitized_augments when sanitized (0 = no aug)
-EVAL_CONFIGS = [("eval_100sanitized_both", 100, PATH_BOTH)]
+# aug_count = max_augments (0 = no aug)
+EVAL_CONFIGS = [("eval_100aug_both", 100, PATH_BOTH)]
 EVAL_BATCH_SIZE = 900
 EVAL_SPLITS = ["test"]
 EVAL_CHECKPOINT_PATH = ARGS["save_path"]
@@ -274,14 +268,14 @@ def main() -> None:
             dihedral_enabled = False
             color_mappings_by_task = None
 
-            sanitized_ctx = eval_data.get("_sanitized", {})
-            if sanitized_ctx:
-                color_mappings_by_task = sanitized_ctx.get(
-                    "color_mappings_by_split", {}
-                ).get("test")
-                dihedral_enabled = sanitized_ctx.get(
-                    "dihedral_augmented_by_split", {}
-                ).get("test", False)
+            aug_ctx = eval_data.get("_aug", {})
+            if aug_ctx:
+                color_mappings_by_task = aug_ctx.get("color_mappings_by_split", {}).get(
+                    "test"
+                )
+                dihedral_enabled = aug_ctx.get("dihedral_augmented_by_split", {}).get(
+                    "test", False
+                )
 
             aaivr.visualize_aaivr_flow(
                 test_results,

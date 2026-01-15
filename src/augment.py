@@ -150,29 +150,18 @@ class Augmentor:
         self.dihedral_apply_to_test_split = bool(dihedral_apply_to_test_split)
         self.max_augments = int(max_augments)
         self._enabled = True
-        self._color_enabled = True
-        self._dihedral_enabled = True
         self._epoch = 0
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = bool(enabled)
 
-    def set_color_enabled(self, enabled: bool) -> None:
-        self._color_enabled = bool(enabled)
-
-    def set_dihedral_enabled(self, enabled: bool) -> None:
-        self._dihedral_enabled = bool(enabled)
-
     def set_epoch(self, epoch: int) -> None:
         self._epoch = max(0, int(epoch))
 
     def _resolve_flags(self, split: str) -> Tuple[bool, bool]:
-        color_enabled = self._color_enabled
-        dihedral_enabled = self._dihedral_enabled
         if split == "test":
-            color_enabled = color_enabled and self.color_apply_to_test_split
-            dihedral_enabled = dihedral_enabled and self.dihedral_apply_to_test_split
-        return color_enabled, dihedral_enabled
+            return self.color_apply_to_test_split, self.dihedral_apply_to_test_split
+        return True, True
 
     def _select_index_for_epoch(
         self, augments: Augments, *, color_enabled: bool, dihedral_enabled: bool
