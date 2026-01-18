@@ -1,6 +1,6 @@
 # 39% on ARC-AGI-1 Pub in just ~$2 using a 60M transformer
 
-Update: I am in the middle of refactoring the code. Performance has improved to 36% for the same cost. Doing a final push towards 50% now. The repo might be a bit unusable till I am done with refactoring and improving the model. Expect 1st week of Jan.
+Update: I am in the middle of refactoring the code. Performance has improved to 39% for the same cost. Doing a final push towards 50% now. The repo might be a bit unusable till I am done with refactoring and improving the model. Expect 1st week of Jan.
 
 ---
 
