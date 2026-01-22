@@ -1,10 +1,5 @@
 venv/
 __pycache__
-runs
 .DS_Store
-results/
 misc/
-newruns/
-assets_clean/
-runfolder/
-.env
+new_dataset_scripts/
