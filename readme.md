@@ -1,13 +1,10 @@
-# 39% on ARC-AGI-1 Pub in just ~$2 using a 60M transformer
-
-Update: I am in the middle of refactoring the code. Performance has improved to 39% for the same cost. Doing a final push towards 50% now. The repo might be a bit unusable till I am done with refactoring and improving the model. Expect 1st week of Jan.
+# 38% on ARC-AGI-1 Pub in just ~$0.60 with a 75M transformer
+Takes <2hrs on a 5090
 
 ---
-
 Deploy:
-- Colab: upload one of the notebooks → select GPU runtime (A100 if available) → (optional) mount google drive to save runs -> “Run all”.
-- Modal: upload the notebook to a Modal Notebook → select an A100 → (optional) attach a Volume and update the first cell’s `mount_folder`/volume name → “Run all”.
-- If you’re running from a fork/branch, edit the `git clone ...` cell in the notebook.
+- rent a 5090, upload the interactive run notebook or runscript, run it
+
 
 ---
 
