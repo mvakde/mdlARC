@@ -1,17 +1,12 @@
-# 38% on ARC-AGI-1 Pub in just ~$0.60 with a 75M transformer
-Takes <2hrs on a 5090
+# 38% on ARC-AGI-1: trained from scratch for just ~$0.60 
+- Takes <2hrs on a 5090
+- Uses a standard tranformer
+- 75M parameters
 
----
 Deploy:
 - rent a 5090, upload the interactive run notebook or runscript, run it
 
-
 ---
-
-Update:  
-Wow this blew up. Pressure is on.  
-Please bear with me as I want to do careful ablations.
-
 ## Self supervised compression on ARC
 
 Every DL approach on ARC today trains a supervised algorithm (other than compressARC)
@@ -25,14 +20,12 @@ Implementation details: [New pareto frontier on ARC-AGI](https://mvakde.github.i
 For why I chose these specific implementations, read my blog on [Why all ARC solvers fail today](https://mvakde.github.io/blog/why-all-ARC-solvers-fail-today/)
 
 ## Details
-Performance - 27.5% on ARC-1 public eval
-Total Compute cost - $1.8
-- ~127min on 40GB A100 for training (1.2$)
-- ~49min on 80GB A100 for inference (0.6$)
+**UPDATED: (details to follow)**
+Performance: **38%** on ARC-1 public eval
+Total compute cost: **~$0.60**  (<2hrs on a 5090 rented on vast.ai)
 
+**Old:**
+Performance: 27.5% on ARC-1 public eval
+Total Compute cost: $1.8 (<3hrs on an A100 rented on Google Colab)
 
-This is early performance. I was too GPU poor to do hyperparameter sweeps.
-
-I should be able to push to 35% with just basic sweeps
-
-I expect to hit 50% with a few obvious research ideas
+50% should be possible with the next research ideas
