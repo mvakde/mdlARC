@@ -97,9 +97,10 @@ def build_model_and_data(
         print("Reusing existing dataset from RAM (skipping 3D pre-computation).")
         dataset = reuse_dataset
     else:
+        splits = ("train", "test") if is_eval else ("train",)
         dataset = ARCExampleDataset(
             json_path=data_path,
-            splits=("train", "test"),
+            splits=splits,
             include_outputs=True,
             max_seq_len=MAX_SEQ_LEN,
             task_whitelist=task_whitelist,

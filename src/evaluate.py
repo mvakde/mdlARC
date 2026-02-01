@@ -761,7 +761,9 @@ def run_evaluation(
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     print("Building model and dataloader...")
-    model, dataset, _, device, _ = build_model_and_data(cfg, checkpoint=checkpoint)
+    model, dataset, _, device, _ = build_model_and_data(
+        cfg, checkpoint=checkpoint, is_eval=True
+    )
 
     def log_eval(msg: str) -> None:
         print(msg)

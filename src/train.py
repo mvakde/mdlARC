@@ -210,7 +210,7 @@ def train_one_epoch(
                 attention_mask=attention_mask,
                 positions_3d=positions_3d,
             )
-            loss = outputs["loss"]
+            loss = outputs["output_loss"]
             inp_loss = outputs.get("input_loss")
             out_loss = outputs.get("output_loss")
 
