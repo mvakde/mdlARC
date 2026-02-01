@@ -3,9 +3,38 @@
 - Uses a standard tranformer
 - 75M parameters
 
-Deploy:
-- rent a 5090, upload the interactive run notebook or runscript, run it
+Deployment:
+1) Rent a 5090, ensure cuda >12.8, ideally >13.0   
+2) Create a virtual environment and install `torch`, `numpy`, `numba`, `matplotlib`  
+3) Download and build the dataset
+4) (optional) delete raw data, solutions file and dataset scripts to prove no leakage
+5) Run the training and inference script  
 
+This script takes care of (2) and (3):  
+```bash
+git clone https://github.com/mvakde/mdlARC.git
+
+# Create virtual env
+cd mdlARC
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# download and build the datasets
+cd dataset_building_scripts
+python download_and_group.py
+python build_datasets.py arc1 --add-conceptarc --with-filtered
+cd ..
+
+# prove no data leakage (optional, uncomment to run)
+# rm -r assets_tmp # deletes raw data
+# rm assets/solutions.json # deletes solutions file
+# rm -r dataset_building_scripts # deletes dataset related files
+
+#run the training + inference script
+python run_script.py
+```
+ 
 ---
 ## Self supervised compression on ARC
 
@@ -28,4 +57,5 @@ Total compute cost: **~$0.60**  (<2hrs on a 5090 rented on vast.ai)
 Performance: 27.5% on ARC-1 public eval
 Total Compute cost: $1.8 (<3hrs on an A100 rented on Google Colab)
 
+**Next goal:**
 50% should be possible with the next research ideas

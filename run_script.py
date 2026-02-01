@@ -5,29 +5,21 @@ from pathlib import Path
 from time import perf_counter
 import torch
 
-# 1. SETUP PATHS (As per your notebook structure)
-PROJECT_ROOT = Path.cwd()
-# Assuming files are in src/ or root. Your notebook adds 'src', checking for that:
-SRC_DIR = PROJECT_ROOT / "src"
-if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+# Choose whether scoring is enabled or not
+SCORE_RESULTS = True
 
-# Import your modules
-try:
-    import utils
-    import tinytransformer
-    import train
-    import build
-    import evaluate
-    print("Modules imported successfully.")
-except ImportError as e:
-    # Fallback if src isn't used in repo, purely root
-    print(f"Import warning: {e}. Assuming modules are in CWD.")
-    import train
-    import build
-    import evaluate
+# 1. SETUP PATHS AND IMPORT MODULES
+SRC_DIR = Path.cwd() / "src"
+sys.path.insert(0, str(SRC_DIR))
 
-# 2. DEFINE CONFIG (Matching your interactive.ipynb exactly)
+import utils
+import tinytransformer
+import train
+import build
+import evaluate
+print("Modules imported successfully.")
+
+# 2. DEFINE CONFIG
 args_dict = {
     "name": "submission_run",
     "data_path": Path("assets/challenges.json"),
@@ -54,7 +46,7 @@ args_dict = {
     "normuon_lr": 1.66e-3,
     "normuon_momentum": 0.95,
     "normuon_beta2": 0.95,
-    "lr": 3e-4,
+    "adamw_lr": 3e-4,
 
     "warmup_pct": 0.02,
     "wsd_decay_start_pct": 0.8,
@@ -73,17 +65,13 @@ args_dict = {
     "d_model": 768,
     "n_heads": 12,
     "d_ff": 3072,
-    "n_layers": 4,
+    "n_layers": 8,
 
     "inference_temperature": None,
     "inference_top_k": None,
 }
-
-# Convert dictionary to Namespace (mimicking argparse)
-cfg = argparse.Namespace(**args_dict)
-
-# Create runs dir
-Path("runs").mkdir(parents=True, exist_ok=True)
+cfg = argparse.Namespace(**args_dict) # Convert dictionary to Namespace
+Path("runs").mkdir(parents=True, exist_ok=True) # Create runs dir
 
 # 3. BUILD
 print("Building model and data...")
@@ -104,13 +92,7 @@ print(f"Training finished in {perf_counter() - t_start:.2f}s")
 
 # 5. EVALUATE / INFERENCE
 print("Starting Evaluation...")
-
-# Force garbage collection before eval
-utils.cleanup_memory(globals())
-
-# Reload checkpoint we just saved (best practice to ensure we use saved state)
-# However, evaluate.py loads it internally based on path.
-
+utils.cleanup_memory(globals()) # Force garbage collection before eval
 eval_result = evaluate.run_evaluation(
     cfg,
     run_name="submission_eval",
@@ -121,5 +103,13 @@ eval_result = evaluate.run_evaluation(
     splits=["test"],          
     task_ids=None,
 )
-
+SUBMISSION_FILE = Path(f"runs/{eval_result[0]}/submission.json")
 print("Evaluation complete. submission.json generated.")
+
+# 6. RESULTS: score the results (if enabled), then visualise
+if SCORE_RESULTS: # scoring, if enabled
+    SOLUTIONS_FILE = Path("assets/solutions.json")
+    score = utils.score_arc_submission(SOLUTIONS_FILE, SUBMISSION_FILE)
+    utils.visualize_submissions(SUBMISSION_FILE, SOLUTIONS_FILE, mode="!")
+else:
+    utils.visualize_submissions(SUBMISSION_FILE, mode="submission")

@@ -658,16 +658,16 @@ def _build_optimizer(
     )
 
     if optimizer_name not in {"normuon"}:
-        return AdamW(list(muon_groups) + list(adamw_groups), lr=args.lr, fused=use_fused)
+        return AdamW(list(muon_groups) + list(adamw_groups), lr=args.adamw_lr, fused=use_fused)
 
     supported, reason = _normuon_supported(device)
     if not supported:
         print(f"NorMuon unavailable ({reason}); falling back to AdamW.")
-        return AdamW(list(muon_groups) + list(adamw_groups), lr=args.lr, fused=use_fused)
+        return AdamW(list(muon_groups) + list(adamw_groups), lr=args.adamw_lr, fused=use_fused)
 
     if not muon_groups:
         print("NorMuon requested but no eligible linear weights found; using AdamW.")
-        return AdamW(list(adamw_groups), lr=args.lr, fused=use_fused)
+        return AdamW(list(adamw_groups), lr=args.adamw_lr, fused=use_fused)
 
     normuon_lr = getattr(args, "normuon_lr", None)
     normuon_lr = 0.02 if normuon_lr is None else float(normuon_lr)
@@ -675,7 +675,7 @@ def _build_optimizer(
     normuon_beta2 = float(getattr(args, "normuon_beta2", 0.95))
 
     adamw_lr = getattr(args, "adamw_lr", None)
-    adamw_lr = args.lr if adamw_lr is None else float(adamw_lr)
+    adamw_lr = 3e-4 if adamw_lr is None else float(adamw_lr)
     normuon_param_groups = []
     for group in muon_groups:
         normuon_group = dict(group)
