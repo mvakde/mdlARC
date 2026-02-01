@@ -1,9 +1,7 @@
 import sys
 import argparse
-import pickle
 from pathlib import Path
 from time import perf_counter
-import torch
 
 # Choose whether scoring is enabled or not
 SCORE_RESULTS = True
@@ -13,7 +11,6 @@ SRC_DIR = Path.cwd() / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 import utils
-import tinytransformer
 import train
 import build
 import evaluate
