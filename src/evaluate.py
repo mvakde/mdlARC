@@ -21,15 +21,12 @@ from common import (
     Augments,
     END_TOKEN_ID,
     IO_SEPARATOR_TOKEN_ID,
-    NEXT_LINE_TOKEN_ID,
-    START_TOKEN_ID,
     VOCAB_SIZE,
     apply_color_permutation_to_grid,
     apply_color_permutation_to_tokens,
     apply_dihedral_transform,
     apply_inverse_dihedral_transform,
     build_augmentor,
-    compute_positions_3d,
     extract_output_tokens,
     grid_to_tokens,
     is_rectangular_grid,
@@ -44,54 +41,6 @@ from tinytransformer import TinyTransformer
 # =============================================================================
 
 DEFAULT_MAX_NEW_TOKENS = 931
-
-
-@torch.compile(mode="default", fullgraph=True)
-def _compiled_grid_update(state, token_ids, start_id, sep_id, end_id, nl_id):
-    x, y, z = state.unbind(-1)
-    pos_x = torch.clamp(x, min=0, max=30)
-    pos_y = torch.clamp(y, min=0, max=29)
-    pos_z = z
-
-    is_start = token_ids == start_id
-    is_sep = token_ids == sep_id
-    is_end = token_ids == end_id
-    is_newline = token_ids == nl_id
-
-    zeros = torch.zeros_like(x)
-    pos_x = torch.where(is_start | is_sep | is_end, zeros, pos_x)
-    pos_y = torch.where(is_start | is_sep | is_end, zeros, pos_y)
-    pos_z = torch.where(is_start, zeros, pos_z)
-    pos_z = torch.where(is_sep, torch.full_like(pos_z, 2), pos_z)
-    pos_z = torch.where(is_end, torch.full_like(pos_z, 4), pos_z)
-
-    next_x = x + 1
-    next_y = y
-    next_z = z
-    next_x = torch.where(is_newline, zeros, next_x)
-    next_y = torch.where(is_newline, y + 1, next_y)
-    next_x = torch.where(is_sep, zeros, next_x)
-    next_y = torch.where(is_sep, zeros, next_y)
-    next_z = torch.where(is_sep, torch.full_like(next_z, 3), next_z)
-    next_x = torch.where(is_end | is_start, x, next_x)
-    next_y = torch.where(is_end | is_start, y, next_y)
-    next_z = torch.where(is_start, z, next_z)
-    next_z = torch.where(is_end, z, next_z)
-
-    return torch.stack([next_x, next_y, next_z], dim=-1), torch.stack([pos_x, pos_y, pos_z], dim=-1)
-
-
-class BatchGridState:
-    def __init__(self, initial_state: torch.Tensor) -> None:
-        self.state = initial_state.clone().long()
-
-    def update(self, token_ids: torch.Tensor) -> torch.Tensor:
-        token_ids = token_ids.view(-1).to(device=self.state.device)
-        self.state, positions = _compiled_grid_update(
-            self.state, token_ids, START_TOKEN_ID, IO_SEPARATOR_TOKEN_ID, END_TOKEN_ID, NEXT_LINE_TOKEN_ID
-        )
-        self.state = self.state.clone()
-        return positions.clone()
 
 
 def _select_next_token(logits: torch.Tensor, temperature: Optional[float] = None, top_k: Optional[int] = None) -> torch.Tensor:
@@ -129,44 +78,10 @@ def _left_pad_sequences(sequences: Sequence[Sequence[int]], pad_token_id: int, d
     return input_ids, attention_mask
 
 
-def _pad_cached_positions(cached_positions: Sequence[torch.Tensor], max_len: int, device: torch.device) -> torch.Tensor:
-    positions = torch.zeros((len(cached_positions), max_len, 3), dtype=torch.long, device=device)
-    for idx, pos in enumerate(cached_positions):
-        seq_len = pos.size(0)
-        start = max_len - seq_len
-        positions[idx, start:] = pos.to(device=device, dtype=torch.long)
-    return positions
-
-
-def _derive_initial_state_from_prompt(input_ids: torch.Tensor, positions_3d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    last_tokens = input_ids[:, -1]
-    last_positions = positions_3d[:, -1]
-    x, y, z = last_positions.unbind(-1)
-
-    next_x = x + 1
-    next_y = y
-    next_z = z
-    next_x = torch.where(last_tokens == NEXT_LINE_TOKEN_ID, torch.zeros_like(next_x), next_x)
-    next_y = torch.where(last_tokens == NEXT_LINE_TOKEN_ID, y + 1, next_y)
-    next_x = torch.where(last_tokens == IO_SEPARATOR_TOKEN_ID, torch.zeros_like(next_x), next_x)
-    next_y = torch.where(last_tokens == IO_SEPARATOR_TOKEN_ID, torch.zeros_like(next_y), next_y)
-    next_z = torch.where(last_tokens == IO_SEPARATOR_TOKEN_ID, torch.full_like(next_z, 3), next_z)
-    next_x = torch.where(last_tokens == END_TOKEN_ID, x, next_x)
-    next_y = torch.where(last_tokens == END_TOKEN_ID, y, next_y)
-    next_z = torch.where(last_tokens == END_TOKEN_ID, z, next_z)
-    next_x = torch.where(last_tokens == START_TOKEN_ID, torch.zeros_like(next_x), next_x)
-    next_y = torch.where(last_tokens == START_TOKEN_ID, torch.zeros_like(next_y), next_y)
-    next_z = torch.where(last_tokens == START_TOKEN_ID, torch.ones_like(next_z), next_z)
-
-    initial_state = torch.stack([next_x, next_y, next_z], dim=-1)
-    finished = last_tokens == END_TOKEN_ID
-    return initial_state, finished
-
-
 @torch.inference_mode()
 def batched_greedy_generate(
     model, prompts, example_ids, device, max_new_tokens=931,
-    cached_positions=None, temperature: Optional[float] = None, top_k: Optional[int] = None,
+    temperature: Optional[float] = None, top_k: Optional[int] = None,
 ):
     model.eval()
     model.to(dtype=torch.bfloat16)
@@ -178,23 +93,15 @@ def batched_greedy_generate(
     batch_max_needed = current_len + max_new_tokens
     batch_max_needed = (batch_max_needed + 127) // 128 * 128
     max_model_len = min(batch_max_needed, model.config.max_seq_len)
-
-    if cached_positions and all(p is not None for p in cached_positions):
-        prompt_positions = _pad_cached_positions([p for p in cached_positions if p is not None], input_ids.size(1), device)
-    else:
-        prompt_positions = compute_positions_3d(input_ids, attention_mask).to(device=device, dtype=torch.long)
-
-    initial_state, finished = _derive_initial_state_from_prompt(input_ids, prompt_positions)
-    grid_state = BatchGridState(initial_state)
+    finished = input_ids[:, -1] == END_TOKEN_ID
     example_embeds = model.example_embedding(example_ids_tensor).to(dtype=torch.bfloat16)
-    current_len = input_ids.size(1)
 
     full_attention_mask = torch.zeros((batch_size, max_model_len), dtype=torch.bool, device=device)
     full_attention_mask[:, :current_len] = attention_mask
 
     outputs = model.forward_generate(
         input_ids=input_ids, example_ids=example_ids_tensor, past_key_values=None,
-        positions_3d=prompt_positions, attention_mask=attention_mask, example_embeds=example_embeds,
+        attention_mask=attention_mask, example_embeds=example_embeds,
     )
     logits = outputs["logits"]
     prompt_kvs = outputs["past_key_values"]
@@ -225,11 +132,10 @@ def batched_greedy_generate(
         next_token = torch.where(finished, torch.tensor(END_TOKEN_ID, device=device), next_token)
         generated_tokens_buffer[:, step_i] = next_token
         finished = finished | (next_token == END_TOKEN_ID)
-        token_positions = grid_state.update(next_token).unsqueeze(1)
         full_attention_mask.index_fill_(1, cache_position, True)
         outputs = model._compiled_decode(
             input_ids=next_token.unsqueeze(1), example_ids=example_ids_tensor,
-            past_key_values=past_key_values, positions_3d=token_positions,
+            past_key_values=past_key_values,
             attention_mask=full_attention_mask, cache_position=cache_position, example_embeds=example_embeds,
         )
         logits = outputs["logits"]
@@ -254,20 +160,16 @@ def _build_prompt_from_tokens(tokens: Sequence[int]) -> List[int]:
     return list(tokens[: sep_idx + 1])
 
 
-def _select_tokens_for_example(example: object, transform_index: Optional[int]) -> Tuple[List[int], Optional[torch.Tensor]]:
+def _select_tokens_for_example(example: object, transform_index: Optional[int]) -> List[int]:
     tokens = getattr(example, "tokens")
-    cached_positions = getattr(example, "cached_positions", None)
     if transform_index is not None:
         tokens_by_dihedral = getattr(example, "tokens_by_dihedral", None)
         if tokens_by_dihedral:
             if transform_index < 0 or transform_index >= len(tokens_by_dihedral):
                 raise ValueError(f"Invalid dihedral transform index {transform_index}.")
             tokens = tokens_by_dihedral[transform_index]
-            cached_by_dihedral = getattr(example, "cached_positions_by_dihedral", None)
-            if cached_by_dihedral:
-                cached_positions = cached_by_dihedral[transform_index]
     token_list = tokens.tolist() if isinstance(tokens, torch.Tensor) else list(tokens)
-    return token_list, cached_positions
+    return token_list
 
 
 def _sequence_length_for_example(example: object, transform_index: Optional[int]) -> int:
@@ -288,17 +190,16 @@ def _prepare_examples_for_inference(
     color_apply_fn: Optional[Callable[[str], bool]] = None,
     dihedral_transform_indices: Optional[Sequence[Optional[int]]] = None,
     pair_indices: Optional[Sequence[int]] = None,
-) -> Tuple[List[List[int]], List[int], List[Dict[str, object]], List[Optional[torch.Tensor]]]:
+) -> Tuple[List[List[int]], List[int], List[Dict[str, object]]]:
     prompts: List[List[int]] = []
     example_ids: List[int] = []
     metadata: List[Dict[str, object]] = []
-    cached_positions: List[Optional[torch.Tensor]] = []
 
     for idx, ex in enumerate(examples):
         if not hasattr(ex, "tokens"):
             raise ValueError("Examples must provide a 'tokens' attribute.")
         transform_index = dihedral_transform_indices[idx] if dihedral_transform_indices is not None else None
-        raw_tokens, cached = _select_tokens_for_example(ex, transform_index)
+        raw_tokens = _select_tokens_for_example(ex, transform_index)
         split = getattr(ex, "split", None)
         mapping = color_mappings[idx] if color_mappings is not None else None
         should_color = mapping is not None and (color_apply_fn is None or color_apply_fn(split))
@@ -306,10 +207,6 @@ def _prepare_examples_for_inference(
         prompt_tokens = _build_prompt_from_tokens(tokens)
         prompts.append(prompt_tokens)
         example_ids.append(int(getattr(ex, "example_id", 0)))
-        if cached is not None:
-            cached_positions.append(cached[: len(prompt_tokens)])
-        else:
-            cached_positions.append(None)
 
         pair_index = pair_indices[idx] if pair_indices is not None else getattr(ex, "pair_index", None)
         metadata.append({
@@ -319,7 +216,7 @@ def _prepare_examples_for_inference(
             "split": getattr(ex, "split", None),
         })
 
-    return prompts, example_ids, metadata, cached_positions
+    return prompts, example_ids, metadata
 
 
 def _build_generation_results(
@@ -350,7 +247,6 @@ def _run_generation_batch(
     prompts: Sequence[Sequence[int]],
     example_ids: Sequence[int],
     metadata: Sequence[Dict[str, object]],
-    cached_positions: Sequence[Optional[torch.Tensor]],
     device: torch.device,
     max_new_tokens: int,
     temperature: Optional[float] = None,
@@ -358,7 +254,7 @@ def _run_generation_batch(
 ) -> List[Dict[str, object]]:
     sequences = batched_greedy_generate(
         model=model, prompts=prompts, example_ids=example_ids, device=device,
-        max_new_tokens=max_new_tokens, cached_positions=cached_positions,
+        max_new_tokens=max_new_tokens,
         temperature=temperature, top_k=top_k,
     )
     return _build_generation_results(sequences=sequences, metadata=metadata, prompts=prompts)
@@ -510,9 +406,9 @@ def run_split_inference(
                 batch_pair_indices.append(base_pair_index)
 
         if augmentor is None:
-            prompts, example_ids, metadata, cached_positions = _prepare_examples_for_inference(batch_examples)
+            prompts, example_ids, metadata = _prepare_examples_for_inference(batch_examples)
         else:
-            prompts, example_ids, metadata, cached_positions = _prepare_examples_for_inference(
+            prompts, example_ids, metadata = _prepare_examples_for_inference(
                 batch_examples,
                 color_mappings=batch_mappings, color_apply_fn=None,
                 dihedral_transform_indices=batch_transform_indices, pair_indices=batch_pair_indices,
@@ -520,7 +416,7 @@ def run_split_inference(
 
         batch_results = _run_generation_batch(
             model=model, prompts=prompts, example_ids=example_ids, metadata=metadata,
-            cached_positions=cached_positions, device=device, max_new_tokens=max_new_tokens,
+            device=device, max_new_tokens=max_new_tokens,
             temperature=temperature, top_k=top_k,
         )
 

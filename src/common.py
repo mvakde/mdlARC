@@ -551,23 +551,6 @@ class ARCExampleDataset(Dataset):
 
         self.num_examples = len(self.task_id_to_example_id)
 
-        print("Precomputing 3D positions...")
-        for ex in self.examples:
-            if ex.tokens_by_dihedral:
-                cached_positions_by_dihedral: List[torch.Tensor] = []
-                for tokens in ex.tokens_by_dihedral:
-                    fake_batch = tokens.unsqueeze(0)
-                    mask = torch.ones_like(fake_batch, dtype=torch.bool)
-                    pos = compute_positions_3d(fake_batch, mask)
-                    cached_positions_by_dihedral.append(pos.squeeze(0))
-                ex.cached_positions_by_dihedral = cached_positions_by_dihedral
-                ex.cached_positions = cached_positions_by_dihedral[0]
-            else:
-                fake_batch = ex.tokens.unsqueeze(0)
-                mask = torch.ones_like(fake_batch, dtype=torch.bool)
-                pos = compute_positions_3d(fake_batch, mask)
-                ex.cached_positions = pos.squeeze(0)
-
     def __len__(self) -> int:
         return len(self.examples)
 
@@ -666,14 +649,12 @@ def collate_examples(
         Tuple[
             SequenceExample,
             torch.Tensor,
-            Optional[torch.Tensor],
             int,
             Optional[torch.Tensor],
         ]
     ] = []
     for example in batch:
         tokens = example.tokens
-        cached_positions = getattr(example, "cached_positions", None)
         mapping: Optional[torch.Tensor] = None
         transform_index: Optional[int] = None
         if augment_selector is not None:
@@ -686,39 +667,27 @@ def collate_examples(
                         f"Invalid dihedral index {transform_index} for example {example.task_id}."
                     )
                 tokens = tokens_by_dihedral[transform_index]
-                cached_by_dihedral = getattr(example, "cached_positions_by_dihedral", None)
-                if cached_by_dihedral:
-                    cached_positions = cached_by_dihedral[transform_index]
         seq_len = int(tokens.size(0))
-        selected.append((example, tokens, cached_positions, seq_len, mapping))
+        selected.append((example, tokens, seq_len, mapping))
 
     batch_size = len(selected)
-    max_len = max(item[3] for item in selected)
+    max_len = max(item[2] for item in selected)
 
     input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
     example_ids = torch.zeros(batch_size, dtype=torch.long)
-    positions_3d = torch.zeros((batch_size, max_len, 3), dtype=torch.long)
 
-    for idx, (example, tokens, cached_positions, seq_len, mapping) in enumerate(
-        selected
-    ):
+    for idx, (example, tokens, seq_len, mapping) in enumerate(selected):
         if mapping is not None:
             tokens = mapping[tokens]
         input_ids[idx, :seq_len] = tokens
         attention_mask[idx, :seq_len] = True
         example_ids[idx] = example.example_id
-        if cached_positions is None:
-            fake_batch = tokens.unsqueeze(0)
-            mask = torch.ones_like(fake_batch, dtype=torch.bool)
-            cached_positions = compute_positions_3d(fake_batch, mask).squeeze(0)
-        positions_3d[idx, :seq_len] = cached_positions
 
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "example_ids": example_ids,
-        "positions_3d": positions_3d,
         "task_ids": [example.task_id for example in batch],
         "splits": [example.split for example in batch],
         "has_output": [example.has_output for example in batch],

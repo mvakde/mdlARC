@@ -192,7 +192,6 @@ def train_one_epoch(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
-        positions_3d = batch["positions_3d"].to(device)
         if accum_index == 0:
             optimizer.zero_grad(set_to_none=True)
             if dataloader_length is not None:
@@ -208,7 +207,6 @@ def train_one_epoch(
                 input_ids,
                 example_ids,
                 attention_mask=attention_mask,
-                positions_3d=positions_3d,
             )
             loss = outputs["loss"]
             inp_loss = outputs.get("input_loss")
@@ -296,7 +294,6 @@ def validate_one_epoch(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
-        positions_3d = batch["positions_3d"].to(device)
 
         if not any(batch["has_output"]):
             continue
@@ -305,7 +302,6 @@ def validate_one_epoch(
             input_ids,
             example_ids,
             attention_mask=attention_mask,
-            positions_3d=positions_3d,
         )
 
         out_loss = outputs.get("output_loss")

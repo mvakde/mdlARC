@@ -10,7 +10,6 @@ from common import (
     IO_SEPARATOR_TOKEN_ID,
     MAX_SEQ_LEN,
     VOCAB_SIZE,
-    compute_positions_3d,
 )
 
 
@@ -57,15 +56,15 @@ class MultiHeadSelfAttention(nn.Module):
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.dropout_p = config.dropout  # Store float for functional call
 
-        # 3D RoPE setup
-        self.rope = RotaryEmbedding3D(self.head_dim)
+        # 1D RoPE setup (sequence index based)
+        self.rope = RotaryEmbedding1D(self.head_dim, config.max_seq_len)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
-        pos_xyz: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, dim = hidden_states.shape
 
@@ -74,9 +73,9 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         queries, keys, values = qkv.unbind(0)
 
-        if pos_xyz is not None:
-            # pos_xyz: [B, S, 3] (x, y, z)
-            queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
+        if positions is not None:
+            # positions: [B, S] (sequence indices)
+            queries, keys = self.rope.apply_rotary(queries, keys, positions)
 
         # Construct a combined attention bias for SDPA
         # SDPA handles broadcasting, but constructing the mask explicitly ensures
@@ -126,11 +125,11 @@ class MultiHeadSelfAttention(nn.Module):
     def forward_with_cache(
         self,
         hidden_states: torch.Tensor,
-        pos_xyz: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, dim = hidden_states.shape
 
@@ -139,14 +138,8 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         queries, keys, values = qkv.unbind(0)
 
-        if pos_xyz is not None:
-            # Cast to fp32 for rotation precision
-            q_f32 = queries.float()
-            k_f32 = keys.float()
-            q_f32, k_f32 = self.rope.apply_rotary(q_f32, k_f32, pos_xyz)
-            # Cast back to original dtype (e.g. bfloat16) for storage
-            queries = q_f32.to(dtype=hidden_states.dtype)
-            keys = k_f32.to(dtype=hidden_states.dtype)
+        if positions is not None:
+            queries, keys = self.rope.apply_rotary(queries, keys, positions)
 
         # ------------------------------------------------------------------
         # PATH A: DECODE (We have a cache buffer)
@@ -250,14 +243,14 @@ class TransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         causal_mask: torch.Tensor,
-        pos_xyz: Optional[torch.Tensor],
+        positions: Optional[torch.Tensor],
     ) -> torch.Tensor:
         attn_input = self.ln_1(hidden_states)
         attn_output = self.attention(
             attn_input,
             attention_mask=attention_mask,
             causal_mask=causal_mask,
-            pos_xyz=pos_xyz,
+            positions=positions,
         )
         hidden_states = hidden_states + attn_output
 
@@ -269,11 +262,11 @@ class TransformerBlock(nn.Module):
     def forward_with_cache(
         self,
         hidden_states: torch.Tensor,
-        pos_xyz: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         attn_input = self.ln_1(hidden_states)
         # Check if we are in Decode mode or Prompt mode
@@ -282,11 +275,11 @@ class TransformerBlock(nn.Module):
             # Attention returns ONLY tensor
             attn_output = self.attention.forward_with_cache(
                 attn_input,
-                pos_xyz=pos_xyz,
                 attention_mask=attention_mask,
                 causal_mask=causal_mask,
                 past_key_value=past_key_value,
                 cache_position=cache_position,
+                positions=positions,
             )
             present_key_value = None  # No return value needed
         else:
@@ -294,11 +287,11 @@ class TransformerBlock(nn.Module):
             # Attention returns Tensor + KV Tuple
             attn_output, present_key_value = self.attention.forward_with_cache(
                 attn_input,
-                pos_xyz=pos_xyz,
                 attention_mask=attention_mask,
                 causal_mask=causal_mask,
                 past_key_value=None,
                 cache_position=None,
+                positions=positions,
             )
         hidden_states = hidden_states + attn_output
 
@@ -362,13 +355,70 @@ class TinyTransformer(nn.Module):
         )
         return mask[None, None, :, :]
 
+    def _build_positions(
+        self,
+        seq_len: int,
+        device: torch.device,
+        batch_size: int,
+        start_position: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        positions = torch.arange(seq_len, device=device, dtype=torch.long)
+        if start_position is not None:
+            if not torch.is_tensor(start_position):
+                start_position = torch.tensor(start_position, device=device, dtype=torch.long)
+            else:
+                start_position = start_position.to(device=device, dtype=torch.long)
+            if start_position.dim() == 0:
+                start_position = start_position.view(1, 1)
+            elif start_position.dim() == 1:
+                start_position = start_position.view(-1, 1)
+            else:
+                raise ValueError("start_position must be a scalar or 1D tensor.")
+            positions = positions.view(1, -1) + start_position
+            if positions.size(0) == 1 and batch_size > 1:
+                positions = positions.expand(batch_size, -1)
+        else:
+            positions = positions.view(1, -1)
+            if batch_size > 1:
+                positions = positions.expand(batch_size, -1)
+        return positions
+
+    def _prepare_positions(
+        self,
+        positions: Optional[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        start_position: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if positions is None:
+            return self._build_positions(
+                seq_len=seq_len,
+                device=device,
+                batch_size=batch_size,
+                start_position=start_position,
+            )
+
+        if positions.device != device or positions.dtype != torch.long:
+            positions = positions.to(device=device, dtype=torch.long)
+
+        if positions.dim() == 1:
+            positions = positions.unsqueeze(0)
+        if positions.dim() != 2 or positions.size(1) != seq_len:
+            raise ValueError("positions must have shape [batch, seq_len] or [seq_len].")
+        if positions.size(0) == 1 and batch_size > 1:
+            positions = positions.expand(batch_size, -1)
+        if positions.size(0) != batch_size:
+            raise ValueError("positions batch size must match input_ids batch size.")
+        return positions
+
     def forward(
         self,
         input_ids: torch.Tensor,
         example_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         targets: Optional[torch.Tensor] = None,
-        positions_3d: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
     ) -> dict:
         batch_size, seq_len = input_ids.size()
         if seq_len > self.config.max_seq_len:
@@ -383,8 +433,8 @@ class TinyTransformer(nn.Module):
             if attention_mask.device != device or attention_mask.dtype != torch.bool:
                 attention_mask = attention_mask.to(device=device, dtype=torch.bool)
 
-        if positions_3d is not None and positions_3d.shape[:2] != input_ids.shape:
-            raise ValueError("positions_3d must match [batch, seq_len] of input_ids.")
+        if positions is not None and positions.shape[-1] != input_ids.shape[1]:
+            raise ValueError("positions must match seq_len of input_ids.")
 
         if targets is None:
             targets = input_ids
@@ -395,16 +445,18 @@ class TinyTransformer(nn.Module):
         hidden_states = token_embeds + example_embeds.unsqueeze(1)
         hidden_states = self.dropout(hidden_states)
 
-        # Compute or reuse 3D positions per token.
-        if positions_3d is None:
-            pos_xyz = self._compute_positions_3d(input_ids, attention_mask)
-        else:
-            pos_xyz = positions_3d.to(device=device, dtype=torch.long)
+        # Compute or reuse 1D positions (sequence indices).
+        pos_1d = self._prepare_positions(
+            positions=positions,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=device,
+        )
 
         causal_mask = self._build_causal_mask(seq_len, device)
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, attention_mask, causal_mask, pos_xyz)
+            hidden_states = block(hidden_states, attention_mask, causal_mask, pos_1d)
             hidden_states = hidden_states * attention_mask.unsqueeze(-1)
 
         hidden_states = self.norm(hidden_states)
@@ -475,7 +527,7 @@ class TinyTransformer(nn.Module):
         input_ids: torch.Tensor,
         example_ids: torch.Tensor,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
-        positions_3d: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         cache_position: Optional[torch.Tensor] = None,
         example_embeds: Optional[torch.Tensor] = None,
@@ -485,7 +537,7 @@ class TinyTransformer(nn.Module):
         When `past_key_values` is None, the call is treated as a full prompt
         pass and the method returns per-layer key/value tensors that
         represent the entire prefix. When `past_key_values` is provided,
-        `input_ids` and `positions_3d` should contain only the newly
+        `input_ids` and `positions` should contain only the newly
         generated tokens, and the cache is updated accordingly. `attention_mask`
         can be provided to mask padded tokens during the initial prompt pass,
         and to mask cached keys during incremental decoding.
@@ -496,8 +548,8 @@ class TinyTransformer(nn.Module):
                 f"Sequence length {seq_len} exceeds model capacity ({self.config.max_seq_len})."
             )
 
-        if positions_3d is not None and positions_3d.shape[:2] != input_ids.shape:
-            raise ValueError("positions_3d must match [batch, seq_len] of input_ids.")
+        if positions is not None and positions.shape[-1] != input_ids.shape[1]:
+            raise ValueError("positions must match seq_len of input_ids.")
 
         device = input_ids.device
         if attention_mask is not None:
@@ -519,13 +571,11 @@ class TinyTransformer(nn.Module):
         hidden_states = token_embeds + example_embeds.unsqueeze(1)
         # hidden_states = self.dropout(hidden_states)
 
-        pos_xyz = (
-            positions_3d.to(device=device, dtype=torch.long)
-            if positions_3d is not None
-            else None
+        pos_1d = (
+            positions.to(device=device, dtype=torch.long) if positions is not None else None
         )
 
-        # Initial prompt: no cache yet, compute 3D positions and use the
+        # Initial prompt: no cache yet, compute 1D positions and use the
         # exact same masking behavior as the standard forward pass.
         if past_key_values is None:
             if attention_mask is None:
@@ -533,15 +583,19 @@ class TinyTransformer(nn.Module):
                     input_ids, dtype=torch.bool, device=device
                 )
 
-            if pos_xyz is None:
-                pos_xyz = self._compute_positions_3d(input_ids, attention_mask)
+            pos_1d = self._prepare_positions(
+                positions=pos_1d,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                device=device,
+            )
             causal_mask = self._build_causal_mask(seq_len, device)
 
             past_key_values_out: List[Tuple[torch.Tensor, torch.Tensor]] = []
             for block in self.blocks:
                 hidden_states, present_kv = block.forward_with_cache(
                     hidden_states,
-                    pos_xyz,
+                    positions=pos_1d,
                     attention_mask=attention_mask,
                     causal_mask=causal_mask,
                     past_key_value=None,
@@ -552,10 +606,18 @@ class TinyTransformer(nn.Module):
             logits = self.lm_head(hidden_states)
             return {"logits": logits, "past_key_values": tuple(past_key_values_out)}
 
-        if pos_xyz is None:
+        if pos_1d is None and cache_position is None:
             raise ValueError(
-                "positions_3d must be provided when using past_key_values."
+                "cache_position must be provided when using past_key_values without explicit positions."
             )
+
+        pos_1d = self._prepare_positions(
+            positions=pos_1d,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=device,
+            start_position=cache_position,
+        )
 
         # We iterate by index to access the specific layer's static buffer in past_key_values
         for i, block in enumerate(self.blocks):
@@ -565,10 +627,10 @@ class TinyTransformer(nn.Module):
             #    TransformerBlock.forward_with_cache no longer returns it in this mode.
             hidden_states = block.forward_with_cache(
                 hidden_states,
-                pos_xyz,
                 attention_mask=attention_mask,
                 past_key_value=past_key_values[i],
                 cache_position=cache_position,
+                positions=pos_1d,
             )
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
@@ -577,128 +639,55 @@ class TinyTransformer(nn.Module):
         # The cache update is done, and we don't need to pass it back.
         return {"logits": logits}
 
-    # ------------------------ 3D RoPE utilities ------------------------
-    def _compute_positions_3d(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """Compute 3D positions on CPU, then move them to the target device."""
-        pos_cpu = compute_positions_3d(
-            input_ids=input_ids.detach().cpu(),
-            attention_mask=attention_mask.detach().cpu(),
-        )
-        return pos_cpu.to(device=input_ids.device, dtype=torch.long)
+class RotaryEmbedding1D(nn.Module):
+    """1D Rotary Positional Embedding applied to Q/K using precomputed lookups."""
 
-
-class RotaryEmbedding3D(nn.Module):
-    """3D Rotary Positional Embedding applied to Q/K using precomputed lookups.
-
-    Splits head_dim into three even slices (x,y,z). Precomputes cos/sin tables
-    for fixed coordinate ranges (x:0-32, y:0-32, z:0-8) to speed up inference.
-    """
-
-    def __init__(self, head_dim: int, base: float = 10000.0) -> None:
+    def __init__(
+        self, head_dim: int, max_position: int, base: float = 10000.0
+    ) -> None:
         super().__init__()
         if head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE.")
+        if max_position <= 0:
+            raise ValueError("max_position must be positive.")
         self.head_dim = head_dim
         self.base = base
+        self.max_position = max_position
 
-        # Distribute pairs across 3 axes as evenly as possible
-        n_pairs = head_dim // 2
-        px = n_pairs // 3
-        py = n_pairs // 3
-        pz = n_pairs - px - py
-        self.d_x = px * 2
-        self.d_y = py * 2
-        self.d_z = pz * 2
-
-        # Define bounds based on grid constraints (30x30 max, 5 z-levels).
-        # Using slightly higher powers-of-2-ish bounds for safety.
-        self.max_x = 32
-        self.max_y = 32
-        self.max_z = 8
-
-        # Precompute and register caches
-        self._register_cache("x", self.d_x, self.max_x)
-        self._register_cache("y", self.d_y, self.max_y)
-        self._register_cache("z", self.d_z, self.max_z)
-
-    def _build_inv_freq(self, dim: int) -> torch.Tensor:
-        if dim <= 0:
-            return torch.empty(0)
-        return 1.0 / (self.base ** (torch.arange(0, dim, 2).float() / dim))
-
-    def _register_cache(self, name: str, dim: int, max_pos: int) -> None:
-        if dim <= 0:
-            # Empty buffers for unused dimensions (keeps state_dict clean)
-            self.register_buffer(f"cos_{name}_cache", torch.empty(0), persistent=False)
-            self.register_buffer(f"sin_{name}_cache", torch.empty(0), persistent=False)
-            return
-
-        inv_freq = self._build_inv_freq(dim)
-        # Generate all possible positions [0, 1, ... max_pos-1]
-        pos = torch.arange(max_pos).float()
-
-        # Outer product: [max_pos, dim/2]
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        pos = torch.arange(self.max_position).float()
         t = pos.unsqueeze(-1) * inv_freq
 
-        # Compute cos/sin and repeat_interleave to match [max_pos, dim]
-        # We do the interleave here once, so we don't do it at every forward step.
         cos = torch.cos(t).repeat_interleave(2, dim=-1)
         sin = torch.sin(t).repeat_interleave(2, dim=-1)
 
-        self.register_buffer(f"cos_{name}_cache", cos, persistent=False)
-        self.register_buffer(f"sin_{name}_cache", sin, persistent=False)
+        self.register_buffer("cos_cache", cos, persistent=False)
+        self.register_buffer("sin_cache", sin, persistent=False)
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        # pairwise rotate: (x0,x1,x2,x3,...) -> (-x1, x0, -x3, x2, ...)
         x1 = x[..., ::2]
         x2 = x[..., 1::2]
         out = torch.stack((-x2, x1), dim=-1)
         return out.flatten(-2)
 
     def apply_rotary(
-        self, q: torch.Tensor, k: torch.Tensor, pos_xyz: torch.Tensor
+        self, q: torch.Tensor, k: torch.Tensor, positions: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply 3D RoPE to the first d_x, d_y, d_z channels respectively.
+        """Apply 1D RoPE using sequence indices.
 
         q, k: [B, H, S, D]
-        pos_xyz: [B, S, 3] with integer coordinates (x, y, z)
+        positions: [B, S] or [S]
         """
-        # B, H, S, D = q.shape
-        # assert D == self.head_dim
+        if positions.dim() == 1:
+            positions = positions.unsqueeze(0)
+        if positions.dim() != 2:
+            raise ValueError("positions must have shape [batch, seq_len] or [seq_len].")
 
-        # Ensure indices are within bounds (clamping protects against out-of-bounds crash)
-        # pos_xyz is expected to be LongTensor suitable for indexing.
-        pos_x = pos_xyz[..., 0].clamp(0, self.max_x - 1)
-        pos_y = pos_xyz[..., 1].clamp(0, self.max_y - 1)
-        pos_z = pos_xyz[..., 2].clamp(0, self.max_z - 1)
+        pos = positions.clamp(0, self.max_position - 1)
+        cos = self.cos_cache[pos].to(dtype=q.dtype).unsqueeze(1)
+        sin = self.sin_cache[pos].to(dtype=q.dtype).unsqueeze(1)
 
-        parts_cos = []
-        parts_sin = []
-
-        # Gather cached Cos/Sin tables based on positions.
-        # Note: self.cos_x_cache is [MaxPos, dx] -> Gather creates [B, S, dx]
-        if self.d_x > 0:
-            parts_cos.append(self.cos_x_cache[pos_x])
-            parts_sin.append(self.sin_x_cache[pos_x])
-
-        if self.d_y > 0:
-            parts_cos.append(self.cos_y_cache[pos_y])
-            parts_sin.append(self.sin_y_cache[pos_y])
-
-        if self.d_z > 0:
-            parts_cos.append(self.cos_z_cache[pos_z])
-            parts_sin.append(self.sin_z_cache[pos_z])
-
-        # Concatenate tables to form the full [B, S, D] embedding mask.
-        # This 'cat' is on non-gradient tensors, which is cheap in the backward pass.
-        cos = torch.cat(parts_cos, dim=-1).unsqueeze(1)  # [B, 1, S, D]
-        sin = torch.cat(parts_sin, dim=-1).unsqueeze(1)  # [B, 1, S, D]
-
-        # Apply standard RoPE arithmetic on the full tensors.
-        # This keeps q and k contiguous and avoids slicing activations.
         q_out = (q * cos) + (self._rotate_half(q) * sin)
         k_out = (k * cos) + (self._rotate_half(k) * sin)
 
