@@ -39,22 +39,6 @@ def load_checkpoint(checkpoint_path: Optional[Path]) -> Optional[Dict[str, Any]]
     return checkpoint
 
 
-def infer_num_examples_from_checkpoint(
-    checkpoint: Optional[Dict[str, Any]],
-) -> Optional[int]:
-    """Extract the number of examples from checkpoint metadata."""
-    if not checkpoint:
-        return None
-    config = checkpoint.get("config")
-    if config and "num_examples" in config:
-        return int(config["num_examples"])
-    state_dict = checkpoint.get("model_state", {})
-    weight = state_dict.get("example_embedding.weight")
-    if weight is not None:
-        return int(weight.shape[0])
-    return None
-
-
 # =============================================================================
 # Build Model and Data
 # =============================================================================
@@ -86,8 +70,6 @@ def build_model_and_data(
                 "their source dataset. Please re-run with the same dataset used for training."
             )
     data_path = Path(data_path)
-
-    checkpoint_num_examples = infer_num_examples_from_checkpoint(checkpoint)
 
     task_whitelist = None
     if checkpoint and "task_ids" in checkpoint:
@@ -136,27 +118,17 @@ def build_model_and_data(
     if augmentor is not None:
         dataloader.augmentor = augmentor
 
-    if (
-        checkpoint_num_examples is not None
-        and dataset.num_examples != checkpoint_num_examples
-    ):
-        raise ValueError(
-            "Dataset task-count mismatch: "
-            f"checkpoint was trained with {checkpoint_num_examples} unique examples but the provided dataset "
-            f"currently exposes {dataset.num_examples}. Pass the original --data-path or retrain."
-        )
-
     if checkpoint and "config" in checkpoint:
-        config = TinyTransformerConfig(**checkpoint["config"])
+        config_data = dict(checkpoint["config"])
+        config_data.pop("num_examples", None)
+        config = TinyTransformerConfig(**config_data)
     else:
-        num_examples = checkpoint_num_examples or max(1, dataset.num_examples)
         d_model = getattr(args, "d_model", 128)
         n_heads = getattr(args, "n_heads", 4)
         d_ff = getattr(args, "d_ff", 512)
         n_layers = getattr(args, "n_layers", 4)
         dropout = getattr(args, "dropout", 0.1)
         config = TinyTransformerConfig(
-            num_examples=num_examples,
             d_model=d_model,
             n_heads=n_heads,
             d_ff=d_ff,
@@ -164,16 +136,14 @@ def build_model_and_data(
             dropout=dropout,
         )
 
-    if dataset.num_examples != config.num_examples:
-        raise ValueError(
-            f"Dataset provides {dataset.num_examples} examples but model expects "
-            f"{config.num_examples}. Please ensure the dataset/task whitelist matches the checkpoint."
-        )
-
     model = TinyTransformer(config).to(device)
 
     if checkpoint:
-        state_dict = checkpoint["model_state"]
+        state_dict = {
+            k: v
+            for k, v in checkpoint["model_state"].items()
+            if not k.startswith("example_embedding.")
+        }
         model.load_state_dict(state_dict, strict=False)
         restore_rng_state(checkpoint.get("rng_state"), device)
 

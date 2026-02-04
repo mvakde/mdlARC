@@ -165,14 +165,13 @@ def _derive_initial_state_from_prompt(input_ids: torch.Tensor, positions_3d: tor
 
 @torch.inference_mode()
 def batched_greedy_generate(
-    model, prompts, example_ids, device, max_new_tokens=931,
+    model, prompts, device, max_new_tokens=931,
     cached_positions=None, temperature: Optional[float] = None, top_k: Optional[int] = None,
 ):
     model.eval()
     model.to(dtype=torch.bfloat16)
     batch_size = len(prompts)
 
-    example_ids_tensor = torch.tensor(example_ids, dtype=torch.long, device=device)
     input_ids, attention_mask = _left_pad_sequences(prompts, END_TOKEN_ID, device)
     current_len = input_ids.size(1)
     batch_max_needed = current_len + max_new_tokens
@@ -186,15 +185,16 @@ def batched_greedy_generate(
 
     initial_state, finished = _derive_initial_state_from_prompt(input_ids, prompt_positions)
     grid_state = BatchGridState(initial_state)
-    example_embeds = model.example_embedding(example_ids_tensor).to(dtype=torch.bfloat16)
     current_len = input_ids.size(1)
 
     full_attention_mask = torch.zeros((batch_size, max_model_len), dtype=torch.bool, device=device)
     full_attention_mask[:, :current_len] = attention_mask
 
     outputs = model.forward_generate(
-        input_ids=input_ids, example_ids=example_ids_tensor, past_key_values=None,
-        positions_3d=prompt_positions, attention_mask=attention_mask, example_embeds=example_embeds,
+        input_ids=input_ids,
+        past_key_values=None,
+        positions_3d=prompt_positions,
+        attention_mask=attention_mask,
     )
     logits = outputs["logits"]
     prompt_kvs = outputs["past_key_values"]
@@ -228,9 +228,11 @@ def batched_greedy_generate(
         token_positions = grid_state.update(next_token).unsqueeze(1)
         full_attention_mask.index_fill_(1, cache_position, True)
         outputs = model._compiled_decode(
-            input_ids=next_token.unsqueeze(1), example_ids=example_ids_tensor,
-            past_key_values=past_key_values, positions_3d=token_positions,
-            attention_mask=full_attention_mask, cache_position=cache_position, example_embeds=example_embeds,
+            input_ids=next_token.unsqueeze(1),
+            past_key_values=past_key_values,
+            positions_3d=token_positions,
+            attention_mask=full_attention_mask,
+            cache_position=cache_position,
         )
         logits = outputs["logits"]
         cache_position.add_(1)
@@ -288,9 +290,8 @@ def _prepare_examples_for_inference(
     color_apply_fn: Optional[Callable[[str], bool]] = None,
     dihedral_transform_indices: Optional[Sequence[Optional[int]]] = None,
     pair_indices: Optional[Sequence[int]] = None,
-) -> Tuple[List[List[int]], List[int], List[Dict[str, object]], List[Optional[torch.Tensor]]]:
+) -> Tuple[List[List[int]], List[Dict[str, object]], List[Optional[torch.Tensor]]]:
     prompts: List[List[int]] = []
-    example_ids: List[int] = []
     metadata: List[Dict[str, object]] = []
     cached_positions: List[Optional[torch.Tensor]] = []
 
@@ -305,7 +306,6 @@ def _prepare_examples_for_inference(
         tokens = apply_color_permutation_to_tokens(raw_tokens, mapping) if should_color else raw_tokens
         prompt_tokens = _build_prompt_from_tokens(tokens)
         prompts.append(prompt_tokens)
-        example_ids.append(int(getattr(ex, "example_id", 0)))
         if cached is not None:
             cached_positions.append(cached[: len(prompt_tokens)])
         else:
@@ -315,11 +315,10 @@ def _prepare_examples_for_inference(
         metadata.append({
             "task_id": getattr(ex, "task_id", None),
             "pair_index": pair_index,
-            "example_id": getattr(ex, "example_id", None),
             "split": getattr(ex, "split", None),
         })
 
-    return prompts, example_ids, metadata, cached_positions
+    return prompts, metadata, cached_positions
 
 
 def _build_generation_results(
@@ -334,7 +333,6 @@ def _build_generation_results(
         result = {
             "task_id": meta.get("task_id"),
             "pair_index": meta.get("pair_index"),
-            "example_id": meta.get("example_id"),
             "split": meta.get("split"),
             "prompt_tokens": list(prompt),
             "sequence": list(seq),
@@ -348,7 +346,6 @@ def _build_generation_results(
 def _run_generation_batch(
     model: TinyTransformer,
     prompts: Sequence[Sequence[int]],
-    example_ids: Sequence[int],
     metadata: Sequence[Dict[str, object]],
     cached_positions: Sequence[Optional[torch.Tensor]],
     device: torch.device,
@@ -357,7 +354,7 @@ def _run_generation_batch(
     top_k: Optional[int] = None,
 ) -> List[Dict[str, object]]:
     sequences = batched_greedy_generate(
-        model=model, prompts=prompts, example_ids=example_ids, device=device,
+        model=model, prompts=prompts, device=device,
         max_new_tokens=max_new_tokens, cached_positions=cached_positions,
         temperature=temperature, top_k=top_k,
     )
@@ -510,16 +507,18 @@ def run_split_inference(
                 batch_pair_indices.append(base_pair_index)
 
         if augmentor is None:
-            prompts, example_ids, metadata, cached_positions = _prepare_examples_for_inference(batch_examples)
+            prompts, metadata, cached_positions = _prepare_examples_for_inference(batch_examples)
         else:
-            prompts, example_ids, metadata, cached_positions = _prepare_examples_for_inference(
+            prompts, metadata, cached_positions = _prepare_examples_for_inference(
                 batch_examples,
-                color_mappings=batch_mappings, color_apply_fn=None,
-                dihedral_transform_indices=batch_transform_indices, pair_indices=batch_pair_indices,
+                color_mappings=batch_mappings,
+                color_apply_fn=None,
+                dihedral_transform_indices=batch_transform_indices,
+                pair_indices=batch_pair_indices,
             )
 
         batch_results = _run_generation_batch(
-            model=model, prompts=prompts, example_ids=example_ids, metadata=metadata,
+            model=model, prompts=prompts, metadata=metadata,
             cached_positions=cached_positions, device=device, max_new_tokens=max_new_tokens,
             temperature=temperature, top_k=top_k,
         )

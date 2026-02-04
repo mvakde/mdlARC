@@ -417,7 +417,6 @@ def compute_positions_3d(
 @dataclass
 class SequenceExample:
     tokens: torch.LongTensor
-    example_id: int
     task_id: str
     split: str
     pair_index: int
@@ -472,14 +471,12 @@ class ARCExampleDataset(Dataset):
             task_ids = sorted(challenges.keys())
 
         self.examples: List[SequenceExample] = []
-        self.task_id_to_example_id: Dict[str, int] = {}
         self.indices_by_split: Dict[str, List[int]] = {split: [] for split in splits}
         self.task_ids = task_ids
         self.sequence_lengths: List[int] = []
         self.task_input_colors: Dict[str, List[int]] = {}
 
-        for example_id, task_id in enumerate(task_ids):
-            self.task_id_to_example_id[task_id] = example_id
+        for task_id in task_ids:
             task = challenges[task_id]
             self.task_input_colors[task_id] = extract_task_input_colors(task)
             for split in splits:
@@ -534,7 +531,6 @@ class ARCExampleDataset(Dataset):
                     seq_len = seq_len_by_dihedral[0]
                     example = SequenceExample(
                         tokens=tensor,
-                        example_id=example_id,
                         task_id=task_id,
                         split=split,
                         pair_index=pair_index,
@@ -548,8 +544,6 @@ class ARCExampleDataset(Dataset):
                     )
                     self.examples.append(example)
                     self.sequence_lengths.append(max(seq_len_by_dihedral))
-
-        self.num_examples = len(self.task_id_to_example_id)
 
         print("Precomputing 3D positions...")
         for ex in self.examples:
@@ -573,9 +567,6 @@ class ARCExampleDataset(Dataset):
 
     def __getitem__(self, idx: int) -> SequenceExample:
         return self.examples[idx]
-
-    def get_task_example_id(self, task_id: str) -> int:
-        return self.task_id_to_example_id[task_id]
 
     def iter_examples(
         self, split: Optional[str] = None, has_output: Optional[bool] = None
@@ -697,7 +688,6 @@ def collate_examples(
 
     input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool)
-    example_ids = torch.zeros(batch_size, dtype=torch.long)
     positions_3d = torch.zeros((batch_size, max_len, 3), dtype=torch.long)
 
     for idx, (example, tokens, cached_positions, seq_len, mapping) in enumerate(
@@ -707,7 +697,6 @@ def collate_examples(
             tokens = mapping[tokens]
         input_ids[idx, :seq_len] = tokens
         attention_mask[idx, :seq_len] = True
-        example_ids[idx] = example.example_id
         if cached_positions is None:
             fake_batch = tokens.unsqueeze(0)
             mask = torch.ones_like(fake_batch, dtype=torch.bool)
@@ -717,7 +706,6 @@ def collate_examples(
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
-        "example_ids": example_ids,
         "positions_3d": positions_3d,
         "task_ids": [example.task_id for example in batch],
         "splits": [example.split for example in batch],

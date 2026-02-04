@@ -52,7 +52,6 @@ args_dict = {
     "weight_decay": 0.1,
     "attention_weight_decay": 0.01,
     "token_embedding_weight_decay": 0.01,
-    "task_embedding_weight_decay": 0.01,
 
     "grad_clip": 1.0,
     "dropout": 0.1,

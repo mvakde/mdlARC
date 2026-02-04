@@ -23,15 +23,12 @@ class TinyTransformerConfig:
     d_ff: int = 512
     n_layers: int = 4
     dropout: float = 0.1
-    num_examples: int = 1280
 
     def __post_init__(self) -> None:
         if self.d_model % self.n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads.")
         if self.n_layers < 1:
             raise ValueError("n_layers must be >= 1.")
-        if self.num_examples < 1:
-            raise ValueError("num_examples must be >= 1.")
 
 
 class RMSNorm(nn.Module):
@@ -337,7 +334,6 @@ class TinyTransformer(nn.Module):
         self.config = config
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.example_embedding = nn.Embedding(config.num_examples, config.d_model)
         self.dropout = nn.Dropout(config.dropout)
 
         self.blocks = nn.ModuleList(
@@ -365,7 +361,6 @@ class TinyTransformer(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        example_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         targets: Optional[torch.Tensor] = None,
         positions_3d: Optional[torch.Tensor] = None,
@@ -390,9 +385,7 @@ class TinyTransformer(nn.Module):
             targets = input_ids
 
         token_embeds = self.token_embedding(input_ids)
-        example_embeds = self.example_embedding(example_ids)  # [B, D]
-        # Add the per-example embedding to every token in the sequence.
-        hidden_states = token_embeds + example_embeds.unsqueeze(1)
+        hidden_states = token_embeds
         hidden_states = self.dropout(hidden_states)
 
         # Compute or reuse 3D positions per token.
@@ -473,12 +466,10 @@ class TinyTransformer(nn.Module):
     def forward_generate(
         self,
         input_ids: torch.Tensor,
-        example_ids: torch.Tensor,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
         positions_3d: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         cache_position: Optional[torch.Tensor] = None,
-        example_embeds: Optional[torch.Tensor] = None,
     ) -> dict:
         """Forward used for autoregressive generation with a KV cache.
 
@@ -504,19 +495,9 @@ class TinyTransformer(nn.Module):
             if attention_mask.device != device or attention_mask.dtype != torch.bool:
                 attention_mask = attention_mask.to(device=device, dtype=torch.bool)
 
-        if example_embeds is not None:
-            if example_embeds.shape[0] != input_ids.size(0):
-                raise ValueError(
-                    "example_embeds must have batch dimension matching input_ids."
-                )
-        else:
-            example_embeds = self.example_embedding(example_ids)
-
         token_embeds = self.token_embedding(input_ids)
 
-        # During generation, also broadcast the example embedding across
-        # all tokens in the (prompt or incremental) sequence.
-        hidden_states = token_embeds + example_embeds.unsqueeze(1)
+        hidden_states = token_embeds
         # hidden_states = self.dropout(hidden_states)
 
         pos_xyz = (

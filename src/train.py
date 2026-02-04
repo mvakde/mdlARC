@@ -191,7 +191,6 @@ def train_one_epoch(
         step += 1
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        example_ids = batch["example_ids"].to(device)
         positions_3d = batch["positions_3d"].to(device)
         if accum_index == 0:
             optimizer.zero_grad(set_to_none=True)
@@ -206,7 +205,6 @@ def train_one_epoch(
         ):
             outputs = model(
                 input_ids,
-                example_ids,
                 attention_mask=attention_mask,
                 positions_3d=positions_3d,
             )
@@ -295,7 +293,6 @@ def validate_one_epoch(
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        example_ids = batch["example_ids"].to(device)
         positions_3d = batch["positions_3d"].to(device)
 
         if not any(batch["has_output"]):
@@ -303,7 +300,6 @@ def validate_one_epoch(
 
         outputs = model(
             input_ids,
-            example_ids,
             attention_mask=attention_mask,
             positions_3d=positions_3d,
         )
@@ -383,7 +379,6 @@ def _collect_param_groups(
         "decay": [],
         "attention": [],
         "token_embed": [],
-        "task_embed": [],
         "no_decay": [],
         "muon": [],
         "muon_attention": [],
@@ -415,8 +410,6 @@ def _collect_param_groups(
         if isinstance(module, nn.Embedding):
             if name.startswith("token_embedding."):
                 groups["token_embed"].append(param)
-            elif name.startswith("example_embedding."):
-                groups["task_embed"].append(param)
             else:
                 groups["no_decay"].append(param)
             continue
@@ -438,7 +431,6 @@ def _build_param_groups(
     weight_decay: float,
     attention_weight_decay: float,
     token_embedding_weight_decay: float,
-    task_embedding_weight_decay: float,
 ) -> Tuple[Sequence[Dict[str, Any]], Sequence[Dict[str, Any]]]:
     """Split params for Muon (linear weights only) and AdamW (everything else)."""
     groups = _collect_param_groups(model, include_muon=True)
@@ -466,13 +458,6 @@ def _build_param_groups(
             {
                 "params": groups["token_embed"],
                 "weight_decay": token_embedding_weight_decay,
-            }
-        )
-    if groups["task_embed"]:
-        adamw_groups.append(
-            {
-                "params": groups["task_embed"],
-                "weight_decay": task_embedding_weight_decay,
             }
         )
     if groups["no_decay"]:
@@ -644,7 +629,6 @@ def _build_optimizer(
     device: torch.device,
     attention_weight_decay: float,
     token_embedding_weight_decay: float,
-    task_embedding_weight_decay: float,
 ) -> torch.optim.Optimizer:
     optimizer_name = str(getattr(args, "optimizer", "adamw")).lower()
     use_fused = device.type == "cuda"
@@ -654,7 +638,6 @@ def _build_optimizer(
         args.weight_decay,
         attention_weight_decay,
         token_embedding_weight_decay,
-        task_embedding_weight_decay,
     )
 
     if optimizer_name not in {"normuon"}:
@@ -832,15 +815,12 @@ def train_model(
 
     attention_weight_decay = getattr(args, "attention_weight_decay", args.weight_decay)
     token_embedding_weight_decay = getattr(args, "token_embedding_weight_decay", 0.0)
-    task_embedding_weight_decay = getattr(args, "task_embedding_weight_decay", 0.0)
-
     optimizer = _build_optimizer(
         args,
         model,
         device,
         attention_weight_decay,
         token_embedding_weight_decay,
-        task_embedding_weight_decay,
     )
     desired_optimizer_hparams = _param_groups_snapshot(optimizer.param_groups)
 
