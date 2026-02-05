@@ -19,6 +19,7 @@ from build import build_model_and_data
 from common import (
     Augmentor,
     Augments,
+    ARCExampleDataset,
     END_TOKEN_ID,
     IO_SEPARATOR_TOKEN_ID,
     NEXT_LINE_TOKEN_ID,
@@ -177,7 +178,10 @@ def batched_greedy_generate(
     current_len = input_ids.size(1)
     batch_max_needed = current_len + max_new_tokens
     batch_max_needed = (batch_max_needed + 127) // 128 * 128
-    max_model_len = min(batch_max_needed, model.config.max_seq_len)
+    if getattr(model, "_force_full_seq_len", False):
+        max_model_len = model.config.max_seq_len
+    else:
+        max_model_len = min(batch_max_needed, model.config.max_seq_len)
 
     if cached_positions and all(p is not None for p in cached_positions):
         prompt_positions = _pad_cached_positions([p for p in cached_positions if p is not None], input_ids.size(1), device)
@@ -706,11 +710,14 @@ def run_evaluation(
     run_name: str,
     max_augments: int,
     data_path: Path,
-    checkpoint_path: Path,
+    checkpoint_path: Optional[Path] = None,
     batch_size: int = 1300,
     splits: Sequence[str] = ("test",),
     task_ids: Optional[Sequence[str]] = None,
     timing_path: Path = Path("runs/timing.txt"),
+    model: Optional[TinyTransformer] = None,
+    dataset: Optional[ARCExampleDataset] = None,
+    device: Optional[torch.device] = None,
 ) -> Tuple[str, Dict[str, Dict[str, object]], Path]:
     """Run evaluation on a single configuration, generating submission.json.
 
@@ -732,7 +739,8 @@ def run_evaluation(
     timing_path = Path(timing_path)
     timing_path.parent.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path is not None:
+        checkpoint_path = Path(checkpoint_path)
     data_path = Path(data_path)
     t_start = perf_counter()
 
@@ -758,10 +766,21 @@ def run_evaluation(
     if use_aug:
         cfg.max_augments = int(max_augments)
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-
-    print("Building model and dataloader...")
-    model, dataset, _, device, _ = build_model_and_data(cfg, checkpoint=checkpoint)
+    if model is None:
+        if checkpoint_path is None:
+            raise ValueError("checkpoint_path is required when no model is provided.")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        print("Building model and dataloader...")
+        model, dataset, _, device, _ = build_model_and_data(cfg, checkpoint=checkpoint)
+    else:
+        if dataset is None:
+            dataset = ARCExampleDataset(
+                json_path=data_path,
+                splits=("train", "test"),
+                include_outputs=True,
+            )
+        if device is None:
+            device = next(model.parameters()).device
 
     def log_eval(msg: str) -> None:
         print(msg)

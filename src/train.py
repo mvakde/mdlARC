@@ -986,10 +986,13 @@ def train_model(
         else:
             scheduler.step(float(start_epoch))
 
-    # Compile model for training speedup
+    # Compile model for training speedup (reuse compiled model if available)
     if hasattr(torch, "compile") and device.type == "cuda":
-        print("Compiling model for training speedup...")
-        training_model = torch.compile(model)
+        training_model = getattr(model, "_compiled_training", None)
+        if training_model is None:
+            print("Compiling model for training speedup...")
+            training_model = torch.compile(model)
+            model._compiled_training = training_model
     else:
         training_model = model
 
