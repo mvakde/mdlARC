@@ -144,7 +144,7 @@ class MultiHeadSelfAttention(nn.Module):
             q_f32 = queries.float()
             k_f32 = keys.float()
             q_f32, k_f32 = self.rope.apply_rotary(q_f32, k_f32, pos_xyz)
-            # Cast back to original dtype (e.g. bfloat16) for storage
+            # Cast back to original dtype for storage
             queries = q_f32.to(dtype=hidden_states.dtype)
             keys = k_f32.to(dtype=hidden_states.dtype)
 

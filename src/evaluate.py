@@ -169,7 +169,7 @@ def batched_greedy_generate(
     cached_positions=None, temperature: Optional[float] = None, top_k: Optional[int] = None,
 ):
     model.eval()
-    model.to(dtype=torch.bfloat16)
+    model.to(dtype=torch.float32)
     batch_size = len(prompts)
 
     example_ids_tensor = torch.tensor(example_ids, dtype=torch.long, device=device)
@@ -186,7 +186,7 @@ def batched_greedy_generate(
 
     initial_state, finished = _derive_initial_state_from_prompt(input_ids, prompt_positions)
     grid_state = BatchGridState(initial_state)
-    example_embeds = model.example_embedding(example_ids_tensor).to(dtype=torch.bfloat16)
+    example_embeds = model.example_embedding(example_ids_tensor).to(dtype=torch.float32)
     current_len = input_ids.size(1)
 
     full_attention_mask = torch.zeros((batch_size, max_model_len), dtype=torch.bool, device=device)
@@ -202,8 +202,8 @@ def batched_greedy_generate(
     past_key_values = []
     for k, v in prompt_kvs:
         B, H, L, D = k.shape
-        k_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.bfloat16, device=device)
-        v_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.bfloat16, device=device)
+        k_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.float32, device=device)
+        v_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.float32, device=device)
         k_buf[:, :, :L, :] = k
         v_buf[:, :, :L, :] = v
         past_key_values.append((k_buf, v_buf))

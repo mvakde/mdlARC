@@ -773,6 +773,7 @@ def resolve_device(device_str: str) -> torch.device:
         raise ValueError("Only CUDA is supported. Set device='cuda'.")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required but not available.")
+    torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     return torch.device(device_str)

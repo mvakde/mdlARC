@@ -33,7 +33,7 @@ def _zeropower_via_newtonschulz5(G, steps=5):
     """Newton-Schulz iteration to compute the zeroth power / orthogonalization of G."""
     assert G.ndim >= 2
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
+    X = G.float()
     if G.size(-2) > G.size(-1):
         X = X.mT
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
@@ -173,8 +173,6 @@ def train_one_epoch(
     total_loss = 0.0
     total_input_loss = 0.0
     total_output_loss = 0.0
-    use_amp = device.type == "cuda"
-
     if steps_per_epoch is None:
         steps_per_epoch = len(dataloader)
     if steps_per_epoch is not None and steps_per_epoch <= 0:
@@ -201,9 +199,7 @@ def train_one_epoch(
             else:
                 accum_target = accum_steps
 
-        with torch.autocast(
-            device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
-        ):
+        with torch.autocast(device_type=device.type, enabled=False):
             outputs = model(
                 input_ids,
                 example_ids,
@@ -370,9 +366,9 @@ def _is_muon_candidate(
 def _normuon_supported(device: torch.device) -> Tuple[bool, str]:
     if device.type != "cuda":
         return False, "NorMuon requires CUDA."
-    bf16_supported = getattr(torch.cuda, "is_bf16_supported", None)
-    if callable(bf16_supported) and not bf16_supported():
-        return False, "NorMuon requires CUDA bfloat16 support"
+    tf32_supported = getattr(torch.cuda, "is_tf32_supported", None)
+    if callable(tf32_supported) and not tf32_supported():
+        return False, "NorMuon requires CUDA TF32 support"
     return True, ""
 
 
