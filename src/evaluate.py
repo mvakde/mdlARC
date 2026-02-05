@@ -170,7 +170,7 @@ def batched_greedy_generate(
     cached_positions=None, temperature: Optional[float] = None, top_k: Optional[int] = None,
 ):
     model.eval()
-    model.to(dtype=torch.bfloat16)
+    use_amp = device.type == "cuda"
     batch_size = len(prompts)
 
     example_ids_tensor = torch.tensor(example_ids, dtype=torch.long, device=device)
@@ -190,24 +190,25 @@ def batched_greedy_generate(
 
     initial_state, finished = _derive_initial_state_from_prompt(input_ids, prompt_positions)
     grid_state = BatchGridState(initial_state)
-    example_embeds = model.example_embedding(example_ids_tensor).to(dtype=torch.bfloat16)
+    example_embeds = model.example_embedding(example_ids_tensor)
     current_len = input_ids.size(1)
 
     full_attention_mask = torch.zeros((batch_size, max_model_len), dtype=torch.bool, device=device)
     full_attention_mask[:, :current_len] = attention_mask
 
-    outputs = model.forward_generate(
-        input_ids=input_ids, example_ids=example_ids_tensor, past_key_values=None,
-        positions_3d=prompt_positions, attention_mask=attention_mask, example_embeds=example_embeds,
-    )
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+        outputs = model.forward_generate(
+            input_ids=input_ids, example_ids=example_ids_tensor, past_key_values=None,
+            positions_3d=prompt_positions, attention_mask=attention_mask, example_embeds=example_embeds,
+        )
     logits = outputs["logits"]
     prompt_kvs = outputs["past_key_values"]
 
     past_key_values = []
     for k, v in prompt_kvs:
         B, H, L, D = k.shape
-        k_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.bfloat16, device=device)
-        v_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.bfloat16, device=device)
+        k_buf = torch.zeros((B, H, max_model_len, D), dtype=k.dtype, device=device)
+        v_buf = torch.zeros((B, H, max_model_len, D), dtype=v.dtype, device=device)
         k_buf[:, :, :L, :] = k
         v_buf[:, :, :L, :] = v
         past_key_values.append((k_buf, v_buf))
@@ -231,11 +232,12 @@ def batched_greedy_generate(
         finished = finished | (next_token == END_TOKEN_ID)
         token_positions = grid_state.update(next_token).unsqueeze(1)
         full_attention_mask.index_fill_(1, cache_position, True)
-        outputs = model._compiled_decode(
-            input_ids=next_token.unsqueeze(1), example_ids=example_ids_tensor,
-            past_key_values=past_key_values, positions_3d=token_positions,
-            attention_mask=full_attention_mask, cache_position=cache_position, example_embeds=example_embeds,
-        )
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+            outputs = model._compiled_decode(
+                input_ids=next_token.unsqueeze(1), example_ids=example_ids_tensor,
+                past_key_values=past_key_values, positions_3d=token_positions,
+                attention_mask=full_attention_mask, cache_position=cache_position, example_embeds=example_embeds,
+            )
         logits = outputs["logits"]
         cache_position.add_(1)
 
