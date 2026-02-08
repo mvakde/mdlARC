@@ -191,6 +191,10 @@ def train_one_epoch(
         step += 1
         has_padding = bool(batch.get("has_padding", True))
         input_ids = batch["input_ids"].to(device)
+        sep_indices_cpu = batch.get("sep_indices")
+        sep_indices = (
+            sep_indices_cpu.to(device) if sep_indices_cpu is not None else None
+        )
         if not has_padding:
             attention_mask = None
         else:
@@ -212,6 +216,8 @@ def train_one_epoch(
                 input_ids,
                 example_ids,
                 attention_mask=attention_mask,
+                sep_indices=sep_indices,
+                compute_input_loss=False,
                 positions_3d=positions_3d,
             )
             loss = outputs["output_loss"]
@@ -299,6 +305,10 @@ def validate_one_epoch(
     for batch in dataloader:
         has_padding = bool(batch.get("has_padding", True))
         input_ids = batch["input_ids"].to(device)
+        sep_indices_cpu = batch.get("sep_indices")
+        sep_indices = (
+            sep_indices_cpu.to(device) if sep_indices_cpu is not None else None
+        )
         if not has_padding:
             attention_mask = None
         else:
@@ -313,6 +323,8 @@ def validate_one_epoch(
             input_ids,
             example_ids,
             attention_mask=attention_mask,
+            sep_indices=sep_indices,
+            compute_input_loss=False,
             positions_3d=positions_3d,
         )
 

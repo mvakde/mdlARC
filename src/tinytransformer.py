@@ -369,6 +369,8 @@ class TinyTransformer(nn.Module):
         input_ids: torch.Tensor,
         example_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        sep_indices: Optional[torch.Tensor] = None,
+        compute_input_loss: bool = True,
         targets: Optional[torch.Tensor] = None,
         positions_3d: Optional[torch.Tensor] = None,
     ) -> dict:
@@ -379,6 +381,11 @@ class TinyTransformer(nn.Module):
             )
 
         device = input_ids.device
+        if sep_indices is not None:
+            if sep_indices.device != device or sep_indices.dtype != torch.long:
+                sep_indices = sep_indices.to(device=device, dtype=torch.long)
+            if sep_indices.dim() != 1 or sep_indices.size(0) != batch_size:
+                raise ValueError("sep_indices must have shape [batch_size].")
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=device)
         else:
@@ -445,27 +452,28 @@ class TinyTransformer(nn.Module):
             loss = raw_losses.sum() / total_valid.clamp(min=1)
 
             # 4. Separate Input vs Output portions
-            # The input sequence (shift_logits input) is input_ids[:, :-1]
-            shift_input_ids = input_ids[:, :-1]
-
-            # Find where the Output phase starts.
-            # If the current input token is IO_SEPARATOR, it is predicting the first output token.
-            # So, the "Output Loss" region starts wherever SEP or subsequent tokens appear.
-            # cumsum >= 1 creates a mask that turns True from the Separator onwards.
-            is_output_phase = (shift_input_ids == IO_SEPARATOR_TOKEN_ID).cumsum(
-                dim=1
-            ) >= 1
-            is_input_phase = ~is_output_phase
-
+            # The output region starts where the current input token is the separator.
+            if sep_indices is not None:
+                shift_len = shift_targets.size(1)
+                sep_positions = sep_indices.clamp(min=0, max=shift_len).unsqueeze(1)
+                positions = torch.arange(shift_len, device=device).unsqueeze(0)
+                is_output_phase = positions >= sep_positions
+            else:
+                shift_input_ids = input_ids[:, :-1]
+                # Fallback for callsites that do not provide sep_indices.
+                is_output_phase = (shift_input_ids == IO_SEPARATOR_TOKEN_ID).cumsum(
+                    dim=1
+                ) >= 1
             # Calculate specific losses
-            valid_input = valid_mask & is_input_phase
             valid_output = valid_mask & is_output_phase
 
             num_output_tokens = valid_output.sum()
 
-            input_loss = (raw_losses * valid_input).sum() / valid_input.sum().clamp(
-                min=1
-            )
+            if compute_input_loss:
+                valid_input = valid_mask & (~is_output_phase)
+                input_loss = (raw_losses * valid_input).sum() / valid_input.sum().clamp(
+                    min=1
+                )
             output_loss = (raw_losses * valid_output).sum() / num_output_tokens.clamp(
                 min=1
             )
