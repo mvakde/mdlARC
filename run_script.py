@@ -66,6 +66,10 @@ args_dict = {
 
     "inference_temperature": None,
     "inference_top_k": None,
+
+    # train logging
+    "train_log_mode": "10_steps", # options: never, step, 10_steps, epoch
+    "log_location": "both", # options: none, terminal, file, both.
 }
 cfg = argparse.Namespace(**args_dict) # Convert dictionary to Namespace
 Path("runs").mkdir(parents=True, exist_ok=True) # Create runs dir
