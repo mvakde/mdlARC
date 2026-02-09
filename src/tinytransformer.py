@@ -1,42 +1,9 @@
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-try:
-    from torch.nn.attention.flex_attention import flex_attention
-except ImportError:  # pragma: no cover - older torch versions
-    flex_attention = None
-
-_compiled_flex_attention = None
-_compile_flex_attempted = False
-
-
-def _get_flex_attention_callable():
-    global _compiled_flex_attention, _compile_flex_attempted
-    if flex_attention is None:
-        return None
-    if _compiled_flex_attention is not None:
-        return _compiled_flex_attention
-    if _compile_flex_attempted:
-        return flex_attention
-
-    _compile_flex_attempted = True
-    compile_fn = getattr(torch, "compile", None)
-    if compile_fn is None:
-        return flex_attention
-
-    try:
-        _compiled_flex_attention = compile_fn(
-            flex_attention,
-            fullgraph=True,
-            dynamic=True,
-        )
-    except Exception:
-        _compiled_flex_attention = None
-
-    return _compiled_flex_attention or flex_attention
 
 from common import (
     IGNORE_INDEX,
@@ -85,7 +52,6 @@ class MultiHeadSelfAttention(nn.Module):
         self.n_heads = config.n_heads
         self.head_dim = config.d_model // config.n_heads
         self.scale = self.head_dim**-0.5
-        self._has_flex_attention = flex_attention is not None
 
         self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
@@ -93,180 +59,6 @@ class MultiHeadSelfAttention(nn.Module):
 
         # 3D RoPE setup
         self.rope = RotaryEmbedding3D(self.head_dim)
-
-    def can_use_flex_attention(
-        self, device: torch.device, dropout_p: float
-    ) -> bool:
-        # FlexAttention currently has no attention-dropout argument, so we
-        # preserve training semantics by using SDPA whenever dropout is active.
-        return (
-            self._has_flex_attention
-            and device.type == "cuda"
-            and dropout_p == 0.0
-        )
-
-    def _can_use_flex_attention(
-        self, queries: torch.Tensor, dropout_p: float
-    ) -> bool:
-        return self.can_use_flex_attention(queries.device, dropout_p)
-
-    def _build_flex_score_mod(
-        self,
-        attention_mask: Optional[torch.Tensor],
-        use_causal: bool,
-        neg_inf: torch.Tensor,
-    ) -> Optional[
-        Callable[
-            [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-            torch.Tensor,
-        ]
-    ]:
-        if attention_mask is None and not use_causal:
-            return None
-
-        if attention_mask is None:
-
-            def score_mod(
-                score: torch.Tensor,
-                b: torch.Tensor,
-                h: torch.Tensor,
-                q_idx: torch.Tensor,
-                kv_idx: torch.Tensor,
-            ) -> torch.Tensor:
-                del b, h
-                allowed = q_idx >= kv_idx
-                return torch.where(allowed, score, neg_inf)
-
-            return score_mod
-
-        if use_causal:
-
-            def score_mod(
-                score: torch.Tensor,
-                b: torch.Tensor,
-                h: torch.Tensor,
-                q_idx: torch.Tensor,
-                kv_idx: torch.Tensor,
-            ) -> torch.Tensor:
-                del h
-                allowed = (q_idx >= kv_idx) & attention_mask[b, kv_idx]
-                return torch.where(allowed, score, neg_inf)
-
-            return score_mod
-
-        def score_mod(
-            score: torch.Tensor,
-            b: torch.Tensor,
-            h: torch.Tensor,
-            q_idx: torch.Tensor,
-            kv_idx: torch.Tensor,
-        ) -> torch.Tensor:
-            del h, q_idx
-            return torch.where(attention_mask[b, kv_idx], score, neg_inf)
-
-        return score_mod
-
-    def _build_sdpa_attn_bias(
-        self,
-        queries: torch.Tensor,
-        keys: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        causal_mask: Optional[torch.Tensor],
-        sdpa_mask: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        if sdpa_mask is not None:
-            return sdpa_mask
-
-        batch_size = queries.size(0)
-        seq_len = queries.size(2)
-        kv_len = keys.size(2)
-        attn_bias = None
-
-        if causal_mask is not None:
-            attn_bias = torch.zeros(
-                (1, 1, seq_len, kv_len), device=queries.device, dtype=queries.dtype
-            )
-            if causal_mask.size(-2) == seq_len and causal_mask.size(-1) == kv_len:
-                attn_bias = attn_bias.masked_fill(causal_mask, float("-inf"))
-            else:
-                generated_causal = torch.triu(
-                    torch.ones(
-                        seq_len, kv_len, device=queries.device, dtype=torch.bool
-                    ),
-                    diagonal=1,
-                )
-                attn_bias = attn_bias.masked_fill(
-                    generated_causal[None, None, :, :], float("-inf")
-                )
-
-        if attention_mask is not None:
-            if attention_mask.size(1) < kv_len:
-                raise ValueError(
-                    "attention_mask length must cover all key/value positions."
-                )
-            if attn_bias is None:
-                attn_bias = torch.zeros(
-                    (batch_size, 1, seq_len, kv_len),
-                    device=queries.device,
-                    dtype=queries.dtype,
-                )
-            key_mask = ~attention_mask[:, None, None, :kv_len]
-            attn_bias = attn_bias.masked_fill(key_mask, float("-inf"))
-
-        return attn_bias
-
-    def _apply_attention(
-        self,
-        queries: torch.Tensor,
-        keys: torch.Tensor,
-        values: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        causal_mask: Optional[torch.Tensor],
-        sdpa_mask: Optional[torch.Tensor],
-        dropout_p: float,
-    ) -> torch.Tensor:
-        if self._can_use_flex_attention(queries, dropout_p):
-            neg_inf = torch.tensor(
-                float("-inf"), device=queries.device, dtype=queries.dtype
-            )
-            score_mod = self._build_flex_score_mod(
-                attention_mask=attention_mask,
-                use_causal=causal_mask is not None,
-                neg_inf=neg_inf,
-            )
-            flex_attention_op = _get_flex_attention_callable() or flex_attention
-            try:
-                return flex_attention_op(
-                    queries,
-                    keys,
-                    values,
-                    score_mod=score_mod,
-                    scale=self.scale,
-                )
-            except Exception:
-                return flex_attention(
-                    queries,
-                    keys,
-                    values,
-                    score_mod=score_mod,
-                    scale=self.scale,
-                )
-
-        attn_bias = self._build_sdpa_attn_bias(
-            queries=queries,
-            keys=keys,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            sdpa_mask=sdpa_mask,
-        )
-        return F.scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            attn_mask=attn_bias,
-            dropout_p=dropout_p,
-            is_causal=False,
-        )
 
     def forward(
         self,
@@ -287,14 +79,47 @@ class MultiHeadSelfAttention(nn.Module):
             # pos_xyz: [B, S, 3] (x, y, z)
             queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
 
-        attn_output = self._apply_attention(
+        # Reuse a precomputed mask when provided by the model forward path.
+        attn_bias = sdpa_mask
+        if attn_bias is None:
+            # Construct a combined attention bias for SDPA
+            # SDPA handles broadcasting, but constructing the mask explicitly ensures
+            # correctness with your specific causal + padding setup.
+            attn_bias = None
+
+            # 1. Start with Causal Mask if present
+            if causal_mask is not None:
+                # causal_mask is usually boolean [1, 1, S, S] where True means "Mask out"
+                # We convert to float: 0.0 for keep, -inf for mask
+                attn_bias = torch.zeros(
+                    (1, 1, seq_len, seq_len), device=queries.device, dtype=queries.dtype
+                )
+                attn_bias = attn_bias.masked_fill(causal_mask, float("-inf"))
+
+            # 2. Apply Padding Mask (attention_mask)
+            if attention_mask is not None:
+                # attention_mask is [B, S] where True means "Keep", False means "Pad"
+                # We need to mask out keys where attention_mask is False.
+                if attn_bias is None:
+                    attn_bias = torch.zeros(
+                        (batch_size, 1, seq_len, seq_len),
+                        device=queries.device,
+                        dtype=queries.dtype,
+                    )
+
+                # Broadcast attention_mask to [B, 1, 1, S]
+                key_mask = ~attention_mask[:, None, None, :]
+                attn_bias = attn_bias.masked_fill(key_mask, float("-inf"))
+
+        # Fused Flash Attention execution
+        # Note: We pass is_causal=False because we manually constructed the causal mask into attn_bias above
+        attn_output = F.scaled_dot_product_attention(
             queries,
             keys,
             values,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            sdpa_mask=sdpa_mask,
+            attn_mask=attn_bias,
             dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False,
         )
 
         attn_output = (
@@ -343,14 +168,24 @@ class MultiHeadSelfAttention(nn.Module):
                 key_layer = past_keys
                 value_layer = past_values
 
-            attn_output = self._apply_attention(
+                # Masking setup for static buffer
+            attn_bias = None
+            if attention_mask is not None:
+                attn_bias = torch.zeros(
+                    (batch_size, 1, seq_len, key_layer.size(2)),
+                    device=queries.device,
+                    dtype=queries.dtype,
+                )
+                key_mask = ~attention_mask[:, None, None, :]
+                attn_bias = attn_bias.masked_fill(key_mask, float("-inf"))
+
+            attn_output = F.scaled_dot_product_attention(
                 queries,
                 key_layer,
                 value_layer,
-                attention_mask=attention_mask,
-                causal_mask=None,
-                sdpa_mask=None,
+                attn_mask=attn_bias,
                 dropout_p=0.0,
+                is_causal=False,
             )
 
             attn_output = (
@@ -363,14 +198,25 @@ class MultiHeadSelfAttention(nn.Module):
         # ------------------------------------------------------------------
         # PATH B: PROMPT (We are initializing)
         # ------------------------------------------------------------------
-        attn_output = self._apply_attention(
-            queries,
-            keys,
-            values,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            sdpa_mask=None,
-            dropout_p=0.0,
+        attn_bias = None
+        if causal_mask is not None:
+            attn_bias = torch.zeros(
+                (1, 1, seq_len, seq_len), device=queries.device, dtype=queries.dtype
+            )
+            attn_bias = attn_bias.masked_fill(causal_mask, float("-inf"))
+
+        if attention_mask is not None:
+            if attn_bias is None:
+                attn_bias = torch.zeros(
+                    (batch_size, 1, seq_len, seq_len),
+                    device=queries.device,
+                    dtype=queries.dtype,
+                )
+            key_mask = ~attention_mask[:, None, None, :]
+            attn_bias = attn_bias.masked_fill(key_mask, float("-inf"))
+
+        attn_output = F.scaled_dot_product_attention(
+            queries, keys, values, attn_mask=attn_bias, dropout_p=0.0, is_causal=False
         )
         attn_output = (
             attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, dim)
@@ -406,16 +252,12 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        causal_mask: Optional[torch.Tensor],
+        sdpa_mask: Optional[torch.Tensor],
         pos_xyz: Optional[torch.Tensor],
-        sdpa_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         attn_input = self.ln_1(hidden_states)
         attn_output = self.attention(
             attn_input,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
             pos_xyz=pos_xyz,
             sdpa_mask=sdpa_mask,
         )
@@ -569,28 +411,15 @@ class TinyTransformer(nn.Module):
             pos_xyz = positions_3d.to(device=device, dtype=torch.long)
 
         causal_mask = self._build_causal_mask(seq_len, device)
-        dropout_p = self.blocks[0].attention.dropout_p if self.training else 0.0
-        use_flex_attention = self.blocks[0].attention.can_use_flex_attention(
-            device=device, dropout_p=dropout_p
+        sdpa_mask = torch.zeros(
+            (1, 1, seq_len, seq_len), device=device, dtype=hidden_states.dtype
         )
-
-        sdpa_mask = None
-        if not use_flex_attention:
-            sdpa_mask = torch.zeros(
-                (1, 1, seq_len, seq_len), device=device, dtype=hidden_states.dtype
-            )
-            sdpa_mask = sdpa_mask.masked_fill(causal_mask, float("-inf"))
-            key_mask = ~attention_mask[:, None, None, :]
-            sdpa_mask = sdpa_mask.masked_fill(key_mask, float("-inf"))
+        sdpa_mask = sdpa_mask.masked_fill(causal_mask, float("-inf"))
+        key_mask = ~attention_mask[:, None, None, :]
+        sdpa_mask = sdpa_mask.masked_fill(key_mask, float("-inf"))
 
         for block in self.blocks:
-            hidden_states = block(
-                hidden_states,
-                attention_mask=attention_mask,
-                causal_mask=causal_mask,
-                pos_xyz=pos_xyz,
-                sdpa_mask=sdpa_mask,
-            )
+            hidden_states = block(hidden_states, sdpa_mask, pos_xyz)
             hidden_states = hidden_states * attention_mask.unsqueeze(-1)
 
         hidden_states = self.norm(hidden_states)
