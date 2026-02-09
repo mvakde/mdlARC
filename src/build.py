@@ -128,16 +128,10 @@ def build_model_and_data(
     collate_augment_selector = None
     if augmentor is not None:
         collate_augment_selector = augmentor.select_for_example
-    num_workers = int(getattr(args, "num_workers", 0) or 0)
-    pin_memory = bool(getattr(args, "pin_memory", False))
-    persistent_workers = bool(getattr(args, "persistent_workers", False))
     dataloader = create_dataloader(
         dataset=dataset,
         batch_size=args.batch_size,
         shuffle=not getattr(args, "eval_only", False),
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
         augment_selector=collate_augment_selector,
     )
     if augmentor is not None:

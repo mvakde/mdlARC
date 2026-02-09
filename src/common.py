@@ -752,9 +752,6 @@ def create_dataloader(
     batch_size: int,
     shuffle: bool = True,
     bucket_size_multiplier: int = 4,
-    num_workers: int = 0,
-    pin_memory: bool = False,
-    persistent_workers: bool = False,
     augment_selector: Optional[
         Callable[[SequenceExample], Tuple[Optional[torch.Tensor], Optional[int]]]
     ] = None,
@@ -774,17 +771,11 @@ def create_dataloader(
         )
     else:
         collate_fn = collate_examples
-    loader_kwargs: Dict[str, Any] = {
-        "num_workers": int(num_workers),
-        "pin_memory": bool(pin_memory),
-    }
-    if int(num_workers) > 0:
-        loader_kwargs["persistent_workers"] = bool(persistent_workers)
     return DataLoader(
         dataset,
         batch_sampler=batch_sampler,
+        num_workers=0,
         collate_fn=collate_fn,
-        **loader_kwargs,
     )
 
 

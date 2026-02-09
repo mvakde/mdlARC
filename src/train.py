@@ -240,19 +240,17 @@ def train_one_epoch(
         last_batch_idx = batch_idx
         step += 1
         has_padding = bool(batch.get("has_padding", True))
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        input_ids = batch["input_ids"].to(device)
         sep_indices_cpu = batch.get("sep_indices")
         sep_indices = (
-            sep_indices_cpu.to(device, non_blocking=True)
-            if sep_indices_cpu is not None
-            else None
+            sep_indices_cpu.to(device) if sep_indices_cpu is not None else None
         )
         if not has_padding:
             attention_mask = None
         else:
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-        example_ids = batch["example_ids"].to(device, non_blocking=True)
-        positions_3d = batch["positions_3d"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device)
+        example_ids = batch["example_ids"].to(device)
+        positions_3d = batch["positions_3d"].to(device)
         if accum_index == 0:
             optimizer.zero_grad(set_to_none=True)
             if dataloader_length is not None:
@@ -364,19 +362,17 @@ def validate_one_epoch(
 
     for batch in dataloader:
         has_padding = bool(batch.get("has_padding", True))
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        input_ids = batch["input_ids"].to(device)
         sep_indices_cpu = batch.get("sep_indices")
         sep_indices = (
-            sep_indices_cpu.to(device, non_blocking=True)
-            if sep_indices_cpu is not None
-            else None
+            sep_indices_cpu.to(device) if sep_indices_cpu is not None else None
         )
         if not has_padding:
             attention_mask = None
         else:
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-        example_ids = batch["example_ids"].to(device, non_blocking=True)
-        positions_3d = batch["positions_3d"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device)
+        example_ids = batch["example_ids"].to(device)
+        positions_3d = batch["positions_3d"].to(device)
 
         if not any(batch["has_output"]):
             continue
@@ -879,9 +875,6 @@ def train_model(
 
     if do_validate:
         val_batch_size = getattr(args, "val_batch_size", args.batch_size)
-        num_workers = int(getattr(args, "num_workers", 0) or 0)
-        pin_memory = bool(getattr(args, "pin_memory", False))
-        persistent_workers = bool(getattr(args, "persistent_workers", False))
         print(f"Building validation dataloader (batch_size={val_batch_size})...")
         print("Building validation dataloader (reading hidden solutions)...")
         val_dataset = ARCExampleDataset(
@@ -897,9 +890,6 @@ def train_model(
             dataset=val_dataset,
             batch_size=val_batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
         )
         print(f"Validation dataset size: {len(val_dataset)}")
     else:

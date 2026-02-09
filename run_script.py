@@ -24,10 +24,6 @@ args_dict = {
     "save_path": Path("runs/tiny.pt"),
     "checkpoint_path": None, 
     "checkpoint_epochs": [], # No intermediate saves needed for short run
-    "num_workers": 4,
-    "pin_memory": True,
-    "persistent_workers": False,
-    
     
     # Hyperparameters
     "epochs": 240, 
