@@ -56,6 +56,7 @@ args_dict = {
 
     "grad_clip": 1.0,
     "dropout": 0.1,
+    "attention_dropout": 0.0,
     "seed": 42,
 
     # Architecture

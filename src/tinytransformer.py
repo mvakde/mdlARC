@@ -1,9 +1,19 @@
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+try:
+    from torch.nn.attention.flex_attention import (
+        and_masks,
+        create_block_mask,
+        flex_attention,
+    )
+except ImportError:  # pragma: no cover - older torch versions
+    and_masks = None
+    create_block_mask = None
+    flex_attention = None
 
 from common import (
     IGNORE_INDEX,
@@ -23,9 +33,13 @@ class TinyTransformerConfig:
     d_ff: int = 512
     n_layers: int = 4
     dropout: float = 0.1
+    attention_dropout: Optional[float] = None
     num_examples: int = 1280
 
     def __post_init__(self) -> None:
+        if self.attention_dropout is None:
+            # Backwards compatibility: old configs used a single dropout knob.
+            self.attention_dropout = self.dropout
         if self.d_model % self.n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads.")
         if self.n_layers < 1:
@@ -52,13 +66,261 @@ class MultiHeadSelfAttention(nn.Module):
         self.n_heads = config.n_heads
         self.head_dim = config.d_model // config.n_heads
         self.scale = self.head_dim**-0.5
+        self._has_flex_attention = (
+            flex_attention is not None and create_block_mask is not None
+        )
 
         self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.dropout_p = config.dropout  # Store float for functional call
+        # Attention dropout is intentionally separate from hidden dropout.
+        self.dropout_p = float(config.attention_dropout)
 
         # 3D RoPE setup
         self.rope = RotaryEmbedding3D(self.head_dim)
+
+    def can_use_flex_attention(self, device: torch.device, dropout_p: float) -> bool:
+        # FlexAttention has no attention-dropout argument; preserve semantics by
+        # falling back to SDPA whenever attention-dropout is active.
+        return self._has_flex_attention and device.type == "cuda" and dropout_p == 0.0
+
+    def _build_flex_mask_mod(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        use_causal: bool,
+    ) -> Optional[
+        Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+    ]:
+        if attention_mask is None and not use_causal:
+            return None
+
+        def causal_mod(
+            b: torch.Tensor,
+            h: torch.Tensor,
+            q_idx: torch.Tensor,
+            kv_idx: torch.Tensor,
+        ) -> torch.Tensor:
+            del b, h
+            return q_idx >= kv_idx
+
+        if attention_mask is None:
+            return causal_mod
+
+        def padding_mod(
+            b: torch.Tensor,
+            h: torch.Tensor,
+            q_idx: torch.Tensor,
+            kv_idx: torch.Tensor,
+        ) -> torch.Tensor:
+            del h, q_idx
+            return attention_mask[b, kv_idx]
+
+        if use_causal:
+            if and_masks is not None:
+                return and_masks(causal_mod, padding_mod)
+
+            def causal_and_padding_mod(
+                b: torch.Tensor,
+                h: torch.Tensor,
+                q_idx: torch.Tensor,
+                kv_idx: torch.Tensor,
+            ) -> torch.Tensor:
+                del h
+                return (q_idx >= kv_idx) & attention_mask[b, kv_idx]
+
+            return causal_and_padding_mod
+
+        return padding_mod
+
+    def _build_flex_score_mod(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        use_causal: bool,
+        neg_inf: torch.Tensor,
+        key_len: int,
+    ) -> Optional[
+        Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            torch.Tensor,
+        ]
+    ]:
+        if attention_mask is not None and attention_mask.size(1) < key_len:
+            raise ValueError(
+                "attention_mask length must cover all key/value positions."
+            )
+
+        if attention_mask is None and not use_causal:
+            return None
+
+        if attention_mask is None:
+
+            def score_mod(
+                score: torch.Tensor,
+                b: torch.Tensor,
+                h: torch.Tensor,
+                q_idx: torch.Tensor,
+                kv_idx: torch.Tensor,
+            ) -> torch.Tensor:
+                del b, h
+                return torch.where(q_idx >= kv_idx, score, neg_inf)
+
+            return score_mod
+
+        if use_causal:
+
+            def score_mod(
+                score: torch.Tensor,
+                b: torch.Tensor,
+                h: torch.Tensor,
+                q_idx: torch.Tensor,
+                kv_idx: torch.Tensor,
+            ) -> torch.Tensor:
+                del h
+                allowed = (q_idx >= kv_idx) & attention_mask[b, kv_idx]
+                return torch.where(allowed, score, neg_inf)
+
+            return score_mod
+
+        def score_mod(
+            score: torch.Tensor,
+            b: torch.Tensor,
+            h: torch.Tensor,
+            q_idx: torch.Tensor,
+            kv_idx: torch.Tensor,
+        ) -> torch.Tensor:
+            del h, q_idx
+            return torch.where(attention_mask[b, kv_idx], score, neg_inf)
+
+        return score_mod
+
+    def build_flex_block_mask(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        use_causal: bool,
+        query_len: int,
+        key_len: int,
+        device: torch.device,
+        dropout_p: float,
+    ) -> Optional[object]:
+        if not self.can_use_flex_attention(device, dropout_p):
+            return None
+        if torch.compiler.is_compiling():
+            # Build-time block-mask creation can trigger graph breaks under
+            # fullgraph compile; use score_mod inside flex_attention instead.
+            return None
+
+        if attention_mask is not None and attention_mask.size(1) < key_len:
+            raise ValueError(
+                "attention_mask length must cover all key/value positions."
+            )
+
+        mask_mod = self._build_flex_mask_mod(attention_mask, use_causal)
+        if mask_mod is None:
+            return None
+
+        batch_dim = attention_mask.size(0) if attention_mask is not None else None
+        return create_block_mask(
+            mask_mod,
+            B=batch_dim,
+            H=None,
+            Q_LEN=query_len,
+            KV_LEN=key_len,
+            device=device,
+        )
+
+    def _build_sdpa_attn_bias(
+        self,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        causal_mask: Optional[torch.Tensor],
+        sdpa_mask: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if sdpa_mask is not None:
+            return sdpa_mask
+
+        batch_size = queries.size(0)
+        query_len = queries.size(2)
+        key_len = keys.size(2)
+        attn_bias = None
+
+        if causal_mask is not None:
+            attn_bias = torch.zeros(
+                (1, 1, query_len, key_len), device=queries.device, dtype=queries.dtype
+            )
+            if causal_mask.size(-2) == query_len and causal_mask.size(-1) == key_len:
+                attn_bias = attn_bias.masked_fill(causal_mask, float("-inf"))
+            else:
+                q_positions = torch.arange(query_len, device=queries.device).view(-1, 1)
+                kv_positions = torch.arange(key_len, device=queries.device).view(1, -1)
+                generated_causal = q_positions < kv_positions
+                attn_bias = attn_bias.masked_fill(
+                    generated_causal[None, None, :, :], float("-inf")
+                )
+
+        if attention_mask is not None:
+            if attention_mask.size(1) < key_len:
+                raise ValueError(
+                    "attention_mask length must cover all key/value positions."
+                )
+            if attn_bias is None:
+                attn_bias = torch.zeros(
+                    (batch_size, 1, query_len, key_len),
+                    device=queries.device,
+                    dtype=queries.dtype,
+                )
+            key_mask = ~attention_mask[:, None, None, :key_len]
+            attn_bias = attn_bias.masked_fill(key_mask, float("-inf"))
+
+        return attn_bias
+
+    def _apply_attention(
+        self,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        causal_mask: Optional[torch.Tensor],
+        sdpa_mask: Optional[torch.Tensor],
+        flex_block_mask: Optional[object],
+        dropout_p: float,
+    ) -> torch.Tensor:
+        if self.can_use_flex_attention(queries.device, dropout_p):
+            score_mod = None
+            if flex_block_mask is None:
+                neg_inf = torch.tensor(
+                    float("-inf"), device=queries.device, dtype=queries.dtype
+                )
+                score_mod = self._build_flex_score_mod(
+                    attention_mask=attention_mask,
+                    use_causal=causal_mask is not None,
+                    neg_inf=neg_inf,
+                    key_len=keys.size(2),
+                )
+
+            return flex_attention(
+                queries,
+                keys,
+                values,
+                score_mod=score_mod,
+                block_mask=flex_block_mask,
+                scale=self.scale,
+            )
+
+        attn_bias = self._build_sdpa_attn_bias(
+            queries=queries,
+            keys=keys,
+            attention_mask=attention_mask,
+            causal_mask=causal_mask,
+            sdpa_mask=sdpa_mask,
+        )
+        return F.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            attn_mask=attn_bias,
+            dropout_p=dropout_p,
+            is_causal=False,
+        )
 
     def forward(
         self,
@@ -67,6 +329,7 @@ class MultiHeadSelfAttention(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         pos_xyz: Optional[torch.Tensor] = None,
         sdpa_mask: Optional[torch.Tensor] = None,
+        flex_block_mask: Optional[object] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, dim = hidden_states.shape
 
@@ -74,52 +337,26 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = qkv.view(batch_size, seq_len, 3, self.n_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         queries, keys, values = qkv.unbind(0)
+        qkv_dtype = queries.dtype
 
         if pos_xyz is not None:
-            # pos_xyz: [B, S, 3] (x, y, z)
-            queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
+            # Match cache path semantics: rotate in fp32 for stability, then
+            # cast back so q/k/v dtypes stay aligned for SDPA.
+            q_f32 = queries.float()
+            k_f32 = keys.float()
+            q_f32, k_f32 = self.rope.apply_rotary(q_f32, k_f32, pos_xyz)
+            queries = q_f32.to(dtype=qkv_dtype)
+            keys = k_f32.to(dtype=qkv_dtype)
 
-        # Reuse a precomputed mask when provided by the model forward path.
-        attn_bias = sdpa_mask
-        if attn_bias is None:
-            # Construct a combined attention bias for SDPA
-            # SDPA handles broadcasting, but constructing the mask explicitly ensures
-            # correctness with your specific causal + padding setup.
-            attn_bias = None
-
-            # 1. Start with Causal Mask if present
-            if causal_mask is not None:
-                # causal_mask is usually boolean [1, 1, S, S] where True means "Mask out"
-                # We convert to float: 0.0 for keep, -inf for mask
-                attn_bias = torch.zeros(
-                    (1, 1, seq_len, seq_len), device=queries.device, dtype=queries.dtype
-                )
-                attn_bias = attn_bias.masked_fill(causal_mask, float("-inf"))
-
-            # 2. Apply Padding Mask (attention_mask)
-            if attention_mask is not None:
-                # attention_mask is [B, S] where True means "Keep", False means "Pad"
-                # We need to mask out keys where attention_mask is False.
-                if attn_bias is None:
-                    attn_bias = torch.zeros(
-                        (batch_size, 1, seq_len, seq_len),
-                        device=queries.device,
-                        dtype=queries.dtype,
-                    )
-
-                # Broadcast attention_mask to [B, 1, 1, S]
-                key_mask = ~attention_mask[:, None, None, :]
-                attn_bias = attn_bias.masked_fill(key_mask, float("-inf"))
-
-        # Fused Flash Attention execution
-        # Note: We pass is_causal=False because we manually constructed the causal mask into attn_bias above
-        attn_output = F.scaled_dot_product_attention(
+        attn_output = self._apply_attention(
             queries,
             keys,
             values,
-            attn_mask=attn_bias,
+            attention_mask=attention_mask,
+            causal_mask=causal_mask,
+            sdpa_mask=sdpa_mask,
+            flex_block_mask=flex_block_mask,
             dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=False,
         )
 
         attn_output = (
@@ -135,6 +372,7 @@ class MultiHeadSelfAttention(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.Tensor] = None,
+        flex_block_mask: Optional[object] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, dim = hidden_states.shape
 
@@ -142,6 +380,7 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = qkv.view(batch_size, seq_len, 3, self.n_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         queries, keys, values = qkv.unbind(0)
+        qkv_dtype = queries.dtype
 
         if pos_xyz is not None:
             # Cast to fp32 for rotation precision
@@ -149,14 +388,16 @@ class MultiHeadSelfAttention(nn.Module):
             k_f32 = keys.float()
             q_f32, k_f32 = self.rope.apply_rotary(q_f32, k_f32, pos_xyz)
             # Cast back to original dtype (e.g. bfloat16) for storage
-            queries = q_f32.to(dtype=hidden_states.dtype)
-            keys = k_f32.to(dtype=hidden_states.dtype)
+            queries = q_f32.to(dtype=qkv_dtype)
+            keys = k_f32.to(dtype=qkv_dtype)
 
         # ------------------------------------------------------------------
         # PATH A: DECODE (We have a cache buffer)
         # ------------------------------------------------------------------
         if past_key_value is not None:
             past_keys, past_values = past_key_value
+            key_layer = past_keys
+            value_layer = past_values
             if cache_position is not None:
                 # We update the buffer directly using index_copy_ (in-place).
                 # keys is [B, H, 1, D], past_keys is [B, H, MaxLen, D]
@@ -168,24 +409,15 @@ class MultiHeadSelfAttention(nn.Module):
                 key_layer = past_keys
                 value_layer = past_values
 
-                # Masking setup for static buffer
-            attn_bias = None
-            if attention_mask is not None:
-                attn_bias = torch.zeros(
-                    (batch_size, 1, seq_len, key_layer.size(2)),
-                    device=queries.device,
-                    dtype=queries.dtype,
-                )
-                key_mask = ~attention_mask[:, None, None, :]
-                attn_bias = attn_bias.masked_fill(key_mask, float("-inf"))
-
-            attn_output = F.scaled_dot_product_attention(
+            attn_output = self._apply_attention(
                 queries,
                 key_layer,
                 value_layer,
-                attn_mask=attn_bias,
+                attention_mask=attention_mask,
+                causal_mask=None,
+                sdpa_mask=None,
+                flex_block_mask=flex_block_mask,
                 dropout_p=0.0,
-                is_causal=False,
             )
 
             attn_output = (
@@ -198,25 +430,15 @@ class MultiHeadSelfAttention(nn.Module):
         # ------------------------------------------------------------------
         # PATH B: PROMPT (We are initializing)
         # ------------------------------------------------------------------
-        attn_bias = None
-        if causal_mask is not None:
-            attn_bias = torch.zeros(
-                (1, 1, seq_len, seq_len), device=queries.device, dtype=queries.dtype
-            )
-            attn_bias = attn_bias.masked_fill(causal_mask, float("-inf"))
-
-        if attention_mask is not None:
-            if attn_bias is None:
-                attn_bias = torch.zeros(
-                    (batch_size, 1, seq_len, seq_len),
-                    device=queries.device,
-                    dtype=queries.dtype,
-                )
-            key_mask = ~attention_mask[:, None, None, :]
-            attn_bias = attn_bias.masked_fill(key_mask, float("-inf"))
-
-        attn_output = F.scaled_dot_product_attention(
-            queries, keys, values, attn_mask=attn_bias, dropout_p=0.0, is_causal=False
+        attn_output = self._apply_attention(
+            queries,
+            keys,
+            values,
+            attention_mask=attention_mask,
+            causal_mask=causal_mask,
+            sdpa_mask=None,
+            flex_block_mask=flex_block_mask,
+            dropout_p=0.0,
         )
         attn_output = (
             attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, dim)
@@ -252,14 +474,20 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        sdpa_mask: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        causal_mask: Optional[torch.Tensor],
         pos_xyz: Optional[torch.Tensor],
+        sdpa_mask: Optional[torch.Tensor] = None,
+        flex_block_mask: Optional[object] = None,
     ) -> torch.Tensor:
         attn_input = self.ln_1(hidden_states)
         attn_output = self.attention(
             attn_input,
+            attention_mask=attention_mask,
+            causal_mask=causal_mask,
             pos_xyz=pos_xyz,
             sdpa_mask=sdpa_mask,
+            flex_block_mask=flex_block_mask,
         )
         hidden_states = hidden_states + attn_output
 
@@ -276,6 +504,7 @@ class TransformerBlock(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[torch.Tensor] = None,
+        flex_block_mask: Optional[object] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         attn_input = self.ln_1(hidden_states)
         # Check if we are in Decode mode or Prompt mode
@@ -289,6 +518,7 @@ class TransformerBlock(nn.Module):
                 causal_mask=causal_mask,
                 past_key_value=past_key_value,
                 cache_position=cache_position,
+                flex_block_mask=flex_block_mask,
             )
             present_key_value = None  # No return value needed
         else:
@@ -301,6 +531,7 @@ class TransformerBlock(nn.Module):
                 causal_mask=causal_mask,
                 past_key_value=None,
                 cache_position=None,
+                flex_block_mask=flex_block_mask,
             )
         hidden_states = hidden_states + attn_output
 
@@ -411,15 +642,38 @@ class TinyTransformer(nn.Module):
             pos_xyz = positions_3d.to(device=device, dtype=torch.long)
 
         causal_mask = self._build_causal_mask(seq_len, device)
-        sdpa_mask = torch.zeros(
-            (1, 1, seq_len, seq_len), device=device, dtype=hidden_states.dtype
+        dropout_p = self.blocks[0].attention.dropout_p if self.training else 0.0
+        use_flex_attention = self.blocks[0].attention.can_use_flex_attention(
+            device=device,
+            dropout_p=dropout_p,
         )
-        sdpa_mask = sdpa_mask.masked_fill(causal_mask, float("-inf"))
-        key_mask = ~attention_mask[:, None, None, :]
-        sdpa_mask = sdpa_mask.masked_fill(key_mask, float("-inf"))
+        flex_block_mask = self.blocks[0].attention.build_flex_block_mask(
+            attention_mask=attention_mask,
+            use_causal=True,
+            query_len=seq_len,
+            key_len=seq_len,
+            device=device,
+            dropout_p=dropout_p,
+        )
+
+        sdpa_mask = None
+        if not use_flex_attention:
+            sdpa_mask = torch.zeros(
+                (1, 1, seq_len, seq_len), device=device, dtype=hidden_states.dtype
+            )
+            sdpa_mask = sdpa_mask.masked_fill(causal_mask, float("-inf"))
+            key_mask = ~attention_mask[:, None, None, :]
+            sdpa_mask = sdpa_mask.masked_fill(key_mask, float("-inf"))
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, sdpa_mask, pos_xyz)
+            hidden_states = block(
+                hidden_states,
+                attention_mask=attention_mask,
+                causal_mask=causal_mask,
+                pos_xyz=pos_xyz,
+                sdpa_mask=sdpa_mask,
+                flex_block_mask=flex_block_mask,
+            )
             hidden_states = hidden_states * attention_mask.unsqueeze(-1)
 
         hidden_states = self.norm(hidden_states)
@@ -552,6 +806,14 @@ class TinyTransformer(nn.Module):
             if pos_xyz is None:
                 pos_xyz = self._compute_positions_3d(input_ids, attention_mask)
             causal_mask = self._build_causal_mask(seq_len, device)
+            prompt_flex_block_mask = self.blocks[0].attention.build_flex_block_mask(
+                attention_mask=attention_mask,
+                use_causal=True,
+                query_len=seq_len,
+                key_len=seq_len,
+                device=device,
+                dropout_p=0.0,
+            )
 
             past_key_values_out: List[Tuple[torch.Tensor, torch.Tensor]] = []
             for block in self.blocks:
@@ -561,6 +823,7 @@ class TinyTransformer(nn.Module):
                     attention_mask=attention_mask,
                     causal_mask=causal_mask,
                     past_key_value=None,
+                    flex_block_mask=prompt_flex_block_mask,
                 )
                 past_key_values_out.append(present_kv)
 
@@ -571,6 +834,17 @@ class TinyTransformer(nn.Module):
         if pos_xyz is None:
             raise ValueError(
                 "positions_3d must be provided when using past_key_values."
+            )
+        decode_flex_block_mask = None
+        if len(past_key_values) > 0:
+            key_len = past_key_values[0][0].size(2)
+            decode_flex_block_mask = self.blocks[0].attention.build_flex_block_mask(
+                attention_mask=attention_mask,
+                use_causal=False,
+                query_len=seq_len,
+                key_len=key_len,
+                device=device,
+                dropout_p=0.0,
             )
 
         # We iterate by index to access the specific layer's static buffer in past_key_values
@@ -585,6 +859,7 @@ class TinyTransformer(nn.Module):
                 attention_mask=attention_mask,
                 past_key_value=past_key_values[i],
                 cache_position=cache_position,
+                flex_block_mask=decode_flex_block_mask,
             )
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
