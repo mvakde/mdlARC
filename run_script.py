@@ -56,7 +56,8 @@ args_dict = {
 
     "grad_clip": 1.0,
     "dropout": 0.1,
-    "attention_dropout": 0.0,
+    # Let attention dropout follow the shared dropout knob.
+    "attention_dropout": None,
     "seed": 42,
 
     # Architecture
