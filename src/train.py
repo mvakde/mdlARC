@@ -115,13 +115,13 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
             try:
                 self._normuon_update_fn = torch.compile(
                     _normuon_update,
-                    mode="reduce-overhead",
+                    mode="default",
                     fullgraph=False,
                     dynamic=True,
                 )
                 self._adam_update_fn = torch.compile(
                     _adam_update,
-                    mode="reduce-overhead",
+                    mode="default",
                     fullgraph=False,
                     dynamic=True,
                 )
@@ -381,6 +381,7 @@ def train_one_epoch(
     train_log_mode: str = "10_steps",
     log_location: str = "both",
     log_handle: Optional[TextIO] = None,
+    non_blocking_transfers: bool = False,
 ) -> int:
     model.train()
     step = start_step
@@ -444,17 +445,25 @@ def train_one_epoch(
         last_batch_idx = batch_idx
         step += 1
         has_padding = bool(batch.get("has_padding", True))
-        input_ids = batch["input_ids"].to(device)
+        input_ids = batch["input_ids"].to(device, non_blocking=non_blocking_transfers)
         sep_indices_cpu = batch.get("sep_indices")
         sep_indices = (
-            sep_indices_cpu.to(device) if sep_indices_cpu is not None else None
+            sep_indices_cpu.to(device, non_blocking=non_blocking_transfers)
+            if sep_indices_cpu is not None
+            else None
         )
         if not has_padding:
             attention_mask = None
         else:
-            attention_mask = batch["attention_mask"].to(device)
-        example_ids = batch["example_ids"].to(device)
-        positions_3d = batch["positions_3d"].to(device)
+            attention_mask = batch["attention_mask"].to(
+                device, non_blocking=non_blocking_transfers
+            )
+        example_ids = batch["example_ids"].to(
+            device, non_blocking=non_blocking_transfers
+        )
+        positions_3d = batch["positions_3d"].to(
+            device, non_blocking=non_blocking_transfers
+        )
         if accum_index == 0:
             optimizer.zero_grad(set_to_none=True)
             if dataloader_length is not None:
@@ -558,6 +567,7 @@ def validate_one_epoch(
     model: TinyTransformer,
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
+    non_blocking_transfers: bool = False,
 ) -> float:
     """Calculates validation loss (Output Loss) on the test set."""
     model.eval()
@@ -566,17 +576,25 @@ def validate_one_epoch(
 
     for batch in dataloader:
         has_padding = bool(batch.get("has_padding", True))
-        input_ids = batch["input_ids"].to(device)
+        input_ids = batch["input_ids"].to(device, non_blocking=non_blocking_transfers)
         sep_indices_cpu = batch.get("sep_indices")
         sep_indices = (
-            sep_indices_cpu.to(device) if sep_indices_cpu is not None else None
+            sep_indices_cpu.to(device, non_blocking=non_blocking_transfers)
+            if sep_indices_cpu is not None
+            else None
         )
         if not has_padding:
             attention_mask = None
         else:
-            attention_mask = batch["attention_mask"].to(device)
-        example_ids = batch["example_ids"].to(device)
-        positions_3d = batch["positions_3d"].to(device)
+            attention_mask = batch["attention_mask"].to(
+                device, non_blocking=non_blocking_transfers
+            )
+        example_ids = batch["example_ids"].to(
+            device, non_blocking=non_blocking_transfers
+        )
+        positions_3d = batch["positions_3d"].to(
+            device, non_blocking=non_blocking_transfers
+        )
 
         if not any(batch["has_output"]):
             continue
@@ -1074,11 +1092,24 @@ def train_model(
     if checkpoint is None:
         checkpoint = getattr(model, "_loaded_checkpoint", None)
 
+    non_blocking_transfers = bool(
+        getattr(args, "non_blocking_transfers", True) and device.type == "cuda"
+    )
     do_validate = getattr(args, "do_validate", True)
     val_dataloader = None
 
     if do_validate:
         val_batch_size = getattr(args, "val_batch_size", args.batch_size)
+        val_num_workers = getattr(
+            args, "val_num_workers", getattr(args, "num_workers", None)
+        )
+        val_pin_memory = getattr(args, "val_pin_memory", getattr(args, "pin_memory", None))
+        val_persistent_workers = getattr(
+            args, "val_persistent_workers", getattr(args, "persistent_workers", None)
+        )
+        val_prefetch_factor = getattr(
+            args, "val_prefetch_factor", getattr(args, "prefetch_factor", None)
+        )
         print(f"Building validation dataloader (batch_size={val_batch_size})...")
         print("Building validation dataloader (reading hidden solutions)...")
         val_dataset = ARCExampleDataset(
@@ -1094,10 +1125,23 @@ def train_model(
             dataset=val_dataset,
             batch_size=val_batch_size,
             shuffle=False,
+            num_workers=val_num_workers,
+            pin_memory=val_pin_memory,
+            persistent_workers=val_persistent_workers,
+            prefetch_factor=val_prefetch_factor,
+            device=device,
         )
         print(f"Validation dataset size: {len(val_dataset)}")
+        print(
+            "Validation dataloader settings: "
+            f"workers={val_dataloader.num_workers}, "
+            f"pin_memory={val_dataloader.pin_memory}, "
+            f"persistent_workers={getattr(val_dataloader, 'persistent_workers', False)}, "
+            f"prefetch_factor={getattr(val_dataloader, 'prefetch_factor', None)}"
+        )
     else:
         print("Validation disabled (skipping solutions.json load).")
+    print(f"Non-blocking batch transfers: {non_blocking_transfers}")
 
     log_file = getattr(args, "train_log_file", None)
     if log_file is not None and not isinstance(log_file, Path):
@@ -1301,6 +1345,7 @@ def train_model(
                 train_log_mode=train_log_mode,
                 log_location=log_location,
                 log_handle=log_handle,
+                non_blocking_transfers=non_blocking_transfers,
             )
 
             if val_dataloader is not None:
@@ -1308,6 +1353,7 @@ def train_model(
                     model=model,
                     dataloader=val_dataloader,
                     device=device,
+                    non_blocking_transfers=non_blocking_transfers,
                 )
 
                 val_msg = (

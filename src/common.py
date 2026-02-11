@@ -8,6 +8,7 @@ import functools
 import hashlib
 import json
 import math
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -755,7 +756,24 @@ def create_dataloader(
     augment_selector: Optional[
         Callable[[SequenceExample], Tuple[Optional[torch.Tensor], Optional[int]]]
     ] = None,
+    *,
+    num_workers: Optional[int] = None,
+    pin_memory: Optional[bool] = None,
+    persistent_workers: Optional[bool] = None,
+    prefetch_factor: Optional[int] = None,
+    device: Optional[torch.device] = None,
 ) -> DataLoader:
+    def _resolve_num_workers(requested: Optional[int]) -> int:
+        if requested is not None:
+            value = int(requested)
+            if value < 0:
+                raise ValueError("num_workers must be >= 0.")
+            return value
+        cpu_count = os.cpu_count() or 0
+        if cpu_count <= 2:
+            return 0
+        return min(8, max(1, cpu_count // 2))
+
     lengths = getattr(dataset, "sequence_lengths", None)
     if lengths is None:
         lengths = [len(dataset[i].tokens) for i in range(len(dataset))]
@@ -771,12 +789,42 @@ def create_dataloader(
         )
     else:
         collate_fn = collate_examples
-    return DataLoader(
-        dataset,
-        batch_sampler=batch_sampler,
-        num_workers=0,
-        collate_fn=collate_fn,
-    )
+
+    resolved_num_workers = _resolve_num_workers(num_workers)
+
+    use_cuda = torch.cuda.is_available()
+    if device is not None:
+        use_cuda = device.type == "cuda"
+    resolved_pin_memory = bool(use_cuda) if pin_memory is None else bool(pin_memory)
+
+    if persistent_workers is None:
+        resolved_persistent_workers = resolved_num_workers > 0
+    else:
+        resolved_persistent_workers = bool(
+            persistent_workers and resolved_num_workers > 0
+        )
+
+    # Augmentation schedule is updated per-epoch in the main process.
+    # With persistent workers, worker-side selector copies would keep stale epoch state.
+    if augment_selector is not None and resolved_persistent_workers:
+        resolved_persistent_workers = False
+
+    resolved_prefetch_factor = 2 if prefetch_factor is None else int(prefetch_factor)
+    if resolved_num_workers > 0 and resolved_prefetch_factor <= 0:
+        raise ValueError("prefetch_factor must be >= 1 when num_workers > 0.")
+
+    dataloader_kwargs: Dict[str, Any] = {
+        "dataset": dataset,
+        "batch_sampler": batch_sampler,
+        "num_workers": resolved_num_workers,
+        "pin_memory": resolved_pin_memory,
+        "collate_fn": collate_fn,
+    }
+    if resolved_num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = resolved_persistent_workers
+        dataloader_kwargs["prefetch_factor"] = resolved_prefetch_factor
+
+    return DataLoader(**dataloader_kwargs)
 
 
 # =============================================================================

@@ -31,6 +31,16 @@ args_dict = {
     "gradient_accumulation_steps": 1,
     "do_validate": False,
     "val_batch_size": 70,
+    # Dataloader throughput knobs
+    "num_workers": 8,
+    "val_num_workers": 4,
+    "pin_memory": True,
+    "val_pin_memory": True,
+    "persistent_workers": True,
+    "val_persistent_workers": True,
+    "prefetch_factor": 4,
+    "val_prefetch_factor": 2,
+    "non_blocking_transfers": True,
 
     "enable_aug": True,
     "max_augments": 80,

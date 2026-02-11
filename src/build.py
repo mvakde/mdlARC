@@ -128,11 +128,34 @@ def build_model_and_data(
     collate_augment_selector = None
     if augmentor is not None:
         collate_augment_selector = augmentor.select_for_example
+    train_num_workers = getattr(args, "num_workers", None)
+    train_pin_memory = getattr(args, "pin_memory", None)
+    train_persistent_workers = getattr(args, "persistent_workers", None)
+    train_prefetch_factor = getattr(args, "prefetch_factor", None)
     dataloader = create_dataloader(
         dataset=dataset,
         batch_size=args.batch_size,
         shuffle=not getattr(args, "eval_only", False),
         augment_selector=collate_augment_selector,
+        num_workers=train_num_workers,
+        pin_memory=train_pin_memory,
+        persistent_workers=train_persistent_workers,
+        prefetch_factor=train_prefetch_factor,
+        device=device,
+    )
+    requested_persistent_workers = train_persistent_workers
+    if requested_persistent_workers is None:
+        requested_persistent_workers = dataloader.num_workers > 0
+    if augmentor is not None and bool(requested_persistent_workers):
+        print(
+            "Training dataloader: disabling persistent workers because augmentation "
+            "selection is updated each epoch."
+        )
+    print(
+        "Training dataloader settings: "
+        f"workers={dataloader.num_workers}, pin_memory={dataloader.pin_memory}, "
+        f"persistent_workers={getattr(dataloader, 'persistent_workers', False)}, "
+        f"prefetch_factor={getattr(dataloader, 'prefetch_factor', None)}"
     )
     if augmentor is not None:
         dataloader.augmentor = augmentor
