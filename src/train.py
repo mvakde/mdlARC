@@ -7,10 +7,9 @@ For model/data building, see build.py.
 import argparse
 import math
 import numbers
-import os
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, TextIO, Tuple
+from typing import Any, Dict, Optional, Sequence, Set, TextIO, Tuple
 
 import torch
 from torch import nn
@@ -49,7 +48,7 @@ def _zeropower_via_newtonschulz5(G, steps=5):
 
 def _normuon_update(grad, momentum, second_momentum, beta=0.95, beta2=0.95, ns_steps=5, nesterov=True):
     momentum.lerp_(grad, 1 - beta)
-    update = torch.lerp(grad, momentum, beta) if nesterov else momentum
+    update = grad.lerp_(momentum, beta) if nesterov else momentum
     original_shape = None
     if update.ndim == 4:
         original_shape = update.shape
@@ -100,91 +99,6 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 }
         super().__init__(param_groups, dict())
 
-        self._normuon_update_fn: Callable[..., torch.Tensor] = _normuon_update
-        self._adam_update_fn: Callable[..., torch.Tensor] = _adam_update
-        self._compiled_update_kernels = False
-        self._zero_scalars: Dict[Tuple[torch.device, torch.dtype], torch.Tensor] = {}
-
-        disable_compile = str(
-            os.environ.get("MDLARC_DISABLE_OPTIMIZER_COMPILE", "0")
-        ).lower() in {"1", "true", "yes", "on"}
-        has_cuda_params = any(
-            p.is_cuda for group in param_groups for p in group["params"]
-        )
-        if has_cuda_params and hasattr(torch, "compile") and not disable_compile:
-            try:
-                self._normuon_update_fn = torch.compile(
-                    _normuon_update,
-                    mode="reduce-overhead",
-                    fullgraph=False,
-                    dynamic=True,
-                )
-                self._adam_update_fn = torch.compile(
-                    _adam_update,
-                    mode="reduce-overhead",
-                    fullgraph=False,
-                    dynamic=True,
-                )
-                self._compiled_update_kernels = True
-                print("Compiled NorMuon optimizer update kernels.")
-            except Exception as exc:
-                print(f"Skipping NorMuon optimizer kernel compile ({exc}).")
-
-    def _get_zero_grad(self, p: torch.Tensor) -> torch.Tensor:
-        key = (p.device, p.dtype)
-        zero = self._zero_scalars.get(key)
-        if zero is None:
-            zero = torch.zeros((), device=p.device, dtype=p.dtype)
-            self._zero_scalars[key] = zero
-        return zero.expand_as(p)
-
-    def _call_normuon_update(
-        self,
-        grad: torch.Tensor,
-        momentum: torch.Tensor,
-        second_momentum: torch.Tensor,
-        beta: float,
-        beta2: float,
-    ) -> torch.Tensor:
-        if not self._compiled_update_kernels:
-            return _normuon_update(grad, momentum, second_momentum, beta=beta, beta2=beta2)
-        try:
-            return self._normuon_update_fn(
-                grad, momentum, second_momentum, beta=beta, beta2=beta2
-            )
-        except Exception as exc:
-            print(
-                "Compiled NorMuon kernels failed during step "
-                f"({exc}); falling back to eager optimizer updates."
-            )
-            self._compiled_update_kernels = False
-            self._normuon_update_fn = _normuon_update
-            self._adam_update_fn = _adam_update
-            return _normuon_update(grad, momentum, second_momentum, beta=beta, beta2=beta2)
-
-    def _call_adam_update(
-        self,
-        grad: torch.Tensor,
-        buf1: torch.Tensor,
-        buf2: torch.Tensor,
-        step: int,
-        betas: Tuple[float, float],
-        eps: float,
-    ) -> torch.Tensor:
-        if not self._compiled_update_kernels:
-            return _adam_update(grad, buf1, buf2, step, betas, eps)
-        try:
-            return self._adam_update_fn(grad, buf1, buf2, step, betas, eps)
-        except Exception as exc:
-            print(
-                "Compiled NorMuon kernels failed during step "
-                f"({exc}); falling back to eager optimizer updates."
-            )
-            self._compiled_update_kernels = False
-            self._normuon_update_fn = _normuon_update
-            self._adam_update_fn = _adam_update
-            return _adam_update(grad, buf1, buf2, step, betas, eps)
-
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -194,164 +108,46 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
 
         for group in self.param_groups:
             if group["use_muon"]:
-                lr = float(group["lr"])
-                beta = float(group["momentum"])
-                beta2 = float(group["beta2"])
-                weight_decay = float(group["weight_decay"])
-
-                buckets: Dict[
-                    Tuple[Tuple[int, ...], torch.dtype, torch.device], List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]
-                ] = {}
                 for p in group["params"]:
-                    grad = p.grad
-                    had_grad = grad is not None
-                    if grad is None:
-                        grad = self._get_zero_grad(p)
+                    had_grad = p.grad is not None
+                    if not had_grad:
+                        p.grad = torch.zeros_like(p)
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
                         state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
-                    key = (tuple(p.shape), p.dtype, p.device)
-                    bucket = buckets.setdefault(key, [])
-                    bucket.append(
-                        (
-                            p,
-                            grad,
-                            state["momentum_buffer"],
-                            state["second_momentum_buffer"],
-                            had_grad,
-                        )
+                    update = _normuon_update(
+                        p.grad,
+                        state["momentum_buffer"],
+                        state["second_momentum_buffer"],
+                        beta=group["momentum"],
+                        beta2=group["beta2"],
                     )
-
-                params_to_update: List[torch.Tensor] = []
-                updates: List[torch.Tensor] = []
-                params_with_grad: List[torch.Tensor] = []
-
-                for bucket in buckets.values():
-                    if len(bucket) == 1:
-                        p, grad, momentum_buffer, second_momentum_buffer, had_grad = bucket[0]
-                        update = self._call_normuon_update(
-                            grad,
-                            momentum_buffer,
-                            second_momentum_buffer,
-                            beta,
-                            beta2,
-                        )
-                        params_to_update.append(p)
-                        updates.append(update.reshape_as(p))
-                        if weight_decay and had_grad:
-                            params_with_grad.append(p)
-                        continue
-
-                    grad_batch = torch.stack([item[1] for item in bucket], dim=0)
-                    momentum_batch = torch.stack([item[2] for item in bucket], dim=0)
-                    second_momentum_batch = torch.stack(
-                        [item[3] for item in bucket], dim=0
-                    )
-                    update_batch = self._call_normuon_update(
-                        grad_batch,
-                        momentum_batch,
-                        second_momentum_batch,
-                        beta,
-                        beta2,
-                    )
-
-                    for idx, (
-                        p,
-                        _grad,
-                        momentum_buffer,
-                        second_momentum_buffer,
-                        had_grad,
-                    ) in enumerate(bucket):
-                        momentum_buffer.copy_(momentum_batch[idx])
-                        second_momentum_buffer.copy_(second_momentum_batch[idx])
-                        params_to_update.append(p)
-                        updates.append(update_batch[idx].reshape_as(p))
-                        if weight_decay and had_grad:
-                            params_with_grad.append(p)
-
-                if weight_decay and params_with_grad:
-                    torch._foreach_mul_(params_with_grad, 1 - lr * weight_decay)
-                if params_to_update:
-                    torch._foreach_add_(params_to_update, updates, alpha=-lr)
+                    if group["weight_decay"] and had_grad:
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
             else:
-                lr = float(group["lr"])
-                betas = group["betas"]
-                beta1 = float(betas[0])
-                beta2 = float(betas[1])
-                eps = float(group["eps"])
-                weight_decay = float(group["weight_decay"])
-
-                params: List[torch.Tensor] = []
-                grads: List[torch.Tensor] = []
-                exp_avgs: List[torch.Tensor] = []
-                exp_avg_sqs: List[torch.Tensor] = []
-                steps: List[int] = []
-                params_with_grad: List[torch.Tensor] = []
-
                 for p in group["params"]:
-                    grad = p.grad
-                    had_grad = grad is not None
-                    if grad is None:
-                        grad = self._get_zero_grad(p)
+                    had_grad = p.grad is not None
+                    if not had_grad:
+                        p.grad = torch.zeros_like(p)
                     state = self.state[p]
                     if len(state) == 0:
                         state["exp_avg"] = torch.zeros_like(p)
                         state["exp_avg_sq"] = torch.zeros_like(p)
                         state["step"] = 0
                     state["step"] += 1
-                    step = int(state["step"])
-
-                    params.append(p)
-                    grads.append(grad)
-                    exp_avgs.append(state["exp_avg"])
-                    exp_avg_sqs.append(state["exp_avg_sq"])
-                    steps.append(step)
-                    if weight_decay and had_grad:
-                        params_with_grad.append(p)
-
-                if not params:
-                    continue
-
-                all_same_step = all(step == steps[0] for step in steps)
-                if all_same_step:
-                    torch._foreach_lerp_(exp_avgs, grads, 1 - beta1)
-                    torch._foreach_mul_(exp_avg_sqs, beta2)
-                    torch._foreach_addcmul_(
-                        exp_avg_sqs,
-                        grads,
-                        grads,
-                        value=1 - beta2,
+                    update = _adam_update(
+                        p.grad,
+                        state["exp_avg"],
+                        state["exp_avg_sq"],
+                        state["step"],
+                        group["betas"],
+                        group["eps"],
                     )
-
-                    step_value = steps[0]
-                    bias_correction1 = 1 - beta1**step_value
-                    bias_correction2 = 1 - beta2**step_value
-
-                    updates = torch._foreach_div(exp_avgs, bias_correction1)
-                    denoms = torch._foreach_sqrt(exp_avg_sqs)
-                    torch._foreach_div_(denoms, math.sqrt(bias_correction2))
-                    torch._foreach_add_(denoms, eps)
-                    updates = torch._foreach_div(updates, denoms)
-                else:
-                    updates = []
-                    for grad, exp_avg, exp_avg_sq, step in zip(
-                        grads, exp_avgs, exp_avg_sqs, steps
-                    ):
-                        updates.append(
-                            self._call_adam_update(
-                                grad,
-                                exp_avg,
-                                exp_avg_sq,
-                                step,
-                                betas,
-                                eps,
-                            )
-                        )
-
-                if weight_decay and params_with_grad:
-                    torch._foreach_mul_(params_with_grad, 1 - lr * weight_decay)
-                torch._foreach_add_(params, updates, alpha=-lr)
+                    if group["weight_decay"] and had_grad:
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
         return loss
 
 
