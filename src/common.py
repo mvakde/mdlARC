@@ -683,6 +683,7 @@ def collate_examples(
             int,
             int,
             Optional[torch.Tensor],
+            int,
         ]
     ] = []
     for example in batch:
@@ -691,9 +692,15 @@ def collate_examples(
         cached_positions = getattr(example, "cached_positions", None)
         mapping: Optional[torch.Tensor] = None
         transform_index: Optional[int] = None
+        dihedral_id = 0
         if augment_selector is not None:
             mapping, transform_index = augment_selector(example)
         if transform_index is not None:
+            if transform_index < 0 or transform_index >= 8:
+                raise ValueError(
+                    f"Invalid dihedral index {transform_index} for example {example.task_id}."
+                )
+            dihedral_id = int(transform_index)
             tokens_by_dihedral = getattr(example, "tokens_by_dihedral", None)
             if tokens_by_dihedral:
                 if transform_index < 0 or transform_index >= len(tokens_by_dihedral):
@@ -708,7 +715,9 @@ def collate_examples(
                 if sep_by_dihedral:
                     sep_index = sep_by_dihedral[transform_index]
         seq_len = int(tokens.size(0))
-        selected.append((example, tokens, cached_positions, seq_len, sep_index, mapping))
+        selected.append(
+            (example, tokens, cached_positions, seq_len, sep_index, mapping, dihedral_id)
+        )
 
     batch_size = len(selected)
     seq_lengths = torch.tensor([item[3] for item in selected], dtype=torch.int32)
@@ -717,18 +726,26 @@ def collate_examples(
 
     input_ids = torch.zeros(total_tokens, dtype=torch.long)
     example_ids = torch.zeros(batch_size, dtype=torch.long)
+    dihedral_ids = torch.zeros(batch_size, dtype=torch.long)
     sep_indices = torch.zeros(batch_size, dtype=torch.long)
     positions_3d = torch.zeros((total_tokens, 3), dtype=torch.long)
 
     cursor = 0
-    for idx, (example, tokens, cached_positions, seq_len, sep_index, mapping) in enumerate(
-        selected
-    ):
+    for idx, (
+        example,
+        tokens,
+        cached_positions,
+        seq_len,
+        sep_index,
+        mapping,
+        dihedral_id,
+    ) in enumerate(selected):
         if mapping is not None:
             tokens = mapping[tokens]
         next_cursor = cursor + seq_len
         input_ids[cursor:next_cursor] = tokens
         example_ids[idx] = example.example_id
+        dihedral_ids[idx] = int(dihedral_id)
         sep_indices[idx] = int(sep_index)
         if cached_positions is None:
             fake_batch = tokens.unsqueeze(0)
@@ -746,6 +763,7 @@ def collate_examples(
         "max_seqlen": max_len,
         "has_padding": False,
         "example_ids": example_ids,
+        "dihedral_ids": dihedral_ids,
         "sep_indices": sep_indices,
         "positions_3d": positions_3d,
         "task_ids": [example.task_id for example in batch],

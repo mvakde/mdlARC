@@ -36,6 +36,7 @@ class TinyTransformerConfig:
     dropout: float = 0.1
     attention_dropout: Optional[float] = None
     num_examples: int = 1280
+    num_dihedrals: int = 8
 
     def __post_init__(self) -> None:
         if self.attention_dropout is None:
@@ -47,6 +48,8 @@ class TinyTransformerConfig:
             raise ValueError("n_layers must be >= 1.")
         if self.num_examples < 1:
             raise ValueError("num_examples must be >= 1.")
+        if self.num_dihedrals != 8:
+            raise ValueError("num_dihedrals must be exactly 8.")
 
 
 class RMSNorm(nn.Module):
@@ -554,6 +557,7 @@ class TinyTransformer(nn.Module):
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.example_embedding = nn.Embedding(config.num_examples, config.d_model)
+        self.dihedral_embedding = nn.Embedding(config.num_dihedrals, config.d_model)
         self.dropout = nn.Dropout(config.dropout)
 
         self.blocks = nn.ModuleList(
@@ -678,6 +682,7 @@ class TinyTransformer(nn.Module):
         self,
         input_ids: torch.Tensor,
         example_ids: torch.Tensor,
+        dihedral_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         sep_indices: Optional[torch.Tensor] = None,
         compute_input_loss: bool = True,
@@ -690,6 +695,7 @@ class TinyTransformer(nn.Module):
             return self._forward_varlen(
                 input_ids=input_ids,
                 example_ids=example_ids,
+                dihedral_ids=dihedral_ids,
                 sep_indices=sep_indices,
                 compute_input_loss=compute_input_loss,
                 targets=targets,
@@ -701,6 +707,7 @@ class TinyTransformer(nn.Module):
             return self._forward_padded(
                 input_ids=input_ids,
                 example_ids=example_ids,
+                dihedral_ids=dihedral_ids,
                 attention_mask=attention_mask,
                 sep_indices=sep_indices,
                 compute_input_loss=compute_input_loss,
@@ -713,6 +720,7 @@ class TinyTransformer(nn.Module):
         self,
         input_ids: torch.Tensor,
         example_ids: torch.Tensor,
+        dihedral_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         sep_indices: Optional[torch.Tensor],
         compute_input_loss: bool,
@@ -739,14 +747,25 @@ class TinyTransformer(nn.Module):
 
         if positions_3d is not None and positions_3d.shape[:2] != input_ids.shape:
             raise ValueError("positions_3d must match [batch, seq_len] of input_ids.")
+        if example_ids.device != device or example_ids.dtype != torch.long:
+            example_ids = example_ids.to(device=device, dtype=torch.long)
+        if example_ids.dim() != 1 or example_ids.size(0) != batch_size:
+            raise ValueError("example_ids must have shape [batch_size].")
+        if dihedral_ids.device != device or dihedral_ids.dtype != torch.long:
+            dihedral_ids = dihedral_ids.to(device=device, dtype=torch.long)
+        if dihedral_ids.dim() != 1 or dihedral_ids.size(0) != batch_size:
+            raise ValueError("dihedral_ids must have shape [batch_size].")
 
         if targets is None:
             targets = input_ids
 
         token_embeds = self.token_embedding(input_ids)
         example_embeds = self.example_embedding(example_ids)  # [B, D]
+        dihedral_embeds = self.dihedral_embedding(dihedral_ids)  # [B, D]
         # Add the per-example embedding to every token in the sequence.
-        hidden_states = token_embeds + example_embeds.unsqueeze(1)
+        hidden_states = (
+            token_embeds + example_embeds.unsqueeze(1) + dihedral_embeds.unsqueeze(1)
+        )
         hidden_states = self.dropout(hidden_states)
 
         # Compute or reuse 3D positions per token.
@@ -838,6 +857,7 @@ class TinyTransformer(nn.Module):
         self,
         input_ids: torch.Tensor,
         example_ids: torch.Tensor,
+        dihedral_ids: torch.Tensor,
         sep_indices: Optional[torch.Tensor],
         compute_input_loss: bool,
         targets: Optional[torch.Tensor],
@@ -851,10 +871,14 @@ class TinyTransformer(nn.Module):
             raise ValueError("positions_3d is required for packed varlen inputs.")
         if example_ids.dim() != 1:
             raise ValueError("example_ids must have shape [batch_size] for varlen inputs.")
+        if dihedral_ids.dim() != 1:
+            raise ValueError("dihedral_ids must have shape [batch_size] for varlen inputs.")
 
         device = input_ids.device
         total_tokens = int(input_ids.size(0))
         batch_size = int(example_ids.size(0))
+        if int(dihedral_ids.size(0)) != batch_size:
+            raise ValueError("dihedral_ids must match example_ids shape [batch_size].")
         if positions_3d.shape != (total_tokens, 3):
             raise ValueError("positions_3d must match packed shape [total_tokens, 3].")
 
@@ -896,12 +920,22 @@ class TinyTransformer(nn.Module):
             sequence_ends = cu_seqlens[1:].to(dtype=torch.long) - 1
             targets[sequence_ends] = IGNORE_INDEX
 
+        example_ids = example_ids.to(device=device, dtype=torch.long)
+        dihedral_ids = dihedral_ids.to(device=device, dtype=torch.long)
         token_example_ids = torch.repeat_interleave(
-            example_ids.to(device=device, dtype=torch.long),
+            example_ids,
+            seq_lengths,
+        )
+        token_dihedral_ids = torch.repeat_interleave(
+            dihedral_ids,
             seq_lengths,
         )
         token_embeds = self.token_embedding(input_ids)
-        hidden_states = token_embeds + self.example_embedding(token_example_ids)
+        hidden_states = (
+            token_embeds
+            + self.example_embedding(token_example_ids)
+            + self.dihedral_embedding(token_dihedral_ids)
+        )
         hidden_states = self.dropout(hidden_states)
 
         pos_xyz = positions_3d.to(device=device, dtype=torch.long)
@@ -974,6 +1008,7 @@ class TinyTransformer(nn.Module):
         self,
         input_ids: torch.Tensor,
         example_ids: torch.Tensor,
+        dihedral_ids: torch.Tensor,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
         positions_3d: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -1001,6 +1036,12 @@ class TinyTransformer(nn.Module):
             raise ValueError("positions_3d must match [batch, seq_len] of input_ids.")
 
         device = input_ids.device
+        example_ids = example_ids.to(device=device, dtype=torch.long)
+        dihedral_ids = dihedral_ids.to(device=device, dtype=torch.long)
+        if example_ids.dim() != 1 or example_ids.size(0) != batch_size:
+            raise ValueError("example_ids must have shape [batch_size].")
+        if dihedral_ids.dim() != 1 or dihedral_ids.size(0) != batch_size:
+            raise ValueError("dihedral_ids must have shape [batch_size].")
         if attention_mask is not None:
             if attention_mask.device != device or attention_mask.dtype != torch.bool:
                 attention_mask = attention_mask.to(device=device, dtype=torch.bool)
@@ -1012,12 +1053,15 @@ class TinyTransformer(nn.Module):
                 )
         else:
             example_embeds = self.example_embedding(example_ids)
+        dihedral_embeds = self.dihedral_embedding(dihedral_ids)
 
         token_embeds = self.token_embedding(input_ids)
 
         # During generation, also broadcast the example embedding across
         # all tokens in the (prompt or incremental) sequence.
-        hidden_states = token_embeds + example_embeds.unsqueeze(1)
+        hidden_states = (
+            token_embeds + example_embeds.unsqueeze(1) + dihedral_embeds.unsqueeze(1)
+        )
         # hidden_states = self.dropout(hidden_states)
 
         pos_xyz = (

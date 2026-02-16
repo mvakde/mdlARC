@@ -469,6 +469,7 @@ def train_one_epoch(
             else:
                 attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
+        dihedral_ids = batch["dihedral_ids"].to(device)
         positions_3d = batch["positions_3d"].to(device)
         if accum_index == 0:
             optimizer.zero_grad(set_to_none=True)
@@ -484,6 +485,7 @@ def train_one_epoch(
             outputs = model(
                 input_ids,
                 example_ids,
+                dihedral_ids,
                 attention_mask=attention_mask,
                 sep_indices=sep_indices,
                 compute_input_loss=False,
@@ -609,6 +611,7 @@ def validate_one_epoch(
             else:
                 attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
+        dihedral_ids = batch["dihedral_ids"].to(device)
         positions_3d = batch["positions_3d"].to(device)
 
         if not any(batch["has_output"]):
@@ -620,6 +623,7 @@ def validate_one_epoch(
             outputs = model(
                 input_ids,
                 example_ids,
+                dihedral_ids,
                 attention_mask=attention_mask,
                 sep_indices=sep_indices,
                 compute_input_loss=False,
@@ -731,7 +735,9 @@ def _collect_param_groups(
         if isinstance(module, nn.Embedding):
             if name.startswith("token_embedding."):
                 groups["token_embed"].append(param)
-            elif name.startswith("example_embedding."):
+            elif name.startswith("example_embedding.") or name.startswith(
+                "dihedral_embedding."
+            ):
                 groups["task_embed"].append(param)
             else:
                 groups["no_decay"].append(param)

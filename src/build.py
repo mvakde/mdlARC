@@ -180,7 +180,14 @@ def build_model_and_data(
 
     if checkpoint:
         state_dict = checkpoint["model_state"]
-        model.load_state_dict(state_dict, strict=False)
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        if "dihedral_embedding.weight" in set(incompatible.missing_keys):
+            checkpoint_path = checkpoint.get("__path__", "<checkpoint>")
+            raise ValueError(
+                "Checkpoint is missing required dihedral embedding weights "
+                f"(dihedral_embedding.weight): {checkpoint_path}. "
+                "This checkpoint predates dihedral embedding support."
+            )
         restore_rng_state(checkpoint.get("rng_state"), device)
 
     # Stash checkpoint for downstream consumers (e.g., so train_model can restore the optimizer).
