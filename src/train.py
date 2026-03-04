@@ -1316,10 +1316,14 @@ def train_model(
         else:
             scheduler.step(float(start_epoch))
 
-    # Compile model for training speedup
+    # Compile model for training speedup (reuse compiled wrapper when available).
     if hasattr(torch, "compile") and device.type == "cuda":
-        print("Compiling model for training speedup...")
-        training_model = torch.compile(model)
+        # Store on __dict__ to avoid registering compiled wrapper as a child module.
+        training_model = model.__dict__.get("_compiled_training")
+        if training_model is None:
+            print("Compiling model for training speedup...")
+            training_model = torch.compile(model)
+            model.__dict__["_compiled_training"] = training_model
     else:
         training_model = model
 

@@ -19,6 +19,7 @@ from build import build_model_and_data
 from common import (
     Augmentor,
     Augments,
+    ARCExampleDataset,
     END_TOKEN_ID,
     IO_SEPARATOR_TOKEN_ID,
     NEXT_LINE_TOKEN_ID,
@@ -168,6 +169,7 @@ def batched_greedy_generate(
     cached_positions=None, temperature: Optional[float] = None, top_k: Optional[int] = None,
 ):
     model.eval()
+    use_amp = device.type == "cuda"
     batch_size = len(prompts)
 
     example_ids_tensor = torch.tensor(example_ids, dtype=torch.long, device=device)
@@ -176,7 +178,10 @@ def batched_greedy_generate(
     current_len = input_ids.size(1)
     batch_max_needed = current_len + max_new_tokens
     batch_max_needed = (batch_max_needed + 127) // 128 * 128
-    max_model_len = min(batch_max_needed, model.config.max_seq_len)
+    if getattr(model, "_force_full_seq_len", False):
+        max_model_len = model.config.max_seq_len
+    else:
+        max_model_len = min(batch_max_needed, model.config.max_seq_len)
 
     if cached_positions and all(p is not None for p in cached_positions):
         prompt_positions = _pad_cached_positions([p for p in cached_positions if p is not None], input_ids.size(1), device)
@@ -185,24 +190,25 @@ def batched_greedy_generate(
 
     initial_state, finished = _derive_initial_state_from_prompt(input_ids, prompt_positions)
     grid_state = BatchGridState(initial_state)
-    example_embeds = model.example_embedding(example_ids_tensor).to(dtype=torch.bfloat16)
+    example_embeds = model.example_embedding(example_ids_tensor)
     current_len = input_ids.size(1)
 
     full_attention_mask = torch.zeros((batch_size, max_model_len), dtype=torch.bool, device=device)
     full_attention_mask[:, :current_len] = attention_mask
 
-    outputs = model.forward_generate(
-        input_ids=input_ids, example_ids=example_ids_tensor, dihedral_ids=dihedral_ids_tensor, past_key_values=None,
-        positions_3d=prompt_positions, attention_mask=attention_mask, example_embeds=example_embeds,
-    )
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+        outputs = model.forward_generate(
+            input_ids=input_ids, example_ids=example_ids_tensor, dihedral_ids=dihedral_ids_tensor, past_key_values=None,
+            positions_3d=prompt_positions, attention_mask=attention_mask, example_embeds=example_embeds,
+        )
     logits = outputs["logits"]
     prompt_kvs = outputs["past_key_values"]
 
     past_key_values = []
     for k, v in prompt_kvs:
         B, H, L, D = k.shape
-        k_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.bfloat16, device=device)
-        v_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.bfloat16, device=device)
+        k_buf = torch.zeros((B, H, max_model_len, D), dtype=k.dtype, device=device)
+        v_buf = torch.zeros((B, H, max_model_len, D), dtype=v.dtype, device=device)
         k_buf[:, :, :L, :] = k
         v_buf[:, :, :L, :] = v
         past_key_values.append((k_buf, v_buf))
@@ -235,12 +241,13 @@ def batched_greedy_generate(
                 kv_len=max_model_len,
                 device=device,
             )
-        outputs = model._compiled_decode(
-            input_ids=next_token.unsqueeze(1), example_ids=example_ids_tensor, dihedral_ids=dihedral_ids_tensor,
-            past_key_values=past_key_values, positions_3d=token_positions,
-            attention_mask=full_attention_mask, cache_position=cache_position, example_embeds=example_embeds,
-            decode_block_mask=decode_block_mask,
-        )
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+            outputs = model._compiled_decode(
+                input_ids=next_token.unsqueeze(1), example_ids=example_ids_tensor, dihedral_ids=dihedral_ids_tensor,
+                past_key_values=past_key_values, positions_3d=token_positions,
+                attention_mask=full_attention_mask, cache_position=cache_position, example_embeds=example_embeds,
+                decode_block_mask=decode_block_mask,
+            )
         logits = outputs["logits"]
         cache_position.add_(1)
 
@@ -474,8 +481,6 @@ def run_split_inference(
     augmentor: Optional[Augmentor] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, List[List[int]]], bool]:
     model.eval()
-    if next(model.parameters()).dtype != torch.bfloat16:
-        model.to(dtype=torch.bfloat16)
 
     examples = _gather_examples_for_split(
         dataset, split=split, task_ids=task_ids, pair_index=pair_index,
@@ -731,11 +736,14 @@ def run_evaluation(
     run_name: str,
     max_augments: int,
     data_path: Path,
-    checkpoint_path: Path,
+    checkpoint_path: Optional[Path] = None,
     batch_size: int = 1300,
     splits: Sequence[str] = ("test",),
     task_ids: Optional[Sequence[str]] = None,
     timing_path: Path = Path("runs/timing.txt"),
+    model: Optional[TinyTransformer] = None,
+    dataset: Optional[ARCExampleDataset] = None,
+    device: Optional[torch.device] = None,
 ) -> Tuple[str, Dict[str, Dict[str, object]], Path]:
     """Run evaluation on a single configuration, generating submission.json.
 
@@ -745,11 +753,14 @@ def run_evaluation(
         max_augments: Number of augmented variants per example for test-time augmentation (TTA).
             Higher values = more diverse predictions for AAIVR voting, but slower inference.
         data_path: Path to challenges.json file.
-        checkpoint_path: Path to model checkpoint (.pt file).
+        checkpoint_path: Path to model checkpoint (.pt file). Required if model is not provided.
         batch_size: Batch size for inference.
         splits: Dataset splits to evaluate (default: ["test"]).
         task_ids: Optional list of specific task IDs to evaluate (None = all tasks).
         timing_path: Path to write timing information.
+        model: Optional preloaded model to evaluate directly (skips checkpoint load/build).
+        dataset: Optional dataset paired with the provided model.
+        device: Optional device override for provided model.
 
     Returns:
         Tuple of (run_name, evaluation_results, submission_path).
@@ -757,7 +768,8 @@ def run_evaluation(
     timing_path = Path(timing_path)
     timing_path.parent.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path is not None:
+        checkpoint_path = Path(checkpoint_path)
     data_path = Path(data_path)
     t_start = perf_counter()
 
@@ -783,12 +795,23 @@ def run_evaluation(
     if use_aug:
         cfg.max_augments = int(max_augments)
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-
-    print("Building model and dataloader...")
-    model, dataset, _, device, _ = build_model_and_data(
-        cfg, checkpoint=checkpoint, is_eval=True
-    )
+    if model is None:
+        if checkpoint_path is None:
+            raise ValueError("checkpoint_path is required when no model is provided.")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        print("Building model and dataloader...")
+        model, dataset, _, device, _ = build_model_and_data(
+            cfg, checkpoint=checkpoint, is_eval=True
+        )
+    else:
+        if dataset is None:
+            dataset = ARCExampleDataset(
+                json_path=data_path,
+                splits=("train", "test"),
+                include_outputs=True,
+            )
+        if device is None:
+            device = next(model.parameters()).device
 
     def log_eval(msg: str) -> None:
         print(msg)
