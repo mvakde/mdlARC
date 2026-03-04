@@ -185,7 +185,9 @@ def batched_greedy_generate(
 
     initial_state, finished = _derive_initial_state_from_prompt(input_ids, prompt_positions)
     grid_state = BatchGridState(initial_state)
-    example_embeds = model.example_embedding(example_ids_tensor).to(dtype=torch.bfloat16)
+    sequence_embeds = None
+    if getattr(model, "dihedral_embedding", None) is not None:
+        sequence_embeds = model.dihedral_embedding(dihedral_ids_tensor).to(dtype=torch.bfloat16)
     current_len = input_ids.size(1)
 
     full_attention_mask = torch.zeros((batch_size, max_model_len), dtype=torch.bool, device=device)
@@ -193,7 +195,7 @@ def batched_greedy_generate(
 
     outputs = model.forward_generate(
         input_ids=input_ids, example_ids=example_ids_tensor, dihedral_ids=dihedral_ids_tensor, past_key_values=None,
-        positions_3d=prompt_positions, attention_mask=attention_mask, example_embeds=example_embeds,
+        positions_3d=prompt_positions, attention_mask=attention_mask, sequence_embeds=sequence_embeds,
     )
     logits = outputs["logits"]
     prompt_kvs = outputs["past_key_values"]
@@ -238,7 +240,7 @@ def batched_greedy_generate(
         outputs = model._compiled_decode(
             input_ids=next_token.unsqueeze(1), example_ids=example_ids_tensor, dihedral_ids=dihedral_ids_tensor,
             past_key_values=past_key_values, positions_3d=token_positions,
-            attention_mask=full_attention_mask, cache_position=cache_position, example_embeds=example_embeds,
+            attention_mask=full_attention_mask, cache_position=cache_position, sequence_embeds=sequence_embeds,
             decode_block_mask=decode_block_mask,
         )
         logits = outputs["logits"]

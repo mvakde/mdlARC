@@ -150,6 +150,7 @@ def build_model_and_data(
             f"currently exposes {dataset.num_examples}. Pass the original --data-path or retrain."
         )
 
+    use_dihedral_embeddings = bool(getattr(args, "use_dihedral_embeddings", True))
     if checkpoint and "config" in checkpoint:
         config = TinyTransformerConfig(**checkpoint["config"])
     else:
@@ -168,6 +169,7 @@ def build_model_and_data(
             n_layers=n_layers,
             dropout=dropout,
             attention_dropout=attention_dropout,
+            use_dihedral_embeddings=use_dihedral_embeddings,
         )
 
     if dataset.num_examples != config.num_examples:
@@ -181,7 +183,10 @@ def build_model_and_data(
     if checkpoint:
         state_dict = checkpoint["model_state"]
         incompatible = model.load_state_dict(state_dict, strict=False)
-        if "dihedral_embedding.weight" in set(incompatible.missing_keys):
+        if (
+            config.use_dihedral_embeddings
+            and "dihedral_embedding.weight" in set(incompatible.missing_keys)
+        ):
             checkpoint_path = checkpoint.get("__path__", "<checkpoint>")
             raise ValueError(
                 "Checkpoint is missing required dihedral embedding weights "

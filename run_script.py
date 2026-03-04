@@ -38,6 +38,8 @@ args_dict = {
     "color_apply_to_test": True,
     "enable_dihedral_aug": True,
     "dihedral_apply_to_test": True,
+    # Model-side ablation toggle: when False, dihedral embedding vectors are not added to tokens.
+    "use_dihedral_embeddings": True,
 
     "optimizer": "normuon",
     "normuon_lr": 1.66e-3,
@@ -52,7 +54,7 @@ args_dict = {
     "weight_decay": 0.1,
     "attention_weight_decay": 0.01,
     "token_embedding_weight_decay": 0.01,
-    "task_embedding_weight_decay": 0.01,  # Applies to task/example and dihedral embeddings.
+    "task_embedding_weight_decay": 0.01,  # Applies to auxiliary embeddings (dihedral when enabled).
 
     "grad_clip": 1.0,
     "dropout": 0.1,

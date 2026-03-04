@@ -37,6 +37,7 @@ class TinyTransformerConfig:
     attention_dropout: Optional[float] = None
     num_examples: int = 1280
     num_dihedrals: int = 8
+    use_dihedral_embeddings: bool = True
 
     def __post_init__(self) -> None:
         if self.attention_dropout is None:
@@ -556,8 +557,11 @@ class TinyTransformer(nn.Module):
         self.config = config
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.example_embedding = nn.Embedding(config.num_examples, config.d_model)
-        self.dihedral_embedding = nn.Embedding(config.num_dihedrals, config.d_model)
+        self.dihedral_embedding = (
+            nn.Embedding(config.num_dihedrals, config.d_model)
+            if config.use_dihedral_embeddings
+            else None
+        )
         self.dropout = nn.Dropout(config.dropout)
 
         self.blocks = nn.ModuleList(
@@ -571,6 +575,42 @@ class TinyTransformer(nn.Module):
         # Decode block-mask cache keyed by (device_type, device_index, kv_len, block_idx).
         self._decode_block_mask_cache: Dict[Tuple[str, int, int, int], object] = {}
         self._decode_block_size = 128
+
+    def _validate_example_ids(
+        self, example_ids: torch.Tensor, batch_size: int, device: torch.device
+    ) -> torch.Tensor:
+        if example_ids.device != device or example_ids.dtype != torch.long:
+            example_ids = example_ids.to(device=device, dtype=torch.long)
+        if example_ids.dim() != 1 or example_ids.size(0) != batch_size:
+            raise ValueError("example_ids must have shape [batch_size].")
+        return example_ids
+
+    def _validate_dihedral_ids(
+        self,
+        dihedral_ids: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if dihedral_ids.device != device or dihedral_ids.dtype != torch.long:
+            dihedral_ids = dihedral_ids.to(device=device, dtype=torch.long)
+        if dihedral_ids.dim() != 1 or dihedral_ids.size(0) != batch_size:
+            raise ValueError("dihedral_ids must have shape [batch_size].")
+        return dihedral_ids
+
+    def _resolve_dihedral_embeds(
+        self,
+        dihedral_ids: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        dihedral_ids = self._validate_dihedral_ids(
+            dihedral_ids,
+            batch_size=batch_size,
+            device=device,
+        )
+        if self.dihedral_embedding is None:
+            return None
+        return self.dihedral_embedding(dihedral_ids)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -747,25 +787,21 @@ class TinyTransformer(nn.Module):
 
         if positions_3d is not None and positions_3d.shape[:2] != input_ids.shape:
             raise ValueError("positions_3d must match [batch, seq_len] of input_ids.")
-        if example_ids.device != device or example_ids.dtype != torch.long:
-            example_ids = example_ids.to(device=device, dtype=torch.long)
-        if example_ids.dim() != 1 or example_ids.size(0) != batch_size:
-            raise ValueError("example_ids must have shape [batch_size].")
-        if dihedral_ids.device != device or dihedral_ids.dtype != torch.long:
-            dihedral_ids = dihedral_ids.to(device=device, dtype=torch.long)
-        if dihedral_ids.dim() != 1 or dihedral_ids.size(0) != batch_size:
-            raise ValueError("dihedral_ids must have shape [batch_size].")
+        self._validate_example_ids(example_ids, batch_size=batch_size, device=device)
+        dihedral_embeds = self._resolve_dihedral_embeds(
+            dihedral_ids,
+            batch_size=batch_size,
+            device=device,
+        )
 
         if targets is None:
             targets = input_ids
 
         token_embeds = self.token_embedding(input_ids)
-        example_embeds = self.example_embedding(example_ids)  # [B, D]
-        dihedral_embeds = self.dihedral_embedding(dihedral_ids)  # [B, D]
-        # Add the per-example embedding to every token in the sequence.
-        hidden_states = (
-            token_embeds + example_embeds.unsqueeze(1) + dihedral_embeds.unsqueeze(1)
-        )
+        if dihedral_embeds is None:
+            hidden_states = token_embeds
+        else:
+            hidden_states = token_embeds + dihedral_embeds.unsqueeze(1)
         hidden_states = self.dropout(hidden_states)
 
         # Compute or reuse 3D positions per token.
@@ -869,16 +905,15 @@ class TinyTransformer(nn.Module):
             raise ValueError("cu_seqlens is required for packed varlen inputs.")
         if positions_3d is None:
             raise ValueError("positions_3d is required for packed varlen inputs.")
-        if example_ids.dim() != 1:
-            raise ValueError("example_ids must have shape [batch_size] for varlen inputs.")
-        if dihedral_ids.dim() != 1:
-            raise ValueError("dihedral_ids must have shape [batch_size] for varlen inputs.")
-
         device = input_ids.device
         total_tokens = int(input_ids.size(0))
         batch_size = int(example_ids.size(0))
-        if int(dihedral_ids.size(0)) != batch_size:
-            raise ValueError("dihedral_ids must match example_ids shape [batch_size].")
+        self._validate_example_ids(example_ids, batch_size=batch_size, device=device)
+        dihedral_embeds = self._resolve_dihedral_embeds(
+            dihedral_ids,
+            batch_size=batch_size,
+            device=device,
+        )
         if positions_3d.shape != (total_tokens, 3):
             raise ValueError("positions_3d must match packed shape [total_tokens, 3].")
 
@@ -920,20 +955,17 @@ class TinyTransformer(nn.Module):
             sequence_ends = cu_seqlens[1:].to(dtype=torch.long) - 1
             targets[sequence_ends] = IGNORE_INDEX
 
-        example_ids = example_ids.to(device=device, dtype=torch.long)
-        dihedral_ids = dihedral_ids.to(device=device, dtype=torch.long)
         token_embeds = self.token_embedding(input_ids)
 
-        # Build per-sequence conditioning once, then broadcast to packed tokens.
-        sequence_embeds = self.example_embedding(example_ids) + self.dihedral_embedding(
-            dihedral_ids
-        )
-        token_sequence_embeds = torch.repeat_interleave(
-            sequence_embeds,
-            seq_lengths,
-            dim=0,
-        )
-        hidden_states = token_embeds + token_sequence_embeds
+        if dihedral_embeds is None:
+            hidden_states = token_embeds
+        else:
+            token_sequence_embeds = torch.repeat_interleave(
+                dihedral_embeds,
+                seq_lengths,
+                dim=0,
+            )
+            hidden_states = token_embeds + token_sequence_embeds
         hidden_states = self.dropout(hidden_states)
 
         pos_xyz = positions_3d.to(device=device, dtype=torch.long)
@@ -1011,6 +1043,7 @@ class TinyTransformer(nn.Module):
         positions_3d: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         cache_position: Optional[torch.Tensor] = None,
+        sequence_embeds: Optional[torch.Tensor] = None,
         example_embeds: Optional[torch.Tensor] = None,
         decode_block_mask: Optional[object] = None,
     ) -> dict:
@@ -1034,32 +1067,38 @@ class TinyTransformer(nn.Module):
             raise ValueError("positions_3d must match [batch, seq_len] of input_ids.")
 
         device = input_ids.device
-        example_ids = example_ids.to(device=device, dtype=torch.long)
-        dihedral_ids = dihedral_ids.to(device=device, dtype=torch.long)
-        if example_ids.dim() != 1 or example_ids.size(0) != batch_size:
-            raise ValueError("example_ids must have shape [batch_size].")
-        if dihedral_ids.dim() != 1 or dihedral_ids.size(0) != batch_size:
-            raise ValueError("dihedral_ids must have shape [batch_size].")
+        self._validate_example_ids(example_ids, batch_size=batch_size, device=device)
         if attention_mask is not None:
             if attention_mask.device != device or attention_mask.dtype != torch.bool:
                 attention_mask = attention_mask.to(device=device, dtype=torch.bool)
 
-        if example_embeds is not None:
-            if example_embeds.shape[0] != input_ids.size(0):
+        if sequence_embeds is None and example_embeds is not None:
+            # Backwards-compatible alias for older callsites.
+            sequence_embeds = example_embeds
+
+        if sequence_embeds is not None:
+            if sequence_embeds.shape[0] != input_ids.size(0):
                 raise ValueError(
-                    "example_embeds must have batch dimension matching input_ids."
+                    "sequence_embeds must have batch dimension matching input_ids."
                 )
-        else:
-            example_embeds = self.example_embedding(example_ids)
-        dihedral_embeds = self.dihedral_embedding(dihedral_ids)
+            self._validate_dihedral_ids(
+                dihedral_ids,
+                batch_size=batch_size,
+                device=device,
+            )
 
         token_embeds = self.token_embedding(input_ids)
 
-        # During generation, also broadcast the example embedding across
-        # all tokens in the (prompt or incremental) sequence.
-        hidden_states = (
-            token_embeds + example_embeds.unsqueeze(1) + dihedral_embeds.unsqueeze(1)
-        )
+        if sequence_embeds is None:
+            sequence_embeds = self._resolve_dihedral_embeds(
+                dihedral_ids,
+                batch_size=batch_size,
+                device=device,
+            )
+        if sequence_embeds is None:
+            hidden_states = token_embeds
+        else:
+            hidden_states = token_embeds + sequence_embeds.unsqueeze(1)
         # hidden_states = self.dropout(hidden_states)
 
         pos_xyz = (

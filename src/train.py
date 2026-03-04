@@ -735,9 +735,7 @@ def _collect_param_groups(
         if isinstance(module, nn.Embedding):
             if name.startswith("token_embedding."):
                 groups["token_embed"].append(param)
-            elif name.startswith("example_embedding.") or name.startswith(
-                "dihedral_embedding."
-            ):
+            elif name.startswith("dihedral_embedding."):
                 groups["task_embed"].append(param)
             else:
                 groups["no_decay"].append(param)
