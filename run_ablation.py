@@ -27,13 +27,13 @@ def default_config() -> Dict[str, object]:
         "checkpoint_path": None,
         "checkpoint_epochs": [],
         # Hyperparameters
-        "epochs": 240,
-        "batch_size": 32,
+        "epochs": 2000,
+        "batch_size": 100,
         "gradient_accumulation_steps": 1,
         "do_validate": False,
         "val_batch_size": 70,
         "enable_aug": True,
-        "max_augments": 80,
+        "max_augments": 1000,
         "enable_color_aug": True,
         "color_apply_to_test": True,
         "enable_dihedral_aug": True,
@@ -43,7 +43,7 @@ def default_config() -> Dict[str, object]:
         "normuon_momentum": 0.95,
         "normuon_beta2": 0.95,
         "adamw_lr": 3e-4,
-        "warmup_pct": 0.02,
+        "warmup_pct": 0.0,
         "wsd_decay_start_pct": 0.8,
         "lr_floor": 0.0,
         "weight_decay": 0.1,
@@ -62,8 +62,8 @@ def default_config() -> Dict[str, object]:
         "inference_temperature": None,
         "inference_top_k": None,
         # train logging
-        "train_log_mode": "epoch",
-        "log_location": "terminal",
+        "train_log_mode": "never",
+        "log_location": "none",
     }
 
 
@@ -360,7 +360,7 @@ def main() -> None:
     solutions_path = Path(cli.solutions_path)
     if solutions_path.exists():
         utils.score_arc_submission(solutions_path, final_submission_path)
-        utils.visualize_submissions(final_submission_path, solutions_path, mode="!")
+        # utils.visualize_submissions(final_submission_path, solutions_path, mode="!")
     else:
         print(f"Skipping score: solutions file not found at {solutions_path}")
         utils.visualize_submissions(final_submission_path, mode="submission")
