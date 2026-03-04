@@ -26,9 +26,12 @@ args_dict = {
     "checkpoint_epochs": [], # No intermediate saves needed for short run
     
     # Hyperparameters
-    "epochs": 240, 
+    "epochs": 170, 
     "batch_size": 32,
     "gradient_accumulation_steps": 1,
+    # True: optimize autoregressive loss on every token in the sequence.
+    # False: optimize only on output-region tokens.
+    "train_on_all_tokens": True,
     "do_validate": False,
     "val_batch_size": 70,
 
@@ -70,8 +73,8 @@ args_dict = {
     "inference_top_k": None,
 
     # train logging
-    "train_log_mode": "10_steps", # options: never, step, 10_steps, epoch
-    "log_location": "both", # options: none, terminal, file, both.
+    "train_log_mode": "never", # options: never, step, 10_steps, epoch
+    "log_location": "none", # options: none, terminal, file, both.
 }
 cfg = argparse.Namespace(**args_dict) # Convert dictionary to Namespace
 Path("runs").mkdir(parents=True, exist_ok=True) # Create runs dir
@@ -113,6 +116,6 @@ print("Evaluation complete. submission.json generated.")
 if SCORE_RESULTS: # scoring, if enabled
     SOLUTIONS_FILE = Path("assets/solutions.json")
     score = utils.score_arc_submission(SOLUTIONS_FILE, SUBMISSION_FILE)
-    utils.visualize_submissions(SUBMISSION_FILE, SOLUTIONS_FILE, mode="!")
+    # utils.visualize_submissions(SUBMISSION_FILE, SOLUTIONS_FILE, mode="!")
 else:
     utils.visualize_submissions(SUBMISSION_FILE, mode="submission")

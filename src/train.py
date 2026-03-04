@@ -379,6 +379,7 @@ def train_one_epoch(
     epoch: Optional[int] = None,
     steps_per_epoch: Optional[int] = None,
     train_log_mode: str = "10_steps",
+    train_on_all_tokens: bool = True,
     log_location: str = "both",
     log_handle: Optional[TextIO] = None,
 ) -> int:
@@ -493,7 +494,10 @@ def train_one_epoch(
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
-            loss = outputs["output_loss"]
+            loss = outputs["loss"] if train_on_all_tokens else outputs["output_loss"]
+            if loss is None:
+                objective = "all-token loss" if train_on_all_tokens else "output loss"
+                raise RuntimeError(f"Model did not return {objective} during training.")
             inp_loss = outputs.get("input_loss")
             out_loss = outputs.get("output_loss")
 
@@ -1148,10 +1152,18 @@ def train_model(
         log_file = Path(log_file)
     train_log_mode = str(getattr(args, "train_log_mode", "10_steps"))
     log_location = str(getattr(args, "log_location", "both"))
+    train_on_all_tokens = bool(getattr(args, "train_on_all_tokens", True))
     log_handle = None
     if log_location in ("file", "both") and log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         log_handle = log_file.open("a")
+
+    objective_desc = (
+        "all tokens (input + output)"
+        if train_on_all_tokens
+        else "output tokens only"
+    )
+    print(f"Training objective: {objective_desc}.")
 
     save_path = getattr(args, "save_path", None)
     if save_path is not None and not isinstance(save_path, Path):
@@ -1343,6 +1355,7 @@ def train_model(
                 epoch=epoch,
                 steps_per_epoch=steps_per_epoch,
                 train_log_mode=train_log_mode,
+                train_on_all_tokens=train_on_all_tokens,
                 log_location=log_location,
                 log_handle=log_handle,
             )
