@@ -425,7 +425,6 @@ class SequenceExample:
     has_output: bool
     seq_len: int
     tokens_by_dihedral: Optional[List[torch.LongTensor]] = None
-    cached_positions_by_dihedral: Optional[List[torch.LongTensor]] = None
     seq_len_by_dihedral: Optional[List[int]] = None
     sep_index_by_dihedral: Optional[List[int]] = None
 
@@ -563,23 +562,6 @@ class ARCExampleDataset(Dataset):
 
         self.num_examples = len(self.task_id_to_example_id)
 
-        print("Precomputing 3D positions...")
-        for ex in self.examples:
-            if ex.tokens_by_dihedral:
-                cached_positions_by_dihedral: List[torch.Tensor] = []
-                for tokens in ex.tokens_by_dihedral:
-                    fake_batch = tokens.unsqueeze(0)
-                    mask = torch.ones_like(fake_batch, dtype=torch.bool)
-                    pos = compute_positions_3d(fake_batch, mask)
-                    cached_positions_by_dihedral.append(pos.squeeze(0))
-                ex.cached_positions_by_dihedral = cached_positions_by_dihedral
-                ex.cached_positions = cached_positions_by_dihedral[0]
-            else:
-                fake_batch = ex.tokens.unsqueeze(0)
-                mask = torch.ones_like(fake_batch, dtype=torch.bool)
-                pos = compute_positions_3d(fake_batch, mask)
-                ex.cached_positions = pos.squeeze(0)
-
     def __len__(self) -> int:
         return len(self.examples)
 
@@ -679,7 +661,6 @@ def collate_examples(
         Tuple[
             SequenceExample,
             torch.Tensor,
-            Optional[torch.Tensor],
             int,
             int,
             Optional[torch.Tensor],
@@ -689,7 +670,6 @@ def collate_examples(
     for example in batch:
         tokens = example.tokens
         sep_index = example.sep_index
-        cached_positions = getattr(example, "cached_positions", None)
         mapping: Optional[torch.Tensor] = None
         transform_index: Optional[int] = None
         dihedral_id = 0
@@ -708,19 +688,16 @@ def collate_examples(
                         f"Invalid dihedral index {transform_index} for example {example.task_id}."
                     )
                 tokens = tokens_by_dihedral[transform_index]
-                cached_by_dihedral = getattr(example, "cached_positions_by_dihedral", None)
-                if cached_by_dihedral:
-                    cached_positions = cached_by_dihedral[transform_index]
                 sep_by_dihedral = getattr(example, "sep_index_by_dihedral", None)
                 if sep_by_dihedral:
                     sep_index = sep_by_dihedral[transform_index]
         seq_len = int(tokens.size(0))
         selected.append(
-            (example, tokens, cached_positions, seq_len, sep_index, mapping, dihedral_id)
+            (example, tokens, seq_len, sep_index, mapping, dihedral_id)
         )
 
     batch_size = len(selected)
-    seq_lengths = torch.tensor([item[3] for item in selected], dtype=torch.int32)
+    seq_lengths = torch.tensor([item[2] for item in selected], dtype=torch.int32)
     max_len = int(seq_lengths.max().item())
     total_tokens = int(seq_lengths.sum().item())
 
@@ -728,13 +705,11 @@ def collate_examples(
     example_ids = torch.zeros(batch_size, dtype=torch.long)
     dihedral_ids = torch.zeros(batch_size, dtype=torch.long)
     sep_indices = torch.zeros(batch_size, dtype=torch.long)
-    positions_3d = torch.zeros((total_tokens, 3), dtype=torch.long)
 
     cursor = 0
     for idx, (
         example,
         tokens,
-        cached_positions,
         seq_len,
         sep_index,
         mapping,
@@ -747,11 +722,6 @@ def collate_examples(
         example_ids[idx] = example.example_id
         dihedral_ids[idx] = int(dihedral_id)
         sep_indices[idx] = int(sep_index)
-        if cached_positions is None:
-            fake_batch = tokens.unsqueeze(0)
-            mask = torch.ones_like(fake_batch, dtype=torch.bool)
-            cached_positions = compute_positions_3d(fake_batch, mask).squeeze(0)
-        positions_3d[cursor:next_cursor] = cached_positions
         cursor = next_cursor
 
     cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32)
@@ -765,7 +735,6 @@ def collate_examples(
         "example_ids": example_ids,
         "dihedral_ids": dihedral_ids,
         "sep_indices": sep_indices,
-        "positions_3d": positions_3d,
         "task_ids": [example.task_id for example in batch],
         "splits": [example.split for example in batch],
         "has_output": [example.has_output for example in batch],

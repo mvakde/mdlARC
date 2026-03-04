@@ -470,7 +470,6 @@ def train_one_epoch(
                 attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
         dihedral_ids = batch["dihedral_ids"].to(device)
-        positions_3d = batch["positions_3d"].to(device)
         if accum_index == 0:
             optimizer.zero_grad(set_to_none=True)
             if dataloader_length is not None:
@@ -489,7 +488,6 @@ def train_one_epoch(
                 attention_mask=attention_mask,
                 sep_indices=sep_indices,
                 compute_input_loss=False,
-                positions_3d=positions_3d,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
@@ -612,7 +610,6 @@ def validate_one_epoch(
                 attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
         dihedral_ids = batch["dihedral_ids"].to(device)
-        positions_3d = batch["positions_3d"].to(device)
 
         if not any(batch["has_output"]):
             continue
@@ -627,7 +624,6 @@ def validate_one_epoch(
                 attention_mask=attention_mask,
                 sep_indices=sep_indices,
                 compute_input_loss=False,
-                positions_3d=positions_3d,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )

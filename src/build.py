@@ -94,7 +94,7 @@ def build_model_and_data(
         task_whitelist = checkpoint["task_ids"]
 
     if reuse_dataset is not None:
-        print("Reusing existing dataset from RAM (skipping 3D pre-computation).")
+        print("Reusing existing dataset from RAM (skipping dataset rebuild).")
         dataset = reuse_dataset
     else:
         splits = ("train", "test") if is_eval else ("train",)
