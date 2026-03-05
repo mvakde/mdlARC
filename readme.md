@@ -3,8 +3,9 @@
 - Uses a standard tranformer
 - 75M parameters
 
+<a href="https://mvakde.github.io/blog/44-on-arc-1/"><img src="graph.png"></a>
 
----
+
 <!-- ## Self supervised compression on ARC
 
 Every DL approach on ARC today trains a supervised algorithm (other than compressARC)
