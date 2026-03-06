@@ -55,4 +55,4 @@ cd ..
 #run the training + inference script
 python run_script.py high # Choose between 3 modes: low, medium, high
 ```
- 
+ Note: To get the best speed, I have disabled logging loss values. Feel free to modify
