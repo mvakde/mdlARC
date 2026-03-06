@@ -53,6 +53,6 @@ cd ..
 # rm -r dataset_building_scripts # deletes dataset related files
 
 #run the training + inference script
-python run_script.py
+python run_script.py high # Choose between 3 modes: low, medium, high
 ```
  

@@ -5,6 +5,7 @@ from time import perf_counter
 
 # Choose whether scoring is enabled or not
 SCORE_RESULTS = True
+VISUALIZE = False
 
 # 1. SETUP PATHS AND IMPORT MODULES
 SRC_DIR = Path.cwd() / "src"
@@ -17,23 +18,56 @@ import evaluate
 print("Modules imported successfully.")
 
 # 2. DEFINE CONFIG
+PRESETS = {
+    "low": {
+        "epochs": 90,
+        "max_augments": 80,
+        "checkpoint_epochs": (),
+        "inference_epoch": 90,
+    },
+    "medium": {
+        "epochs": 240,
+        "max_augments": 80,
+        "checkpoint_epochs": (),
+        "inference_epoch": 240,
+    },
+    "high": {
+        "epochs": 650,
+        "max_augments": 300,
+        "checkpoint_epochs": (645, 648, 650),
+        "inference_epoch": 645,
+    },
+}
+
+parser = argparse.ArgumentParser(description="Train and evaluate mdlARC.")
+parser.add_argument(
+    "preset",
+    nargs="?",
+    choices=tuple(PRESETS),
+    default="medium",
+    help="Training preset to run.",
+)
+cli_args = parser.parse_args()
+preset = PRESETS[cli_args.preset]
+print(f"Using preset: {cli_args.preset}")
+
 args_dict = {
     "name": "submission_run",
     "data_path": Path("assets/challenges.json"),
     "train_log_file": Path("runs/training_log.txt"),
     "save_path": Path("runs/tiny.pt"),
     "checkpoint_path": None, 
-    "checkpoint_epochs": [], # No intermediate saves needed for short run
+    "checkpoint_epochs": list(preset["checkpoint_epochs"]),
     
     # Hyperparameters
-    "epochs": 240, 
+    "epochs": preset["epochs"], 
     "batch_size": 32,
     "gradient_accumulation_steps": 1,
     "do_validate": False,
     "val_batch_size": 70,
 
     "enable_aug": True,
-    "max_augments": 80,
+    "max_augments": preset["max_augments"],
     "enable_color_aug": True,
     "color_apply_to_test": True,
     "enable_dihedral_aug": True,
@@ -96,12 +130,19 @@ print(f"Training finished in {perf_counter() - t_start:.2f}s")
 # 5. EVALUATE / INFERENCE
 print("Starting Evaluation...")
 utils.cleanup_memory(globals()) # Force garbage collection before eval
+inference_checkpoint_path = cfg.save_path
+if preset["inference_epoch"] != cfg.epochs:
+    inference_checkpoint_path = train._checkpoint_path_for_epoch(
+        cfg.save_path,
+        preset["inference_epoch"],
+        cfg.epochs,
+    )
 eval_result = evaluate.run_evaluation(
     cfg,
     run_name="submission_eval",
     max_augments=cfg.max_augments,        
     data_path=cfg.data_path,
-    checkpoint_path=cfg.save_path,
+    checkpoint_path=inference_checkpoint_path,
     batch_size=100,
     splits=["test"],          
     task_ids=None,
@@ -113,6 +154,8 @@ print("Evaluation complete. submission.json generated.")
 if SCORE_RESULTS: # scoring, if enabled
     SOLUTIONS_FILE = Path("assets/solutions.json")
     score = utils.score_arc_submission(SOLUTIONS_FILE, SUBMISSION_FILE)
-    utils.visualize_submissions(SUBMISSION_FILE, SOLUTIONS_FILE, mode="!")
+    if VISUALIZE:
+        utils.visualize_submissions(SUBMISSION_FILE, SOLUTIONS_FILE, mode="!")
 else:
-    utils.visualize_submissions(SUBMISSION_FILE, mode="submission")
+    if VISUALIZE:
+        utils.visualize_submissions(SUBMISSION_FILE, mode="submission")
