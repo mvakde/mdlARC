@@ -35,7 +35,7 @@ PRESETS = {
         "epochs": 650,
         "max_augments": 300,
         "checkpoint_epochs": (645, 648, 650),
-        "inference_epoch": 645,
+        "inference_epoch": 648,
     },
 }
 
