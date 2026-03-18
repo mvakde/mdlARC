@@ -18,6 +18,9 @@ A self-supervised compression step will obviously perform better:
 Implementation details: [New pareto frontier on ARC-AGI](https://mvakde.github.io/blog/new-pareto-frontier-arc-agi/)  
 For why I chose these specific implementations, read my blog on [Why all ARC solvers fail today](https://mvakde.github.io/blog/why-all-ARC-solvers-fail-today/) -->
 
+Blog: https://mvakde.github.io/blog/44-on-arc-1/  
+X thread: https://x.com/evilmathkid/status/2029519274835148829   
+
 ## Details
 **UPDATED: (details to follow)**  
 Performance: **44%** on ARC-1 public eval  
