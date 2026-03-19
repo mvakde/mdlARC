@@ -3,30 +3,21 @@
 - Uses a standard tranformer
 - 75M parameters
 
+This is one of the **best non-LLM scores** in the world today (if not THE best).  
+It is also the **cheapest**, by far, at that performance.   
+
+Details: [Blog](https://mvakde.github.io/blog/44-on-arc-1/), [X thread](https://x.com/evilmathkid/status/2029519274835148829)   
+
+
 <a href="https://mvakde.github.io/blog/44-on-arc-1/"><img src="graph.png"></a>
 
 
-<!-- ## Self supervised compression on ARC
 
-Every DL approach on ARC today trains a supervised algorithm (other than compressARC)
-
-This is suboptimal.  
-A self-supervised compression step will obviously perform better:
-- There is new information in the input grids and private puzzles that is currently uncompressed
-- Test grids have distribution shifts. Compression will push these grids into distribution
-
-Implementation details: [New pareto frontier on ARC-AGI](https://mvakde.github.io/blog/new-pareto-frontier-arc-agi/)  
-For why I chose these specific implementations, read my blog on [Why all ARC solvers fail today](https://mvakde.github.io/blog/why-all-ARC-solvers-fail-today/) -->
-
-Blog: https://mvakde.github.io/blog/44-on-arc-1/  
-X thread: https://x.com/evilmathkid/status/2029519274835148829   
-
-## Details
-**UPDATED: (details to follow)**  
+### New score
 Performance: **44%** on ARC-1 public eval  
 Total compute cost: **~$0.67**  (2hrs on a 5090 rented on vast.ai)
 
-**Old:**  
+### Old score
 Performance: 27.5% on ARC-1 public eval  
 Total Compute cost: $1.8 (<3hrs on an A100 rented on Google Colab)
 <!-- 
