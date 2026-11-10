@@ -1,9 +1,0 @@
-{
-  "image": "nvcr.io/nvidia/pytorch:26.05-py3",
-  "image_selection": "cuda",
-  "gpu_names": ["H100_SXM", "H100_PCIE", "H100_NVL"],
-  "num_gpus": 1,
-  "min_gpu_memory_gb": 75,
-  "max_gpu_memory_gb": null,
-  "min_cuda_version": 13.2
-}
