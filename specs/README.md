@@ -94,8 +94,8 @@ demonstrations; the ARC-AGI-2 rows swap the two ARC sets) unless stated.
 | 2.2 | [`paper/rearc_and_scale/arc2_d384x6_rearc.json`](paper/rearc_and_scale/arc2_d384x6_rearc.json) | as 2.1 on ARC-AGI-2 | 330 | 20.14 / 32.08 (24.17 / 38.5 of 120) |
 | 2.3 | [`paper/rearc_and_scale/arc1_d384x6_scale_aug.json`](paper/rearc_and_scale/arc1_d384x6_scale_aug.json) | d384 ×6 + DS, scale aug; eval `final` | 330 | 70.38 / 79.75 |
 | 2.4 | [`paper/rearc_and_scale/arc1_d384x6_scale_aug.json`](paper/rearc_and_scale/arc1_d384x6_scale_aug.json) | same run; eval `final_scale_views` | 330 | 71.00 / 81.50 |
-| 2.5 | [`paper/rearc_and_scale/arc1_d384x6_scale_aug_rescore_eval.json`](paper/rearc_and_scale/arc1_d384x6_scale_aug_rescore_eval.json) | eval only: likelihood ranking of the 2.4 candidates | – | 71.88 / 81.50 (see notes) |
-| 2.6 | [`paper/rearc_and_scale/arc1_d384x6_rescore_eval.json`](paper/rearc_and_scale/arc1_d384x6_rescore_eval.json) | eval only: likelihood ranking of the 1.3 candidates | – | 70.25 (see notes) |
+| 2.5 | [`paper/rearc_and_scale/arc1_d384x6_scale_aug_rescore_eval.json`](paper/rearc_and_scale/arc1_d384x6_scale_aug_rescore_eval.json) | eval only: likelihood ranking of the 2.4 candidates, then `tools/guards_eval.py` | – | 71.88 / 81.50 |
+| 2.6 | [`paper/rearc_and_scale/arc1_d384x6_rescore_eval.json`](paper/rearc_and_scale/arc1_d384x6_rescore_eval.json) | eval only: likelihood ranking of the 1.3 candidates, then `tools/guards_eval.py` | – | 70.88 / 79.88 |
 
 ### Loop ablations (d256, 8 blocks, loop over blocks [2,6), unless stated)
 
@@ -156,11 +156,12 @@ demonstrations; the ARC-AGI-2 rows swap the two ARC sets) unless stated.
 - **2.3 / 2.4.** The run was trained in two parts with the same effective batch of 64: epochs 1–130 at
   micro-batch 16 × 4 accumulation, epochs 131–330 at 32 × 2. The spec runs all 330 epochs at 16 × 4.
 - **2.5.** The spec ranks the 2.4 candidates by likelihood (71.25 top-2; plain votes 70.50). The
-  paper's 71.88 then drops candidates with symbolic guards, applied by a separate script that is not
-  part of this code. In-decode guards (`inference_symbolic_guards`) are a later re-implementation.
-- **2.6.** Likelihood ranking gives 70.25 (plain votes 68.13). The 70.88 quoted with guards has no
-  saved output. The original ranked candidates from a second decode of 1.3; the spec uses the
-  candidates of the 1.3 spec's own `final` evaluation.
+  paper's 71.88 then applies the symbolic guards to the likelihood ranking:
+  [`tools/guards_eval.py`](../tools/guards_eval.py) over the 2.4 candidates and this spec's
+  `rescore.json` (its `ll_top20+guards` line; the docstring has the exact command).
+- **2.6.** Likelihood ranking gives 70.25 (plain votes 68.13); `tools/guards_eval.py` on the 1.3
+  candidates and this spec's `rescore.json` gives the paper's 70.88. The original ranked candidates
+  from a second decode of 1.3; the spec uses the candidates of the 1.3 spec's own `final` evaluation.
 - **3.7.** 64.25 is the run's own decode. Three later decodes of the same checkpoint scored 63.50 to
   63.88 top-2, 74.50 to 75.50 oracle.
 - **3.19.** The run's own decode ran out of memory on an 80 GB GPU. The score comes from a second

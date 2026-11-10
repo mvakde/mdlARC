@@ -38,8 +38,10 @@ Kaggle model trains on the generated task families in [`data_generation/`](data_
 | d96, looped ×6 | 1.05M | 49.00 / 60.62 | | [`arc1_d96x6`](specs/data_squeeze/arc1_d96x6.json) |
 | d1024, looped ×6, Kaggle model (with test-time fine-tuning) | 99.8M | | 37.08 (Kaggle public score¹) | [`specs/paper/kaggle_d1024/`](specs/paper/kaggle_d1024/), [`kaggle_submissions/`](kaggle_submissions/) |
 
-The loop ablations, the unlooped depth ladder, the sub-1M models and the other paper rows are listed
-with their specs and scores in [`specs/README.md`](specs/README.md).
+The 71.88 row ranks the decoded candidates by likelihood, then applies the symbolic guards with
+[`tools/guards_eval.py`](tools/guards_eval.py). The loop ablations, the unlooped depth ladder, the
+sub-1M models and the other paper rows are listed with their specs and scores in
+[`specs/README.md`](specs/README.md).
 
 ## Quick start
 
@@ -154,6 +156,7 @@ dataset_building_scripts/  ARC-AGI-1/2, ConceptARC and ReARC downloads at pinned
 data_generation/           generators, sampler, validator and packager for the Kaggle model's training data
 specs/                     data_squeeze/ baselines; paper/ one spec per paper result
 kaggle_submissions/        the submitted Kaggle notebooks, their wheel build and a runtime extractor
+tools/                     guard re-ranking of saved candidates; decode batch sizing for your GPU
 visualiser/                browser viewer for tasks and model outputs
 tests/                     unit tests (CPU): python -m pytest -q tests
 ```
