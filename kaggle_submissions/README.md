@@ -24,9 +24,10 @@ deadline. Submission 57850224 (35.69) was made on 31 October at 20:43 UTC.
 Attach three inputs and set **Accelerator: GPU L4 × 4, Internet: off**:
 
 1. The competition data (`arc-prize-2026-arc-agi-2`).
-2. The pretrained checkpoint (`tiny.pt`). It is published as a Kaggle Model and as a file on this
-   repository's Releases page. The notebook checks its configuration (width, loop settings, MTP heads)
-   after loading and logs its SHA-256.
+2. The pretrained checkpoint (`tiny.pt`). The d1024 epoch-440 checkpoint is published on Kaggle as
+   [`mithilavakde/mdlarc-loopv3-private/pyTorch/d1024-e440`](https://www.kaggle.com/models/mithilavakde/mdlarc-loopv3-private/pyTorch/d1024-e440).
+   The notebook checks its configuration (width, loop settings, MTP heads) after loading and logs its
+   SHA-256.
 3. A FlashAttention 2 wheel for Kaggle's Python 3.13 / PyTorch 2.11 / CUDA 12.8 image. The submitted
    notebooks read it from the Kaggle dataset `flash-attn-cp313-torch211-cu128`;
    [`build/flash_attn/`](build/flash_attn/) builds and validates the same wheel.

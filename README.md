@@ -106,8 +106,8 @@ checkpoint of the training spec they name, from `runs/<that run>/pretrain/tiny.p
 4. **Test-time fine-tune and decode.** [`kaggle_submissions/`](kaggle_submissions/) holds the
    submitted notebooks and explains their inputs and recipe.
 
-The epoch-440 checkpoint is published on this repository's Releases page and as the Kaggle Model
-`mithilavakde/mdlarc`.
+The epoch-440 checkpoint (99.8M parameters) is published on Kaggle as the model variation
+[`mithilavakde/mdlarc-loopv3-private/pyTorch/d1024-e440`](https://www.kaggle.com/models/mithilavakde/mdlarc-loopv3-private/pyTorch/d1024-e440).
 
 Multi-GPU specs set `"distributed": {"nproc_per_node": N}`; `launch_run.py` then starts one process per
 GPU on a single machine.
@@ -175,7 +175,7 @@ tests/                     unit tests (CPU): python -m pytest -q tests
 
 - Paper: <!-- TODO(paper link) -->
 - Blog post: https://mvakde.github.io/blog/looped-mdlarc/
-- Model weights: https://www.kaggle.com/models/mithilavakde/mdlarc and this repository's Releases page
+- Model weights (99.8M, the 37.08% Kaggle model): https://www.kaggle.com/models/mithilavakde/mdlarc-loopv3-private/pyTorch/d1024-e440
 - ARC Data Squeeze benchmark: https://github.com/mvakde/arc-data-squeeze
 
 <!-- TODO(licence): decided last, with the user -->
