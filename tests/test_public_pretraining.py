@@ -4,7 +4,6 @@ import hashlib
 import json
 from pathlib import Path
 import sys
-import tarfile
 import zipfile
 
 import pytest
@@ -16,8 +15,6 @@ sys.path.insert(0, str(ROOT / "src"))
 import launch_run
 import variations
 from dataset_building_scripts import build_variation_dataset as builder
-from scripts import package_compositions as packager
-from workflows.vast import snapshot
 
 PAIR = {"input": [[1]], "output": [[2]]}
 TEST_PAIR = {"input": [[3]], "output": [[4]]}
@@ -90,12 +87,10 @@ def public_corpus(tmp_path, monkeypatch):
         "train": [PAIR], "test": [{"input": TEST_PAIR["input"]}],
     }}))
     (assets / "ARC-2/arc2_eval_solutions.json").write_text(json.dumps({"arc2_eval_task": [TEST_PAIR["output"]]}))
-    scripts = tmp_path / "scripts"
-    scripts.mkdir()
-    (scripts / "colab_drive.json").write_text(json.dumps({
+    monkeypatch.setattr(builder, "VARIATION_ARCHIVE_IDENTITY", {
         "dataset_size": archive_path.stat().st_size,
         "dataset_sha256": hashlib.sha256(archive_path.read_bytes()).hexdigest(),
-    }))
+    })
     for module in (builder, variations):
         monkeypatch.setattr(module, "ROOT", tmp_path)
     monkeypatch.setattr(builder, "ASSETS_TMP", assets)
@@ -170,55 +165,3 @@ def test_invalid_manifest_cannot_reach_training(public_corpus, change, message):
         builder._composition_tasks(identity, SOURCES)
 
 
-def test_composition_archive_is_in_vast_source_and_must_match_the_spec(public_corpus):
-    root, spec = public_corpus
-    for name in ("launch_run.py", "requirements.txt", "scripts/run_layout.py"):
-        (root / name).write_text("")
-    path = root / "spec.json"
-    path.write_text(json.dumps(spec))
-    snapshot.create(root, path, root / "source.tar.gz")
-    with tarfile.open(root / "source.tar.gz") as archive:
-        assert "scripts/colab_drive.json" in archive.getnames()
-        assert archive.extractfile("assets_tmp/compositions.zip").read() == (root / "assets_tmp/compositions.zip").read_bytes()
-    spec["dataset"]["pretrain_data"]["compositions"]["sha256"] = "0" * 64
-    path.write_text(json.dumps(spec))
-    with pytest.raises(ValueError, match="selected experiment spec"):
-        snapshot.source_files(root, path)
-
-
-def test_packager_selects_only_v3_and_checks_author_checkpoint(tmp_path, monkeypatch):
-    monkeypatch.setattr(packager, "ROOT", tmp_path)
-    synth = tmp_path / "synth"
-    (synth / "results/task-composition-v3-empty-placeholder").mkdir(parents=True)
-    data = json.dumps(TASK).encode()
-    for pipeline in ("task-composition-v3", "task-compsition-v2-test"):
-        root = synth / "results" / pipeline
-        job = root / "family"
-        folder = job / "llm-inputs/author/checked-samples"
-        folder.mkdir(parents=True)
-        (root / "plan.json").write_text(json.dumps({"dataset": "arc2/evaluation"}))
-        (job / "status.json").write_text(json.dumps({"state": "author_completed", "dataset": "arc2/evaluation", "parents": ["one", "two"]}))
-        name = "llm-inputs/author/checked-samples/seed-0000000000.json"
-        (job / name).write_bytes(data)
-        (job / "checkpoints.json").write_text(json.dumps({"author": {name: hashlib.sha256(data).hexdigest()}}))
-    output = tmp_path / "assets_tmp/compositions.zip"
-    with pytest.raises(ValueError, match="No eligible"):
-        packager.package(synth, output)
-    result = packager.package(synth, output, include_author_completed=True, pipeline="v3")
-    assert (result["tasks"], result["samples"], result["stages"]) == (1, 1, ["author"])
-    with zipfile.ZipFile(output) as archive:
-        assert all("v2" not in name for name in archive.namelist())
-    with pytest.raises(ValueError, match="already exists"):
-        packager.package(synth, output, include_author_completed=True)
-    (synth / "results/task-composition-v3/family/llm-inputs/author/checked-samples/seed-0000000000.json").write_text("{}")
-    with pytest.raises(ValueError, match="sample checksum changed"):
-        packager.package(synth, tmp_path / "assets_tmp/changed.zip", include_author_completed=True)
-
-
-def test_packager_requires_plan_for_a_root_with_saved_jobs(tmp_path):
-    synth = tmp_path / "synth"
-    job = synth / "results/task-composition-v3-incomplete/family"
-    job.mkdir(parents=True)
-    (job / "status.json").write_text(json.dumps({"state": "author_completed"}))
-    with pytest.raises(FileNotFoundError, match="plan.json"):
-        list(packager.selected_samples(synth, include_author_completed=True))

@@ -18,6 +18,7 @@ LOOP_DEFAULTS = {
     "loop_streams": 0,                  # 0 or >=2 residual streams written once per iteration
     "loop_stream_gate": "dynamic",      # static | dynamic diagonal keep-gate per stream
     "loop_exit_weight": 0.0,            # deep supervision: early-exit CE weight after iterations 1..K-1
+    "loop_exit_iterations": None,       # which iterations exit (default: every one but the last); fewer exits skip coda passes
 }
 LOOP_ENUMS = {
     "loop_gate": ("none", "static", "token"),
@@ -26,7 +27,7 @@ LOOP_ENUMS = {
 }
 LOOP_EXTENSION_DEFAULTS = {key: LOOP_DEFAULTS[key] for key in (
     "loop_dense_mixing", "loop_iteration_embedding", "loop_gate", "loop_ffn",
-    "loop_iteration_norms", "loop_streams", "loop_exit_weight")}
+    "loop_iteration_norms", "loop_streams", "loop_exit_weight", "loop_exit_iterations")}
 NEXT_LATENT_DEFAULTS = {
     "next_latent_prediction": False,
     "next_latent_horizon": 1,
@@ -74,6 +75,17 @@ def validate_research_options(options, *, n_layers=None, require_complete=False)
     if (require_complete or value is not None) and (
             isinstance(value, bool) or not isinstance(value, int) or value < 0 or value == 1):
         raise ValueError("loop_streams must be 0 or an integer >= 2.")
+    exits = options.get("loop_exit_iterations")
+    if exits is not None:
+        if (not isinstance(exits, (list, tuple)) or not exits or len(set(exits)) != len(exits)
+                or any(isinstance(item, bool) or not isinstance(item, int) or item < 1 for item in exits)):
+            raise ValueError("loop_exit_iterations must be a nonempty list of distinct integers >= 1.")
+        iterations = options.get("loop_iterations")
+        if iterations is not None and max(exits) >= iterations:
+            raise ValueError("loop_exit_iterations must name iterations before the last one (below loop_iterations).")
+        weight = options.get("loop_exit_weight")
+        if weight is not None and weight == 0:
+            raise ValueError("loop_exit_iterations requires loop_exit_weight > 0.")
     if options.get("loop_iterations") == 1:
         changed = [key for key, default in LOOP_EXTENSION_DEFAULTS.items()
                    if options.get(key) is not None and options.get(key) != default]

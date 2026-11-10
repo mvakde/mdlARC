@@ -12,6 +12,7 @@ import os
 import random
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -20,9 +21,10 @@ import torch
 from numba import njit
 from torch.utils.data import DataLoader, Dataset, Sampler
 import distributed_training as distributed
-from demo_schedule import MAX_CONTEXT_DEMOS, balanced_demonstrations, training_demonstrations
-from pair_identity import balanced_pair_vertices, leave_one_out, schedule_seed
-from intermediate_sampling import intermediate_candidates, intermediate_indices
+from demo_schedule import (
+    MAX_CONTEXT_DEMOS, balanced_demonstrations, half_or_more_demonstrations, training_demonstrations,
+)
+from pair_identity import balanced_leave_one_out, balanced_pair_vertices, leave_one_out, schedule_seed
 
 
 # =============================================================================
@@ -49,8 +51,6 @@ MAX_PAIR_LEN = 1861
 MAX_SEQ_LEN = 1 + (DEMO_PAIRS + 1) * (MAX_PAIR_LEN - 1)
 SEQUENCE_FORMAT = "two_demo_bidirectional_v1"
 GROUP_SEQUENCE_FORMAT = "all_demo_pair_group_target_roles_two_lookup_v1"
-GRID_CHAIN_SEQUENCE_FORMAT = "intermediate_grid_pair_group_two_lookup_v1"
-SUPERVISED_GRID_CHAIN_SEQUENCE_FORMAT = "supervised_intermediate_grid_chain_v1"
 IGNORE_INDEX = -100
 
 AUGMENTATION_SAMPLING_MODES = ("full_task_prefix", "single_grid_prefix", "context_palette")
@@ -85,15 +85,12 @@ def _extract_pairs_colors(
 ) -> Set[int]:
     colors: Set[int] = set()
     for pair in pairs:
-        grids = [pair.get(key) or []]
-        if key == "output":
-            grids.extend(intermediate_candidates(pair))
-        for grid in grids:
-            for row in grid:
-                for val in row:
-                    val_i = int(val)
-                    if 0 <= val_i <= 9:
-                        colors.add(val_i)
+        grid = pair.get(key) or []
+        for row in grid:
+            for val in row:
+                val_i = int(val)
+                if 0 <= val_i <= 9:
+                    colors.add(val_i)
     return colors
 
 
@@ -235,6 +232,325 @@ def apply_inverse_dihedral_transform(
 
 
 # =============================================================================
+# Scale (Block-Upscale) Augmentation
+# =============================================================================
+# Integer block-upscale ("scale") augmentation for training and decoding.
+#
+# Follows transductARC (K. Schweighofer, 2026, MIT; ``src/augment.py`` and ``src/eval.py``):
+#
+# * A spec ``(fr, fc)`` turns every cell into an ``fr x fc`` block; ``(1, 1)`` is identity.
+#   Specs live in the grid's original orientation and compose as "scale, then dihedral",
+#   so a dihedral that swaps rows and columns sees the axes swapped
+#   (:func:`oriented_scale_factor`).
+# * A pair's spec pool lists the specs that keep its input and output within 30x30, identity
+#   first and grouped by level ``k = max(fr, fc)``, the square ``(k, k)`` before the
+#   anisotropic ``(k, m), (m, k)`` for ``m < k``, truncated to ``max_specs`` (12 there)::
+#
+#       (1,1) (2,2) (2,1) (1,2) (3,3) (3,1) (1,3) (3,2) (2,3) (4,4) (4,1) (1,4) ...
+#
+#   His length cap holds two 30x30 grids, so it never removes a spec that keeps the grids
+#   within 30x30; the pool here therefore applies only the 30x30 bound.
+# * Training draws one spec uniformly from the pool of every pair in the sequence. His
+#   single demo "pins" the scale to a spec both pairs offer; with several demos the
+#   sequence offers the target pair's specs that every visible demo also offers
+#   (:func:`sequence_scale_specs`). One spec scales every grid of the sequence.
+# * Decoding bounds specs by the demonstrations, since the unknown test output must still
+#   fit 30x30 (:func:`demo_bounded_scale_specs`). Candidates are mapped back by an exact
+#   downscale that rejects grids whose size is not divisible by the factor or whose blocks
+#   are not uniform (:func:`downscale_grid_exact`); his reference strides instead.
+#
+# Every choice is a pure function of seeds and visit numbers, so no shared RNG is consumed
+# and the stream with scale augmentation off is unchanged.
+
+SCALE_MAX_GRID_DIM = 30
+DEFAULT_SCALE_MAX_SPECS = 12
+# Demos shown with a ReARC training target (ARCExampleDataset.rearc_demonstration_indices).
+DEFAULT_REARC_MAX_DEMOS = 4
+IDENTITY_SCALE = (1, 1)
+# rot90, rot270, flip_main_diagonal, flip_anti_diagonal in _DIHEDRAL_TRANSFORM_NAMES
+# (the same order as transductARC): these map an R x C grid to C x R.
+SCALE_TRANSPOSING_DIHEDRALS = frozenset({1, 3, 6, 7})
+
+ScaleSpec = Tuple[int, int]
+
+
+def normalize_scale(factor) -> ScaleSpec:
+    """An int (isotropic) or a (rows, cols) pair as a pair of integers >= 1."""
+    if isinstance(factor, (tuple, list)):
+        fr, fc = int(factor[0]), int(factor[1])
+    else:
+        fr = fc = int(factor)
+    if fr < 1 or fc < 1:
+        raise ValueError(f"Scale factors must be >= 1, got {factor!r}")
+    return fr, fc
+
+
+def is_identity_scale(factor) -> bool:
+    return factor is None or normalize_scale(factor) == IDENTITY_SCALE
+
+
+def oriented_scale_factor(factor, dihedral_index: int) -> ScaleSpec:
+    """The factor in the dihedral-transformed frame, where a transposing dihedral swaps axes."""
+    fr, fc = normalize_scale(factor)
+    return (fc, fr) if int(dihedral_index) % 8 in SCALE_TRANSPOSING_DIHEDRALS else (fr, fc)
+
+
+def grid_dims(grid: Optional[Sequence[Sequence[int]]]) -> Tuple[int, int]:
+    if not grid:
+        return 0, 0
+    return len(grid), max((len(row) for row in grid), default=0)
+
+
+def upscale_grid(grid: Sequence[Sequence[int]], factor) -> List[List[int]]:
+    """Each cell becomes an ``fr x fc`` block of its value."""
+    fr, fc = normalize_scale(factor)
+    if (fr, fc) == IDENTITY_SCALE:
+        return [list(row) for row in grid]
+    scaled: List[List[int]] = []
+    for row in grid:
+        wide = [int(value) for value in row for _ in range(fc)]
+        scaled.extend(list(wide) for _ in range(fr))
+    return scaled
+
+
+def downscale_grid_exact(grid: Sequence[Sequence[int]], factor) -> Optional[List[List[int]]]:
+    """Exact inverse of :func:`upscale_grid`, or None when ``grid`` is not an upscale.
+
+    Rejects ragged or empty grids, sizes not divisible by the factor and blocks that are
+    not one uniform colour.
+    """
+    fr, fc = normalize_scale(factor)
+    if not grid or not grid[0] or any(len(row) != len(grid[0]) for row in grid):
+        return None
+    rows, cols = len(grid), len(grid[0])
+    if (fr, fc) == IDENTITY_SCALE:
+        return [list(row) for row in grid]
+    if rows % fr or cols % fc:
+        return None
+    result: List[List[int]] = []
+    for block_row in range(0, rows, fr):
+        reference = grid[block_row]
+        values = [int(reference[c]) for c in range(0, cols, fc)]
+        for r in range(block_row, block_row + fr):
+            row = grid[r]
+            for index, start in enumerate(range(0, cols, fc)):
+                if any(int(row[c]) != values[index] for c in range(start, start + fc)):
+                    return None
+        result.append(values)
+    return result
+
+
+@functools.lru_cache(maxsize=None)
+def scale_specs_for_dims(rows: int, cols: int, out_rows: int = 0, out_cols: int = 0, *,
+                         anisotropic: bool = True, max_specs: Optional[int] = None,
+                         max_dim: int = SCALE_MAX_GRID_DIM) -> Tuple[ScaleSpec, ...]:
+    """transductARC's ``available_scale_specs_for_dims`` (draw order, identity first).
+
+    Caps are per axis over the input and output (``max_dim // extent``); since a
+    transposing dihedral swaps both the grid and the factor, the caps hold in every
+    orientation.
+    """
+    max_rows, max_cols = max(rows, out_rows), max(cols, out_cols)
+    row_cap = max(1, max_dim // max_rows) if max_rows else 1
+    col_cap = max(1, max_dim // max_cols) if max_cols else 1
+    specs: List[ScaleSpec] = []
+    for k in range(1, max(row_cap, col_cap) + 1):
+        candidates: List[ScaleSpec] = [(k, k)]
+        if anisotropic:
+            for m in range(1, k):
+                candidates.extend(((k, m), (m, k)))
+        for fr, fc in candidates:
+            if fr > row_cap or fc > col_cap:
+                continue
+            specs.append((fr, fc))
+            if max_specs is not None and len(specs) >= max_specs:
+                return tuple(specs)
+    return tuple(specs)
+
+
+def pair_scale_specs(pair, *, anisotropic: bool = True,
+                     max_specs: Optional[int] = DEFAULT_SCALE_MAX_SPECS) -> Tuple[ScaleSpec, ...]:
+    """One pair's pool from its input and (when present) output dimensions."""
+    rows, cols = grid_dims(pair["input"])
+    out_rows, out_cols = grid_dims(pair.get("output"))
+    return scale_specs_for_dims(rows, cols, out_rows, out_cols,
+                                anisotropic=anisotropic, max_specs=max_specs)
+
+
+def sequence_scale_specs(target, demos: Iterable, *, anisotropic: bool = True,
+                         max_specs: Optional[int] = DEFAULT_SCALE_MAX_SPECS) -> Tuple[ScaleSpec, ...]:
+    """Specs of the target pair's pool that every visible demo's pool also offers."""
+    specs = pair_scale_specs(target, anisotropic=anisotropic, max_specs=max_specs)
+    for demo in demos:
+        offered = set(pair_scale_specs(demo, anisotropic=anisotropic, max_specs=max_specs))
+        specs = tuple(spec for spec in specs if spec in offered)
+    return specs
+
+
+def training_scale_seed(seed: int, task_id: str, split: str, pair_index: int, visit: int) -> int:
+    return schedule_seed(seed, task_id, split, int(pair_index), "scale-augmentation-v1", int(visit))
+
+
+def draw_scale(specs: Sequence[ScaleSpec], seed: int) -> ScaleSpec:
+    """Uniform over ``specs`` (as transductARC's ``randrange``), from a private RNG."""
+    if not specs:
+        return IDENTITY_SCALE
+    if len(specs) == 1:
+        return tuple(specs[0])
+    return tuple(specs[random.Random(int(seed)).randrange(len(specs))])
+
+
+def demo_bounded_scale_specs(input_grid, demos: Iterable, *, anisotropic: bool = True,
+                             max_specs: Optional[int] = DEFAULT_SCALE_MAX_SPECS) -> List[ScaleSpec]:
+    """transductARC's ``demo_bounded_scale_specs`` without its (never binding) length cap.
+
+    1. Project the test output size per axis from each demo's in/out size ratio (only
+       integral projections within 1..30 count; the largest wins, a missing axis falls
+       back to the input's) and keep specs that fit the input and that projection.
+    2. Keep only specs every demonstration pair itself admits.
+    """
+    if max_specs is not None and max_specs <= 1:
+        return [IDENTITY_SCALE]
+    in_rows, in_cols = grid_dims(input_grid)
+    demos = [demo for demo in demos
+             if demo.get("input") and demo["input"][0] and demo.get("output") and demo["output"][0]]
+    projected = [0, 0]
+    for demo in demos:
+        (demo_in_rows, demo_in_cols), (demo_out_rows, demo_out_cols) = grid_dims(demo["input"]), grid_dims(demo["output"])
+        for axis, (demo_in, demo_out, test_in) in enumerate(((demo_in_rows, demo_out_rows, in_rows),
+                                                              (demo_in_cols, demo_out_cols, in_cols))):
+            expected = test_in * Fraction(demo_out, demo_in)
+            if expected.denominator != 1 or not 1 <= expected <= SCALE_MAX_GRID_DIM:
+                continue
+            projected[axis] = max(projected[axis], int(expected))
+    if any(projected):
+        projected = [p or d for p, d in zip(projected, (in_rows, in_cols))]
+    specs = list(scale_specs_for_dims(in_rows, in_cols, projected[0], projected[1], anisotropic=anisotropic))
+    for demo in demos:
+        admitted = set(pair_scale_specs(demo, anisotropic=anisotropic, max_specs=None))
+        specs = [spec for spec in specs if spec in admitted]
+    return specs[:max_specs] if max_specs is not None else specs
+
+
+def inference_scale_schedule(specs: Sequence[ScaleSpec], count: int, seed: int) -> List[ScaleSpec]:
+    """Balanced decode views: each spec once per shuffled cycle of ``len(specs)`` views."""
+    specs = [tuple(spec) for spec in specs] or [IDENTITY_SCALE]
+    schedule: List[ScaleSpec] = []
+    cycle = 0
+    while len(schedule) < int(count):
+        order = list(range(len(specs)))
+        random.Random(schedule_seed(seed, "scale-views-v1", cycle)).shuffle(order)
+        schedule.extend(specs[index] for index in order)
+        cycle += 1
+    return schedule[:int(count)]
+
+
+# =============================================================================
+# Symbolic Candidate Guards (demo-derived output checks)
+# =============================================================================
+# Ported in logic from transductARC src/guard.py (MIT). Every rule is derived from the task's
+# demonstrations alone and only ever rejects a candidate that breaks an invariant all demos share,
+# e.g. a fixed output/input size ratio, an unchanged colour set, or output = a crop of the input.
+
+
+def _grid_colors(grid: Sequence[Sequence[int]]) -> Set[int]:
+    return {int(value) for row in grid for value in row}
+
+
+def _foreground_counts(grid: Sequence[Sequence[int]]) -> Dict[int, int]:
+    counts: Dict[int, int] = {}
+    for row in grid:
+        for value in row:
+            if value != 0:
+                counts[int(value)] = counts.get(int(value), 0) + 1
+    return counts
+
+
+def _is_subgrid(sub: Sequence[Sequence[int]], grid: Sequence[Sequence[int]]) -> bool:
+    outer = np.asarray(grid, dtype=np.int16)
+    inner = np.asarray(sub, dtype=np.int16)
+    if (outer.ndim != 2 or inner.ndim != 2 or inner.shape[0] > outer.shape[0]
+            or inner.shape[1] > outer.shape[1]):
+        return False
+    windows = np.lib.stride_tricks.sliding_window_view(outer, inner.shape)
+    return bool((windows == inner).all(axis=(2, 3)).any())
+
+
+def symbolic_guards(demos: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Invariants every demonstration (input -> output) shares.
+
+    The rules follow the demo-derived candidate guards of transductARC (MIT licence).
+    """
+    guards: Dict[str, Any] = dict(forbid_empty=True, forbid_copy=True, row_ratio=None, col_ratio=None,
+                                  color_set=False, color_counts=False, crop=False, single_color=False,
+                                  dropped_color=None)
+    pairs = [(demo["input"], demo["output"]) for demo in demos]
+    if not pairs or any(not i or not i[0] or not o or not o[0] for i, o in pairs):
+        return guards
+    guards["forbid_empty"] = not any(all(v == 0 for row in o for v in row) for _, o in pairs)
+    guards["forbid_copy"] = not any(i == o for i, o in pairs)
+    row_ratios = {Fraction(len(o), len(i)) for i, o in pairs}
+    col_ratios = {Fraction(len(o[0]), len(i[0])) for i, o in pairs}
+    if len(row_ratios) == 1:
+        guards["row_ratio"] = next(iter(row_ratios))
+    if len(col_ratios) == 1:
+        guards["col_ratio"] = next(iter(col_ratios))
+    guards["color_set"] = all(_grid_colors(i) == _grid_colors(o) for i, o in pairs)
+    guards["color_counts"] = all(_foreground_counts(i) == _foreground_counts(o) for i, o in pairs)
+    guards["crop"] = all(_is_subgrid(o, i) for i, o in pairs)
+    guards["single_color"] = all(len(_grid_colors(o) - {0}) == 1 for _, o in pairs)
+    dropped = []
+    for i, o in pairs:
+        input_colors, output_colors = _grid_colors(i), _grid_colors(o)
+        removed = input_colors - output_colors
+        if len(removed) != 1 or not output_colors <= input_colors:
+            dropped = []
+            break
+        dropped.append(next(iter(removed)))
+    if dropped and len(set(dropped)) == 1:
+        guards["dropped_color"] = dropped[0]
+    return guards
+
+
+def symbolic_guard_rejection(
+    guards: Dict[str, Any], grid: Sequence[Sequence[int]], test_input: Optional[Sequence[Sequence[int]]],
+) -> Optional[str]:
+    """Name of the first invariant ``grid`` breaks for this test input, or None if it passes."""
+    if not grid or not grid[0]:
+        return "empty_grid"
+    if guards["forbid_empty"] and not any(v for row in grid for v in row):
+        return "all_background"
+    if guards["forbid_copy"] and test_input and grid == test_input:
+        return "input_copy"
+    for size, input_size, ratio, name in (
+        (len(grid), len(test_input) if test_input else 0, guards["row_ratio"], "row_ratio"),
+        (len(grid[0]), len(test_input[0]) if test_input and test_input[0] else 0, guards["col_ratio"], "col_ratio"),
+    ):
+        if ratio is None or input_size <= 0:
+            continue
+        expected = input_size * ratio
+        if expected.denominator != 1 or not 1 <= expected <= SCALE_MAX_GRID_DIM:
+            continue
+        if size != expected:
+            return name
+    if guards["single_color"] and len(_grid_colors(grid) - {0}) > 1:
+        return "single_color"
+    if test_input and test_input[0]:
+        if guards["crop"] and not _is_subgrid(grid, test_input):
+            return "crop"
+        if guards["color_set"] and _grid_colors(grid) != _grid_colors(test_input):
+            return "color_set"
+        if guards["color_counts"] and _foreground_counts(grid) != _foreground_counts(test_input):
+            return "color_counts"
+        if guards["dropped_color"] is not None:
+            expected_colors = _grid_colors(test_input) - {guards["dropped_color"]}
+            colors = _grid_colors(grid)
+            if colors - expected_colors or expected_colors - colors - {0}:
+                return "dropped_color"
+    return None
+
+
+# =============================================================================
 # Color Permutation
 # =============================================================================
 
@@ -329,31 +645,29 @@ def encode_context(
     target: Dict[str, object],
     transform_index: int = 0,
     mapping: Optional[torch.Tensor] = None,
-    *, predict_intermediate_grids: bool = False,
+    scale: Optional[Tuple[int, int]] = None,
 ) -> Tuple[torch.Tensor, int]:
-    """Serialize complete demos and a target using one shared augmentation."""
+    """Serialize complete demos and a target using one shared augmentation.
+
+    A non-identity ``scale`` (rows, cols) block-upscales every grid in its original
+    orientation before the dihedral transform (``scale_augmentation``).
+    """
+    if scale is not None and is_identity_scale(scale):
+        scale = None
+
+    def view(grid):
+        return apply_dihedral_transform(grid if scale is None else upscale_grid(grid, scale), transform_index)
+
     tokens = [START_TOKEN_ID]
     target_sep = -1
     for index, pair in enumerate([*demonstrations, target]):
         if index < len(demonstrations) and pair.get("output") is None:
             raise ValueError("Demonstrations must have outputs.")
-        tokens.extend(grid_to_tokens(
-            apply_dihedral_transform(pair["input"], transform_index), IO_SEPARATOR_TOKEN_ID,
-        ))
+        tokens.extend(grid_to_tokens(view(pair["input"]), IO_SEPARATOR_TOKEN_ID))
         if index == len(demonstrations):
             target_sep = len(tokens) - 1
-        if index < len(demonstrations) or (predict_intermediate_grids and pair.get("output") is not None):
-            intermediates = pair.get("intermediate_grids", [])
-            if len(intermediates) > 2:
-                raise ValueError("A demonstration supports at most two intermediate grids")
-            for grid in intermediates:
-                tokens.extend(grid_to_tokens(
-                    apply_dihedral_transform(grid, transform_index), IO_SEPARATOR_TOKEN_ID,
-                ))
         if pair.get("output") is not None:
-            tokens.extend(grid_to_tokens(
-                apply_dihedral_transform(pair["output"], transform_index), END_PAIR_TOKEN_ID,
-            ))
+            tokens.extend(grid_to_tokens(view(pair["output"]), END_PAIR_TOKEN_ID))
     tensor = torch.tensor(tokens, dtype=torch.long)
     return (mapping[tensor] if mapping is not None else tensor), target_sep
 
@@ -689,11 +1003,14 @@ class ARCExampleDataset(Dataset):
         selected_task_ids: Optional[Sequence[str]] = None,
         attention_pattern: str = "dense",
         training_demo_schedule: str = "all",
-        max_training_demos: int = MAX_CONTEXT_DEMOS,
         inference_demo_policy: str = "all",
-        inference_max_demos: int = MAX_CONTEXT_DEMOS,
         pair_identity_vertices: int = 0,
-        predict_intermediate_grids: bool = False,
+        max_training_demos: Optional[int] = None,
+        inference_max_demos: Optional[int] = None,
+        scale_augmentation: bool = False,
+        scale_max_specs: int = DEFAULT_SCALE_MAX_SPECS,
+        scale_anisotropic: bool = True,
+        rearc_max_demos: int = DEFAULT_REARC_MAX_DEMOS,
     ) -> None:
         available_splits = {"train", "test"}
         for split in splits:
@@ -718,17 +1035,27 @@ class ARCExampleDataset(Dataset):
         if inference_demo_policy not in ("all", "leave_one_out", "two"):
             raise ValueError("inference_demo_policy must be all, leave_one_out or two")
         self.training_demo_schedule = training_demo_schedule
-        if isinstance(max_training_demos, bool) or not isinstance(max_training_demos, int) or not 1 <= max_training_demos <= MAX_CONTEXT_DEMOS:
-            raise ValueError("max_training_demos must be an integer from 1 to 6")
-        self.max_training_demos = max_training_demos
-        if isinstance(inference_max_demos, bool) or not isinstance(inference_max_demos, int) or not 1 <= inference_max_demos <= MAX_CONTEXT_DEMOS:
-            raise ValueError("inference_max_demos must be an integer from 1 to 6")
-        self.inference_max_demos = inference_max_demos
         self.inference_demo_policy = inference_demo_policy
+        # None keeps the uncapped schedules; an integer (1-6) selects the balanced capped
+        # schedules (demo_schedule.training_demonstrations / balanced_demonstrations).
+        for name, cap in (("max_training_demos", max_training_demos), ("inference_max_demos", inference_max_demos)):
+            if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int)
+                                    or not 1 <= cap <= MAX_CONTEXT_DEMOS):
+                raise ValueError(f"{name} must be null or an integer from 1 to {MAX_CONTEXT_DEMOS}")
+        self.max_training_demos = max_training_demos
+        self.inference_max_demos = inference_max_demos
         self.pair_identity_vertices = int(pair_identity_vertices)
-        self.predict_intermediate_grids = bool(predict_intermediate_grids)
-        if self.predict_intermediate_grids and (self.attention_pattern != "pair_group" or self.pair_identity_vertices):
-            raise ValueError("Supervised grid chains require pair_group attention and no pair identities")
+        # Training-only block upscale of every grid in a regular training sequence
+        # (scale_augmentation.py); off leaves every sequence unchanged.
+        self.scale_augmentation = bool(scale_augmentation)
+        self.scale_max_specs = int(scale_max_specs)
+        self.scale_anisotropic = bool(scale_anisotropic)
+        if self.scale_max_specs < 1:
+            raise ValueError("scale_max_specs must be >= 1.")
+        # Most demos shown with a ReARC target (rearc_demonstration_indices).
+        self.rearc_max_demos = int(rearc_max_demos)
+        if self.rearc_max_demos < 1:
+            raise ValueError("rearc_max_demos must be >= 1.")
         self.max_seq_len = max_seq_len if max_seq_len is not None else (
             MAX_SEQ_LEN if self.attention_pattern == "dense" else 2**31 - 1
         )
@@ -738,12 +1065,6 @@ class ARCExampleDataset(Dataset):
         self.max_augments = max(1, int(max_augments))
         self.augmentation_sampling_mode = normalize_augmentation_sampling_mode(augmentation_sampling_mode)
         challenges = load_challenges(self.source_path)
-        self.has_intermediate_grids = any(
-            intermediate_candidates(pair) for task in challenges.values()
-            for pair in task.get("train", [])
-        )
-        if self.has_intermediate_grids and (self.attention_pattern != "pair_group" or self.pair_identity_vertices):
-            raise ValueError("Intermediate-grid demos require pair_group attention and pair_identity_vertices=0")
         rearc_challenges = (
             load_challenges(self.rearc_source_path)
             if self.rearc_source_path is not None
@@ -880,16 +1201,22 @@ class ARCExampleDataset(Dataset):
             counts = [len(pairs) for pairs in self.pairs_by_task.values()]
             self.max_seq_len = self.context_capacity(max(counts, default=0))
 
+    @property
+    def capped_training_demos(self) -> bool:
+        """Balanced capped training contexts (max_training_demos set, or the two-demo schedule)."""
+        return getattr(self, "max_training_demos", None) is not None or self.training_demo_schedule == "two"
+
+    @property
+    def capped_inference_demos(self) -> bool:
+        """Balanced capped decode contexts (inference_max_demos set, or the two-demo policy)."""
+        return getattr(self, "inference_max_demos", None) is not None or self.inference_demo_policy == "two"
+
     def context_capacity(self, pair_count: int) -> int:
         if self.attention_pattern == "dense":
             return MAX_SEQ_LEN
-        if self.has_intermediate_grids:
-            demo_cap = min(self.max_training_demos, 2 if self.training_demo_schedule == "two" else MAX_CONTEXT_DEMOS)
-            if "test" in self.indices_by_split:
-                demo_cap = max(demo_cap, 2 if self.inference_demo_policy == "two" else MAX_CONTEXT_DEMOS)
-            target_grids = 4 if self.predict_intermediate_grids else 2
-            return max(MAX_SEQ_LEN, 1 + (min(demo_cap, int(pair_count)) * 4 + target_grids) * ((MAX_PAIR_LEN - 1) // 2))
-        return max(MAX_SEQ_LEN, 1 + (min(MAX_CONTEXT_DEMOS, int(pair_count)) + 1) * (MAX_PAIR_LEN - 1))
+        if self.capped_training_demos or self.capped_inference_demos:
+            pair_count = min(MAX_CONTEXT_DEMOS, int(pair_count))
+        return max(MAX_SEQ_LEN, 1 + (int(pair_count) + 1) * (MAX_PAIR_LEN - 1))
 
     def _get_nvarc_pairs(self, task_id: str) -> List[Dict[str, object]]:
         cached = self.nvarc_raw_cache.pop(task_id, None)
@@ -975,6 +1302,7 @@ class ARCExampleDataset(Dataset):
             visit = int(example.augment_epoch_override or 0)
         token_tensor, target_sep = self.build_context_sequence(
             example, pair, int(transform_index or 0), mapping, visit=visit,
+            scale=self.training_scale_factor(example, pair, visit),
         )
         if token_tensor.numel() > self.max_seq_len:
             raise ValueError(
@@ -987,33 +1315,54 @@ class ARCExampleDataset(Dataset):
     def demonstration_pairs(self, example: SequenceExample) -> Sequence[Dict[str, object]]:
         return self.pairs_by_task[example.task_id]
 
-    def demonstration_indices(self, example: SequenceExample, visit: int) -> Tuple[int, ...]:
+    def rearc_demonstration_indices(self, example: SequenceExample, visit: int) -> Tuple[int, ...]:
+        """Demos for a ReARC target: a few sibling pairs of the same task, drawn per visit.
+
+        A ReARC task holds its original ARC pairs plus up to 1,000 generated pairs, so
+        the pair-group schedules cannot show them all; transductARC shows one random
+        sibling. Here the count follows the regular half-or-more rule over
+        ``rearc_max_demos`` (2 to 4 by default), so sequences look like ARC tasks decoded
+        leave-one-out. The draw comes from a private seed of (task, pair, visit); no shared
+        RNG is consumed. Dense contexts keep their balanced two-demo schedule.
+        """
         pairs = self.demonstration_pairs(example)
-        solved = tuple(i for i, pair in enumerate(pairs) if pair.get("output") is not None)
+        eligible = [i for i, pair in enumerate(pairs)
+                    if pair.get("output") is not None and i != example.pair_index]
+        if not eligible:
+            return ()
+        upper = max(1, min(int(getattr(self, "rearc_max_demos", DEFAULT_REARC_MAX_DEMOS)), len(eligible)))
+        lower = min(upper, max(2, (upper + 1) // 2))
+        rng = random.Random(schedule_seed(
+            self.seed, example.task_id, "rearc-demos-v1", int(example.pair_index), int(visit)))
+        count = rng.randint(lower, upper)
+        return tuple(sorted(rng.sample(eligible, count)))
+
+    def demonstration_indices(self, example: SequenceExample, visit: int) -> Tuple[int, ...]:
+        if example.is_rearc and self.attention_pattern == "pair_group":
+            # Dense contexts already take two balanced demos; the pair-group schedules
+            # ("all", "half_or_more") would otherwise show the whole ReARC pool.
+            return self.rearc_demonstration_indices(example, visit)
+        pairs = self.demonstration_pairs(example)
         if self.attention_pattern == "pair_group":
-            if example.split == "train":
-                return training_demonstrations(
-                    solved, target=example.pair_index, visit=visit,
-                    half_or_more=self.training_demo_schedule == "half_or_more",
-                    max_demos=min(self.max_training_demos, 2 if self.training_demo_schedule == "two" else MAX_CONTEXT_DEMOS),
-                    seed=schedule_seed(self.seed,
+            capped = self._capped_demonstration_indices(example, visit, pairs)
+            if capped is not None:
+                return capped
+        eligible = [i for i, pair in enumerate(pairs)
+                    if pair.get("output") is not None
+                    and (example.split != "train" or i != example.pair_index)]
+        if self.attention_pattern == "pair_group":
+            if self.training_demo_schedule == "half_or_more" and example.split == "train":
+                return half_or_more_demonstrations(
+                    eligible, visit=visit,
+                    seed=_derive_order_seed(self.seed, (
                         example.variation_path or example.task_id,
-                        "balanced-capped-training-demos-v1",
-                    ),
+                        "half-or-more-demos", example.pair_index,
+                    )),
                 )
-            # Match the maximum fine-tuning context: one demo becomes the
-            # target there. Apply the six-demo cap after this subtraction.
-            seed = schedule_seed(self.seed, example.task_id, example.split, example.pair_index)
-            # inference_max_demos (default 6) caps the decode context, e.g. to
-            # the fine-tuning cap so decode prompts match the trained contexts.
-            if self.inference_demo_policy == "leave_one_out":
-                if self.inference_max_demos >= MAX_CONTEXT_DEMOS:
-                    return leave_one_out(solved, visit=visit, seed=seed)
-                count = min(len(solved) - 1, self.inference_max_demos)
-                return balanced_demonstrations(solved, count=count, visit=visit, seed=seed)
-            count = 2 if self.inference_demo_policy == "two" else len(solved)
-            return balanced_demonstrations(solved, count=min(count, self.inference_max_demos), visit=visit, seed=seed)
-        eligible = tuple(i for i in solved if example.split != "train" or i != example.pair_index)
+            if self.inference_demo_policy == "leave_one_out" and example.split == "test":
+                return leave_one_out(eligible, visit=visit, seed=schedule_seed(
+                    self.seed, example.task_id, example.split, example.pair_index))
+            return tuple(eligible)
         return select_balanced_demonstrations(
             eligible, visit=visit,
             seed=_derive_order_seed(self.seed, (
@@ -1022,35 +1371,64 @@ class ARCExampleDataset(Dataset):
             )),
         )
 
+    def _capped_demonstration_indices(
+        self, example: SequenceExample, visit: int, pairs: Sequence[Dict[str, object]],
+    ) -> Optional[Tuple[int, ...]]:
+        """Balanced capped pair-group contexts, or None for the uncapped schedules."""
+        solved = tuple(i for i, pair in enumerate(pairs) if pair.get("output") is not None)
+        if example.split == "train":
+            if not self.capped_training_demos:
+                return None
+            cap = MAX_CONTEXT_DEMOS if self.max_training_demos is None else self.max_training_demos
+            return training_demonstrations(
+                solved, target=example.pair_index, visit=visit,
+                half_or_more=self.training_demo_schedule == "half_or_more",
+                max_demos=min(cap, 2 if self.training_demo_schedule == "two" else MAX_CONTEXT_DEMOS),
+                seed=schedule_seed(self.seed,
+                    example.variation_path or example.task_id,
+                    "balanced-capped-training-demos-v1",
+                ),
+            )
+        if not self.capped_inference_demos:
+            return None
+        # Match the maximum fine-tuning context: one demo becomes the target
+        # there. The cap applies after this subtraction.
+        cap = MAX_CONTEXT_DEMOS if self.inference_max_demos is None else self.inference_max_demos
+        seed = schedule_seed(self.seed, example.task_id, example.split, example.pair_index)
+        if self.inference_demo_policy == "leave_one_out":
+            if cap >= MAX_CONTEXT_DEMOS:
+                return balanced_leave_one_out(solved, visit=visit, seed=seed)
+            count = min(len(solved) - 1, cap)
+            return balanced_demonstrations(solved, count=count, visit=visit, seed=seed)
+        count = 2 if self.inference_demo_policy == "two" else len(solved)
+        return balanced_demonstrations(solved, count=min(count, cap), visit=visit, seed=seed)
+
+    def training_scale_factor(
+        self, example: SequenceExample, target: Dict[str, object], visit: int,
+    ) -> Optional[Tuple[int, int]]:
+        """One spec for every grid of a regular training sequence, or None when off.
+
+        Uniform over the target pair's specs that every visible demo also offers, drawn
+        from a private seed of (task, pair, visit): no shared RNG is consumed.
+        """
+        if (not getattr(self, "scale_augmentation", False) or example.split != "train"
+                or example.is_rearc or example.is_nvarc):
+            return None
+        pairs = self.demonstration_pairs(example)
+        demos = [pairs[i] for i in self.demonstration_indices(example, visit)]
+        specs = sequence_scale_specs(target, demos, anisotropic=self.scale_anisotropic,
+                                     max_specs=self.scale_max_specs)
+        return draw_scale(specs, training_scale_seed(
+            self.seed, example.task_id, example.split, example.pair_index, visit))
+
     def build_context_sequence(
         self, example: SequenceExample, target: Dict[str, object],
         transform_index: int, mapping: Optional[torch.Tensor], *, visit: int,
+        scale: Optional[Tuple[int, int]] = None,
     ) -> Tuple[torch.Tensor, int]:
         pairs = self.demonstration_pairs(example)
-        demos = []
-        for index in self.demonstration_indices(example, visit):
-            pair = pairs[index]
-            candidates = intermediate_candidates(pair)
-            grids = [candidates[i] for i in self.intermediate_grid_indices(example, index, visit)]
-            demos.append({**pair, "intermediate_grids": grids})
-        if self.predict_intermediate_grids and target.get("output") is not None:
-            target = {**target, "intermediate_grids": self.target_intermediates(example, visit)}
-        return encode_context(demos, target, transform_index, mapping,
-                              predict_intermediate_grids=self.predict_intermediate_grids)
-
-    def target_intermediates(self, example, visit):
-        pairs = self.test_pairs_by_task[example.task_id] if example.split == "test" else self.demonstration_pairs(example)
-        pair = pairs[example.pair_index]
-        candidates = intermediate_candidates(pair)
-        indices = intermediate_indices(pair, seed=self.seed,
-            task=example.variation_path or example.task_id, split=example.split,
-            target=example.pair_index, visit=visit)
-        return [candidates[i] for i in indices]
-
-    def intermediate_grid_indices(self, example, pair_index, visit):
-        return intermediate_indices(self.demonstration_pairs(example)[pair_index],
-            seed=self.seed, task=example.variation_path or example.task_id,
-            split=example.split, target=example.pair_index, visit=visit)
+        demos = [pairs[i] for i in self.demonstration_indices(example, visit)]
+        return encode_context(demos, target, transform_index, mapping, scale=scale)
 
     def pair_identity_ids(self, example, positions, *, visit):
         """IDs use physical pair identity before role RoPE erases pair numbers."""
@@ -1060,10 +1438,12 @@ class ARCExampleDataset(Dataset):
         visible = self.demonstration_indices(example, visit)
         # Count visits to this context, so skipped/subsampled contexts do not
         # repeatedly land on the same phase of the Latin cycle.
-        demo_cap = self.max_training_demos if example.split == "train" else self.inference_max_demos
-        varying = len(self.demonstration_pairs(example)) > demo_cap or (
-            example.split == "train" and self.training_demo_schedule != "all") or (
+        varying = (example.split == "train" and self.training_demo_schedule != "all") or (
             example.split == "test" and self.inference_demo_policy != "all")
+        capped = self.capped_training_demos if example.split == "train" else self.capped_inference_demos
+        if capped:
+            cap = self.max_training_demos if example.split == "train" else self.inference_max_demos
+            varying = varying or len(self.demonstration_pairs(example)) > (MAX_CONTEXT_DEMOS if cap is None else cap)
         occurrence = sum(self.demonstration_indices(example, v) == visible for v in range(visit)) if varying else visit
         assignment = balanced_pair_vertices(visible, visit=occurrence,
             seed=schedule_seed(self.seed, example.variation_path or example.task_id,
@@ -1625,6 +2005,29 @@ class LazyTrainBatchSampler(Sampler[List[object]]):
         return iter(batches)
 
 
+def packed_prefix_layout_for_batch(
+    input_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    sep_indices: torch.Tensor,
+    attention_pattern: str,
+) -> Dict[str, object]:
+    """Build the model's packed attention layout on the collating CPU.
+
+    The model adopts it when the pattern matches and rebuilds it otherwise, so
+    collation never has to know the model's exact configuration. Pair-group
+    batches also carry the split target/demo layout, which that model variant
+    uses and the plain variant ignores.
+    """
+    from target_demo_attention import packed_prefix_lm_layout_fields  # lazy: that module imports common
+
+    pattern = normalize_attention_pattern(attention_pattern)
+    fields = packed_prefix_lm_layout_fields(
+        cu_seqlens, int(input_ids.numel()), sep_indices.clamp(min=0) + 1, input_ids,
+        attention_pattern=pattern, split_target_demo=pattern == "pair_group",
+    )
+    return {"attention_pattern": pattern, **fields}
+
+
 def collate_examples(
     batch: List[SequenceExample],
     dataset: ARCExampleDataset,
@@ -1722,16 +2125,13 @@ def collate_examples(
 
     cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32)
     cu_seqlens[1:] = torch.cumsum(seq_lengths, dim=0)
+    prefix_layout = packed_prefix_layout_for_batch(
+        input_ids, cu_seqlens, sep_indices, getattr(dataset, "attention_pattern", "dense"))
 
-    prepared = {}
-    if getattr(dataset, "prepare_target_demo_layout", getattr(dataset, "attention_pattern", "dense") == "pair_group"):
-        from target_demo_attention import PreparedLayout, build_split_layout
-        prepared["target_demo_layout"] = PreparedLayout(
-            build_split_layout(input_ids, cu_seqlens, sep_indices + 1))
-
-    return {**prepared, **({"pair_identity_ids": pair_identity_ids} if pair_identity_ids is not None else {}),
+    return {**({"pair_identity_ids": pair_identity_ids} if pair_identity_ids is not None else {}),
         "input_ids": input_ids,
         "cu_seqlens": cu_seqlens,
+        "prefix_layout": prefix_layout,
         "max_seqlen": max_len,
         "has_padding": False,
         "example_ids": example_ids,

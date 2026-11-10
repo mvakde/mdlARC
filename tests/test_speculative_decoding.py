@@ -135,10 +135,8 @@ class ScriptedModel(TinyTransformer):
 
     def predict_mtp(self, hidden_states):
         offset = hidden_states[:, 0].long()[:, None] + torch.arange(1, 4)[None]
-        identities = hidden_states[:, 1].long()
-        draft = self.answers[identities].gather(1, offset.clamp(max=7)).clone()
-        for row, identity in enumerate(identities.tolist()):
-            error = self.errors[identity]
+        draft = self.answers.gather(1, offset.clamp(max=7)).clone()
+        for row, error in enumerate(self.errors):
             if error is not None:
                 draft[row, error] = IO_SEPARATOR_TOKEN_ID  # wrong boundary would change z
         return draft
@@ -156,13 +154,13 @@ class ScriptedModel(TinyTransformer):
             offsets = slots - self.prompt_len + 1
             for tensor in past_key_values[0]:
                 tensor.scatter_(2, slots[:, None, :, None], input_ids[:, None, :, None].to(tensor.dtype))
-            self.calls.append((slots.clone(), positions_3d.clone(), input_ids.clone(), example_ids.clone()))
+            self.calls.append((slots.clone(), positions_3d.clone(), input_ids.clone()))
             result = {}
-        next_tokens = self.answers[example_ids.long()].gather(1, offsets.clamp(max=7))
+        next_tokens = self.answers.gather(1, offsets.clamp(max=7))
         logits = torch.full((batch, offsets.size(1), 14), -10.)
         result["logits"] = logits.scatter(2, next_tokens[:, :, None], 10.)
         if return_hidden_states:
-            result["hidden_states"] = torch.stack((offsets, example_ids[:, None].expand_as(offsets)), -1).to(torch.bfloat16)
+            result["hidden_states"] = offsets[:, :, None].to(torch.bfloat16)
         return result
 
 
@@ -175,13 +173,13 @@ def test_heterogeneous_acceptance_matches_ordinary_and_grid_state(eager, errors)
     assert actual == evaluate.batched_greedy_generate(**kwargs)
     if errors == (None, None):
         assert len(speculative_calls) == 2  # 7 and 6 output tokens including EOS
-    for slots, positions, _, identities in speculative_calls:
-        for row, identity in enumerate(identities.tolist()):
+    for slots, positions, _ in speculative_calls:
+        for row in range(2):
             offset = int(slots[row, 0]) - model.prompt_len
-            if offset >= len(actual[identity]) - len(PROMPTS[identity]):
+            if offset >= len(actual[row]) - len(PROMPTS[row]):
                 continue
-            true_positions = compute_positions_3d(torch.tensor(actual[identity])[None])[0]
-            assert torch.equal(positions[row, 0], true_positions[len(PROMPTS[identity]) + offset])
+            true_positions = compute_positions_3d(torch.tensor(actual[row])[None])[0]
+            assert torch.equal(positions[row, 0], true_positions[len(PROMPTS[row]) + offset])
 
 
 def test_greedy_only_and_legacy_fallback(eager, monkeypatch):

@@ -274,13 +274,19 @@ def _keyed(selections: Iterable) -> Dict[tuple, object]:
 
 
 def oracle_report(raw_selections: Sequence, voted_selections: Sequence, solutions: dict,
-                  expected_candidates: Optional[int] = None) -> dict:
-    """Score raw (unfiltered) candidates, filtered candidates and the voted top-2 against solutions."""
+                  expected_candidates: Optional[int] = None,
+                  extra_top2: Optional[Dict[str, Sequence]] = None) -> dict:
+    """Score raw (unfiltered) candidates, filtered candidates and the submitted top-2 against solutions.
+
+    ``extra_top2`` names other selections (e.g. plain votes before guards or rescoring) whose
+    top-2 is scored alongside, as additional metrics."""
     raw, voted = _keyed(raw_selections), _keyed(voted_selections)
-    per_task = {name: {} for name in METRICS}
+    extras = {name: _keyed(selections) for name, selections in (extra_top2 or {}).items()}
+    names = METRICS + tuple(extras)
+    per_task = {name: {} for name in names}
     pairs = []
     for task, outputs in solutions.items():
-        hits = {name: [] for name in METRICS}
+        hits = {name: [] for name in names}
         for index, truth in enumerate(outputs):
             a, f = raw.get((task, index)), voted.get((task, index))
             raw_hit = bool(a) and any(c["grid"] == truth for c in a.ranked_candidates)
@@ -289,12 +295,18 @@ def oracle_report(raw_selections: Sequence, voted_selections: Sequence, solution
             hits["oracle"].append(raw_hit)
             hits["oracle_after_filters"].append(filtered_hit)
             hits["top2"].append(top2_hit)
+            extra_hits = {}
+            for name, keyed in extras.items():
+                e = keyed.get((task, index))
+                extra_hits[name] = bool(e) and any(grid == truth for grid in e.selected_outputs[:2])
+                hits[name].append(extra_hits[name])
             correct = next((c for c in a.ranked_candidates if c["grid"] == truth), None) if a else None
             pairs.append({
                 "task_id": task, "pair_index": index,
                 "num_generated": a.num_generated if a else 0,
                 "num_unique": len(a.ranked_candidates) if a else 0,
                 "oracle_hit": raw_hit, "oracle_after_filters_hit": filtered_hit, "top2_hit": top2_hit,
+                **{f"{name}_hit": hit for name, hit in extra_hits.items()},
                 "correct_candidate_votes": correct["count"] if correct else 0,
                 "correct_candidate_rank_after_filters": next(
                     (j + 1 for j, c in enumerate(f.ranked_candidates) if c["grid"] == truth), None) if f else None,
@@ -304,7 +316,8 @@ def oracle_report(raw_selections: Sequence, voted_selections: Sequence, solution
     maximum = len(solutions)
     report = {
         "definition": "oracle: any generated candidate correct; oracle_after_filters: any candidate surviving "
-                      "the vote filters correct; top2: either voted output correct",
+                      "the vote filters (input copies, symbolic guards when on) correct; top2: either "
+                      "submitted output correct; top2_votes: either plain-vote output correct",
         "aggregation": "mean correctness over each task's test outputs, summed over tasks (score_arc_submission)",
         "expected_candidates_per_test_output": expected_candidates,
         "num_tasks": maximum, "num_test_outputs": len(pairs), "metrics": {}, "pairs": pairs,
@@ -319,34 +332,44 @@ def oracle_report(raw_selections: Sequence, voted_selections: Sequence, solution
 
 
 def write_oracle_report(directory, raw_selections, voted_selections, solutions_path,
-                        expected_candidates: Optional[int] = None) -> dict:
+                        expected_candidates: Optional[int] = None,
+                        extra_top2: Optional[Dict[str, Sequence]] = None) -> dict:
     solutions = json.loads(Path(solutions_path).read_text())
-    report = oracle_report(raw_selections, voted_selections, solutions, expected_candidates)
+    report = oracle_report(raw_selections, voted_selections, solutions, expected_candidates, extra_top2)
     path = Path(directory) / "oracle_score.json"
     path.write_text(json.dumps(report, indent=2) + "\n")
     m = report["metrics"]
     print(f"Top-2: {m['top2']['score']:g}/{m['top2']['max_score']} ({m['top2']['percentage']:.2f}%) | "
           f"Oracle@{expected_candidates}: {m['oracle']['score']:g} ({m['oracle']['percentage']:.2f}%) | "
-          f"after filters: {m['oracle_after_filters']['percentage']:.2f}%", flush=True)
+          f"after filters: {m['oracle_after_filters']['percentage']:.2f}%"
+          + "".join(f" | {name}: {m[name]['score']:g} ({m[name]['percentage']:.2f}%)" for name in m if name not in METRICS),
+          flush=True)
     return report
 
 
 def write_candidate_dump(directory, raw_selections, test_inputs: Optional[dict] = None,
-                         expected_candidates: Optional[int] = None) -> Path:
+                         expected_candidates: Optional[int] = None, annotations: Optional[dict] = None) -> Path:
     """Every distinct de-augmented candidate with its vote count, per test output (candidates.json.gz).
 
     Lets candidates from several models be pooled or re-ranked offline without decoding again.
-    `input_copy` marks candidates equal to the test input (the voting filter drops them)."""
+    `input_copy` marks candidates equal to the test input (the voting filter drops them). With
+    ``annotations`` ({(task, pair): {grid tuple: fields}}), `guard` names the symbolic guard that
+    rejects a candidate and `log_likelihood` is its rescored summed log-likelihood."""
     test_inputs = test_inputs or {}
+    annotations = annotations or {}
     pairs = []
     for selection in raw_selections:
         original = test_inputs.get((str(selection.task_id), int(selection.original_pair_index)))
+        notes = annotations.get((str(selection.task_id), int(selection.original_pair_index)), {})
         pairs.append({
             "task_id": selection.task_id, "pair_index": selection.original_pair_index,
             "num_generated": selection.num_generated, "num_valid": selection.num_valid,
             "discarded_non_rectangular": selection.discarded_non_rectangular,
+            **({"discarded_scale_mismatch": selection.discarded_scale_mismatch}
+               if getattr(selection, "discarded_scale_mismatch", 0) else {}),
             "candidates": [{"grid": entry["grid"], "count": entry["count"],
-                            "input_copy": original is not None and entry["grid"] == original}
+                            "input_copy": original is not None and entry["grid"] == original,
+                            **notes.get(tuple(tuple(row) for row in entry["grid"]), {})}
                            for entry in selection.ranked_candidates],
         })
     path = Path(directory) / "candidates.json.gz"
@@ -366,4 +389,6 @@ def oracle_summary_fields(submission_path) -> dict:
         "oracle_score": metrics["oracle"]["score"], "oracle_percentage": metrics["oracle"]["percentage"],
         "oracle_after_filters_percentage": metrics["oracle_after_filters"]["percentage"],
         "oracle_fully_solved_tasks": len(metrics["oracle"]["fully_solved_tasks"]),
+        **{f"{name}_score": metrics[name]["score"] for name in metrics if name not in METRICS},
+        **{f"{name}_percentage": metrics[name]["percentage"] for name in metrics if name not in METRICS},
     }

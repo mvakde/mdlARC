@@ -478,32 +478,6 @@ def test_mtp_bfloat16_autocast_has_float32_finite_losses_and_gradients(packed, m
     assert all(torch.isfinite(param.grad).all() for param in model.parameters())
 
 
-@pytest.mark.parametrize("packed", [False, True])
-def test_main_and_mtp_losses_keep_saturated_target_gradients(packed, monkeypatch):
-    class ConfidentHead(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.logits = torch.nn.Parameter(torch.tensor([20.] + [0.] * 13))
-
-        def forward(self, hidden):
-            return self.logits.expand(*hidden.shape[:-1], 14)
-
-    model = _model(n_predict=2)
-    _set_path(model, monkeypatch, "packed" if packed else "padded")
-    model.lm_head = ConfidentHead()
-    model.lm_head_mtp = torch.nn.ModuleList([ConfidentHead()])
-    batch = _batch(packed, custom_targets=True)
-    batch["targets"] = batch["targets"].masked_fill(batch["targets"] != IGNORE_INDEX, 0)
-    result = model(**batch)
-    result["loss"].backward()
-    for key in ("output_loss", "mtp_loss"):
-        torch.testing.assert_close(result[key], torch.tensor(2.6794997e-8), rtol=2e-6, atol=0)
-    for head in (model.lm_head, *model.lm_head_mtp):
-        assert head.logits.grad[0] < 0
-        assert (head.logits.grad[1:] > 0).all()
-        assert head.logits.grad.sum().abs() < 1e-14
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_cuda_flash_attention_mtp_training_is_finite_and_matches_padded():
     model = TinyTransformer(TinyTransformerConfig(
@@ -525,3 +499,30 @@ def test_cuda_flash_attention_mtp_training_is_finite_and_matches_padded():
         torch.testing.assert_close(actual[key], reference[key], atol=0.02, rtol=0.02)
     actual["loss"].backward()
     assert all(param.grad is not None and torch.isfinite(param.grad).all() for param in model.parameters())
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_stable_cross_entropy_keeps_saturated_target_gradients(packed, monkeypatch):
+    class ConfidentHead(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logits = torch.nn.Parameter(torch.tensor([20.] + [0.] * 13))
+
+        def forward(self, hidden):
+            return self.logits.expand(*hidden.shape[:-1], 14)
+
+    model = _model(n_predict=2)
+    model.stable_cross_entropy = True
+    _set_path(model, monkeypatch, "packed" if packed else "padded")
+    model.lm_head = ConfidentHead()
+    model.lm_head_mtp = torch.nn.ModuleList([ConfidentHead()])
+    batch = _batch(packed, custom_targets=True)
+    batch["targets"] = batch["targets"].masked_fill(batch["targets"] != IGNORE_INDEX, 0)
+    result = model(**batch)
+    result["loss"].backward()
+    for key in ("output_loss", "mtp_loss"):
+        torch.testing.assert_close(result[key], torch.tensor(2.6794997e-8), rtol=2e-6, atol=0)
+    for head in (model.lm_head, *model.lm_head_mtp):
+        assert head.logits.grad[0] < 0
+        assert (head.logits.grad[1:] > 0).all()
+        assert head.logits.grad.sum().abs() < 1e-14

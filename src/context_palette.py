@@ -5,13 +5,13 @@ input. Fix K-V, reserve those destinations, and permute every other label.
 Unused labels remain legal destinations. Neither kind of input deduplication
 is imposed. Geometry and demo selection remain owned by the existing schedules.
 """
-from collections import defaultdict, OrderedDict
 import random
+from collections import defaultdict, OrderedDict
 
 import torch
 
+from common import random_color_mapping
 from pair_identity import schedule_seed
-from intermediate_sampling import intermediate_candidates
 
 
 def grid_colors(grid):
@@ -22,7 +22,6 @@ def protection_schedule(dataset, example, count, *, visits=None):
     """Test answers and gold target output never contribute to V."""
     pairs = dataset.demonstration_pairs(example)
     pair_colors = [grid_colors(p['input']) | grid_colors(p['output']) for p in pairs]
-    candidate_colors = [[grid_colors(g) for g in intermediate_candidates(p)] for p in pairs]
     targets = dataset.test_pairs_by_task[example.task_id] if example.split == 'test' else pairs
     target_colors = grid_colors(targets[example.pair_index]['input'])
     known = set(example.variation_colors if getattr(example, 'variation_path', None)
@@ -32,10 +31,6 @@ def protection_schedule(dataset, example, count, *, visits=None):
         visible = set(target_colors)
         for index in dataset.demonstration_indices(example, visit):
             visible.update(pair_colors[index])
-            if candidate_colors[index]:
-                selected = dataset.intermediate_grid_indices(example, index, visit)
-                for candidate in selected:
-                    visible.update(candidate_colors[index][candidate])
         protected.append(tuple(sorted(known - visible)))
     return protected
 
@@ -86,9 +81,9 @@ class ContextPaletteAugmentor:
     """
     def __init__(self, dataset, *, seed, max_augments):
         self._family_sampling = (getattr(dataset, 'variation_index', {}).get('sampling', {}).get('unit') == 'family')
-        if (dataset.has_rearc_train_sampling or dataset.has_nvarc_train_sampling
-                or (getattr(dataset, 'has_variation_sampling', False) and not self._family_sampling)):
-            raise ValueError('context_palette currently supports regular ARC tasks only')
+        if dataset.has_nvarc_train_sampling or (
+                getattr(dataset, 'has_variation_sampling', False) and not self._family_sampling):
+            raise ValueError('context_palette currently supports regular ARC, ReARC and family-sampled tasks only')
         self.dataset = dataset
         self.seed = int(seed)
         self.max_augments = int(max_augments)
@@ -132,7 +127,12 @@ class ContextPaletteAugmentor:
             raise ValueError('context_palette requires the balanced regular training sampler')
         geometry = defaultdict(dict)
         for epoch in sampler._balanced_indices():
-            for source, index, visit, dihedral, occurrence in epoch:
+            for item in epoch:
+                if item[0] == 'rearc':
+                    # ReARC targets get a per-visit palette (select_for_example); the
+                    # sampler's dihedral travels with the example, so no plan is kept.
+                    continue
+                source, index, visit, dihedral, occurrence = item
                 if source != 'regular' or visit in geometry[index]:
                     raise ValueError('Unexpected regular training visit schedule')
                 # drop_last can skip different physical targets each epoch.
@@ -146,11 +146,50 @@ class ContextPaletteAugmentor:
         }
         self._plans.clear()
 
+    def _visit(self, example):
+        visit = example.demo_visit_override
+        if visit is None:
+            visit = example.augment_epoch_override
+        if visit is None:
+            visit = self._epoch if self._shared_epoch is None else int(self._shared_epoch.item())
+        return int(visit)
+
+    def select_rearc(self, example):
+        """One context-observable palette per ReARC visit, from a private seed.
+
+        The rule is the regular one with the sequence as the task: K is the palette of the
+        shown sibling demos plus the target pair, V the colours visible in the demos and the
+        target input, so H = K - V is the colours that appear only in the target output. H
+        stays fixed and every other label, seen or not, is permuted bijectively. The pool's
+        other thousand pairs do not count, or K would be all ten colours and nothing could
+        move onto an unseen label. A ReARC pair is visited only a few times in a run
+        (rearc_pairs_per_epoch of about a thousand per task), so the Latin-block balance
+        kept for regular targets is moot and the draw is uniform per visit. The dihedral is
+        the sampler's when it travels with the example.
+        """
+        visit = self._visit(example)
+        pairs = self.dataset.demonstration_pairs(example)
+        target = pairs[example.pair_index]
+        visible = grid_colors(target['input'])
+        for index in self.dataset.demonstration_indices(example, visit):
+            visible |= grid_colors(pairs[index]['input']) | grid_colors(pairs[index]['output'])
+        pinned = grid_colors(target['output']) - visible
+        legal = [color for color in range(10) if color not in pinned]
+        palette_seed = schedule_seed(self.seed, example.task_id, example.split, example.pair_index,
+                                     'context-palette-rearc-v1', visit)
+        mapping = random_color_mapping(legal, palette_seed, destination_colors=legal)
+        geometry = example.preselected_dihedral_index
+        if geometry is None:
+            geometry = random.Random(schedule_seed(palette_seed, 'geometry')).randrange(8)
+        return mapping, int(geometry)
+
     def select_for_example(self, example):
         if not self._enabled:
             return None, None
         if self._family_sampling:
             return self._select_family_example(example)
+        if example.is_rearc:
+            return self.select_rearc(example)
         key = (example.task_id, example.split, example.pair_index)
         geometry = self._geometry.get(key)
         if geometry is None:

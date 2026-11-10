@@ -1,4 +1,4 @@
-"""Publish complete checkpoints and notify the optional Colab backup process."""
+"""Publish complete checkpoints and notify an optional external backup process."""
 
 import json
 import os

@@ -7,7 +7,6 @@ import re
 import shlex
 import subprocess
 import sys
-from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
@@ -18,17 +17,14 @@ SCORE_RESULTS = True
 VISUALIZE = False
 DEFAULT_REARC_SAMPLE_COUNT = 1000
 
-from scripts.run_layout import runs_root
-
-
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_SPEC_PATH = REPO_ROOT / "specs" / "pretrain_eval.json"
 SRC_DIR = REPO_ROOT / "src"
 DATASET_SCRIPT_DIR = REPO_ROOT / "dataset_building_scripts"
 DATASET_BUILD_VENV_DIR = REPO_ROOT / ".dataset-build-venv"
 DATASET_BUILD_ENV_PATH = REPO_ROOT / ".dataset-build.env"
 sys.path.insert(0, str(SRC_DIR))
 from research_options import RESEARCH_DEFAULTS, validate_research_options
+from run_layout import runs_root
 
 
 DEFAULT_DATASET = {
@@ -38,7 +34,8 @@ DEFAULT_DATASET = {
     "add_conceptarc": True,
     "keep_train_test_separate": False,
     "add_filtered": True,
-    "add_rearc": DEFAULT_REARC_SAMPLE_COUNT,
+    # ReARC is opt-in: set e.g. "add_rearc": 1000 (pairs sampled per ARC-1 training task).
+    "add_rearc": None,
     "add_nvarc_training": False,
     "add_nvarc_full": False,
 }
@@ -57,6 +54,7 @@ BASE_ARGS = {
     "augmentation_sampling_mode": None,
     "nvarc_puzzles_per_epoch": None,
     "checkpoint_epochs": [],
+    # Keep at most this many local periodic/final checkpoints (None keeps all).
     "checkpoint_keep_last": None,
     # Every run keeps tiny.epochNNN.pt every 50 epochs (backed up like any checkpoint) and
     # overwrites a local-only tiny.rolling.pt every 10 epochs for resuming. 0 disables either.
@@ -106,6 +104,8 @@ BASE_ARGS = {
     "token_embedding_weight_decay": 0.01,
     "task_embedding_weight_decay": 0.01,
     "dihedral_embedding_weight_decay": 0.01,
+    # Cautious weight decay: decay only coordinates whose update shares the weight's sign.
+    "cautious_weight_decay": False,
     "grad_clip": 1.0,
     "dropout": 0.1,
     "embedding_dropout": 0.1,
@@ -117,28 +117,42 @@ BASE_ARGS = {
     "d_ff": 3072,
     "n_layers": 8,
     "input_shortcuts": None,
-    "residual_init": None,
-    "branch_norm": None,
     "rope_spatial_base": None,
     "attention_pattern": None,
     "training_demo_schedule": "all",
-    "max_training_demos": 6,
     "inference_demo_policy": "all",
-    # Decode-context demo cap (1-6) applied after leave_one_out's M-1; 6 keeps the old behaviour.
-    "inference_max_demos": 6,
-    "predict_intermediate_grids": None,
+    # Pair-group demo-context caps (1-6). None keeps the uncapped schedules (all demos or
+    # half or more of them; uncapped leave-one-out); an integer selects the balanced capped
+    # schedules (demo_schedule.py). Family-sampled data always trains capped (6 when None),
+    # and decoding a checkpoint trained capped defaults to 6.
+    "max_training_demos": None,
+    "inference_max_demos": None,
     "pair_identity_vertices": 0,
     "pair_identity_strength": 0.25,
+    # Block-upscale augmentation (src/common.py): training draws one of up to scale_max_specs
+    # specs per regular training sequence; inference_scale_views mixes demo-bounded scale views
+    # into a full decode. Both opt-in (scale costs ~1.57x tokens/epoch and ~1.38x peak memory).
+    "scale_augmentation": False,
+    "scale_max_specs": 12,
+    "scale_anisotropic": True,
+    "inference_scale_views": False,
+    # Full-decode selection (opt-in): demo-derived symbolic guards drop candidates, then each
+    # output's top rescore_top_k voted candidates are re-ranked by summed log-likelihood over the
+    # decode's views (prefix-cached: one prompt prefill per view). Plain-vote top-2 stays reported.
+    "inference_symbolic_guards": False,
+    "inference_rescore": False,
+    "rescore_top_k": 20,
+    "rescore_prefix_cache": True,
     "depth_diagnostics_every": 0,
-    # Fine-tune adaptation (training stages only). "lora" trains rank-r adapters on qkv/out/fc_in/fc_out of every
-    # block with AdamW (lora_lr, lora_weight_decay); checkpoints hold the merged ordinary weights.
-    # finetune_trainable_blocks [first, last] freezes everything outside those edge blocks (kaggle/multi_gpu.py).
-    "finetune_method": "full",
-    "finetune_trainable_blocks": None,
-    "lora_rank": 16,
-    "lora_alpha": 16,
-    "lora_lr": 1e-3,
-    "lora_weight_decay": 0.01,
+    # torch.compile extras: compiled autograd for the backward dispatch,
+    # hierarchical (per-block) compilation of the repeated transformer block,
+    # the torch.compile mode (max-autotune* for Triton GEMMs with fused
+    # epilogues, reduce-overhead for CUDA graphs) and inductor's coordinate
+    # descent tuning of kernel launch configs.
+    "compiled_autograd": False,
+    "compile_regions": False,
+    "compile_mode": "default",
+    "coordinate_descent_tuning": False,
     # R1's effective latent-bank cap; an explicit size remains configurable.
     "num_task_embedding_latents": None,
     # None inherits checkpoints; fresh models use task conditioning and no
@@ -151,9 +165,17 @@ BASE_ARGS = {
     # Omitted research options inherit saved checkpoint configuration.
     **dict.fromkeys(RESEARCH_DEFAULTS),
     "mtp_decay": [0.8, 0.9, 1.0],
+    # Saturation-safe hard-target cross-entropy (src/stable_losses.py) for every training
+    # loss instead of F.cross_entropy; the loop-composition-v3 (Kaggle d1024) recipe used it.
+    "stable_cross_entropy": False,
     "inference_temperature": None,
     "inference_top_k": None,
-    "inference_speculative": "auto",
+    # Self-speculative greedy decoding (MTP or NextLat drafts, main-head verification); a
+    # sampled decode (temperature > 0) turns the default off.
+    "inference_speculative": True,
+    # torch.compile scope for training: "blocks" compiles each transformer block once (looped
+    # blocks reuse it), "model" compiles the whole forward, "none" skips compilation.
+    "compile_scope": "blocks",
     "warmup_pct": 0.0,
     "resume_warmup_pct": 0.0,
     "wsd_decay_start_pct": 0.8,
@@ -163,8 +185,9 @@ BASE_ARGS = {
 }
 
 TOP_LEVEL_KEYS = {
-    "checkpoint_adaptation",
     "distributed",
+    "finetune_only",
+    "finetune_resume",
     "evaluation_budget_benchmark",
     "speculative_benchmark",
     "backend_benchmark",
@@ -172,11 +195,8 @@ TOP_LEVEL_KEYS = {
     "run_name",
     "FA",
     "checkpoint",
-    "evaluation_checkpoints",
     "validate_cuda",
     "eval_only",
-    "finetune_only",
-    "finetune_resume",
     "skip_data_build",
     "skip_evals",
     "score_results",
@@ -190,16 +210,16 @@ TOP_LEVEL_KEYS = {
     "eval_defaults",
     "evals",
 }
-DATASET_KEYS = set(DEFAULT_DATASET) | {"pretrain_data", "evaluation", "prepared"}
+DATASET_KEYS = set(DEFAULT_DATASET) | {"pretrain_data", "evaluation"}
 TRAINING_CONFIG_KEYS = set(BASE_ARGS) | {
     "FA",
     "rearc_pairs_per_epoch",
+    "rearc_max_demos",
     "nvarc_pairs_per_epoch",
     "reset_training_state",
     "inherit_checkpoint_rearc_data_path",
 }
 EVAL_CONFIG_KEYS = TRAINING_CONFIG_KEYS | {
-    "prefill_token_budget",
     "mode",
     "checkpoint",
     "from",
@@ -208,7 +228,13 @@ EVAL_CONFIG_KEYS = TRAINING_CONFIG_KEYS | {
     "group",
     "checkpoint_task_id_prefix",
     "reference_submission",
-    "diagnostic_cases",
+    "candidates_path",
+    "rescore_top_k",
+    # Decode a looped checkpoint at another iteration count (K-independent loop parameters only).
+    "eval_loop_iterations",
+    # Summed padded prompt tokens per decode batch (None: MDLARC_PREFILL_TOKEN_BUDGET
+    # or 524,288).
+    "prefill_token_budget",
 }
 
 build = None
@@ -257,54 +283,16 @@ def reject_unknown_keys(config: dict[str, Any], allowed: set[str], name: str) ->
         )
 
 
-def resolve_input_checkpoint(
-    value: Any, run_dir: Path,
-) -> tuple[Path | None, dict[str, Any] | None]:
-    """Resolve a local path or validated Drive identity without fetching bytes."""
+def resolve_input_checkpoint(value: Any, run_dir: Path) -> Path | None:
+    """Resolve the spec's local checkpoint path ("runs/<run>/..." is relative to the runs root)."""
     if value is None:
-        return None, None
-    if isinstance(value, str):
-        path = Path(value)
-        if not path.is_absolute() and path.parts[:1] == ("runs",):
-            path = run_dir.parent.joinpath(*path.parts[1:])
-        return path, None
-    if not isinstance(value, dict):
-        raise TypeError("checkpoint must be a local path string or a Drive reference object.")
-    keys = {"drive_id", "name", "size", "sha256"}
-    reject_unknown_keys(value, keys | {"source_branch"}, "checkpoint")
-    missing = sorted(keys - value.keys())
-    if missing:
-        raise ValueError("checkpoint is missing required field(s): " + ", ".join(missing))
-    if not isinstance(value["drive_id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value["drive_id"]):
-        raise ValueError("checkpoint.drive_id must be a Drive file ID.")
-    name = value["name"]
-    if not isinstance(name, str) or Path(name).name != name or not name.endswith(".pt"):
-        raise ValueError("checkpoint.name must be a single .pt filename.")
-    if isinstance(value["size"], bool) or not isinstance(value["size"], int) or value["size"] <= 0:
-        raise ValueError("checkpoint.size must be a positive integer byte count.")
-    digest = value["sha256"]
-    source_branch = value.get("source_branch")
-    if source_branch is not None and (not isinstance(source_branch, str) or not source_branch
-            or source_branch in {".", ".."} or any(ord(c) < 32 for c in source_branch)):
-        raise ValueError("checkpoint.source_branch must be an explicit nonempty branch name")
-    if not isinstance(digest, str) or (digest != "drive" and not re.fullmatch(r"[0-9a-f]{64}", digest)):
-        raise ValueError("checkpoint.sha256 must be a lowercase SHA-256 digest or 'drive'.")
-    return run_dir / "inputs/pretrain.pt", dict(value)
-
-
-def resolve_evaluation_checkpoints(spec, run_dir):
-    """Named Drive inputs for sequential evaluation within one managed run."""
-    inputs = expect_dict(spec.get("evaluation_checkpoints"), "evaluation_checkpoints")
-    if inputs and (not spec.get("eval_only") or spec.get("enable_finetune", True)):
-        raise ValueError("evaluation_checkpoints requires eval_only and enable_finetune=false")
-    resolved = {}
-    for name, value in inputs.items():
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) or name == "pretrain":
-            raise ValueError("Evaluation input names must be safe and cannot be pretrain")
-        if not isinstance(value, dict):
-            raise ValueError("Named evaluation inputs require Drive identities")
-        _, resolved[name] = resolve_input_checkpoint(value, run_dir)
-    return resolved
+        return None
+    if not isinstance(value, str):
+        raise TypeError("checkpoint must be a local path string.")
+    path = Path(value)
+    if not path.is_absolute() and path.parts[:1] == ("runs",):
+        path = run_dir.parent.joinpath(*path.parts[1:])
+    return path
 
 
 def training_overrides(
@@ -315,23 +303,22 @@ def training_overrides(
 ) -> dict[str, Any]:
     config = dict(expect_dict(value, name))
     reject_unknown_keys(config, allowed_keys, name)
+    validate_research_options(config, n_layers=config.get("n_layers"))
     from src.checkpoint_io import validate_checkpoint_keep_last
     validate_checkpoint_keep_last(config.get("checkpoint_keep_last"))
-    validate_research_options(config, n_layers=config.get("n_layers"))
-    if "inference_speculative" in config and not (isinstance(config["inference_speculative"], bool) or config["inference_speculative"] == "auto"):
-        raise ValueError(f"{name}.inference_speculative must be boolean or auto.")
+    if "inference_speculative" in config and not (
+            isinstance(config["inference_speculative"], bool) or config["inference_speculative"] == "auto"):
+        raise ValueError(f"{name}.inference_speculative must be a boolean or auto.")
+    for key in ("max_training_demos", "inference_max_demos"):
+        cap = config.get(key)
+        if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 6):
+            raise ValueError(f"{name}.{key} must be null or an integer from 1 to 6.")
+    if not isinstance(config.get("stable_cross_entropy", False), bool):
+        raise ValueError(f"{name}.stable_cross_entropy must be a boolean.")
     if config.get("dihedral_embeddings") is not None and not isinstance(config["dihedral_embeddings"], bool):
         raise ValueError(f"{name}.dihedral_embeddings must be a boolean.")
     if config.get("task_embeddings") is not None and not isinstance(config["task_embeddings"], bool):
         raise ValueError(f"{name}.task_embeddings must be a boolean.")
-    if config.get("predict_intermediate_grids") is not None and not isinstance(config["predict_intermediate_grids"], bool):
-        raise ValueError(f"{name}.predict_intermediate_grids must be a boolean.")
-    cap = config.get("max_training_demos", 6)
-    if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 6:
-        raise ValueError(f"{name}.max_training_demos must be an integer from 1 to 6.")
-    decode_cap = config.get("inference_max_demos", 6)
-    if isinstance(decode_cap, bool) or not isinstance(decode_cap, int) or not 1 <= decode_cap <= 6:
-        raise ValueError(f"{name}.inference_max_demos must be an integer from 1 to 6.")
     if config.get("attention_pattern") not in (None, "dense", "pair_group"):
         raise ValueError(f"{name}.attention_pattern must be 'dense' or 'pair_group'.")
     for key, allowed in (("training_demo_schedule", ("all", "half_or_more", "two")),
@@ -349,10 +336,6 @@ def training_overrides(
             f"{name}.augmentation_sampling_mode must be 'full_task_prefix', 'single_grid_prefix' or 'context_palette'."
         )
     n_predict = config.get("n_predict")
-    if config.get("residual_init") not in (None, "xavier", "depth_scaled"):
-        raise ValueError(f"{name}.residual_init must be xavier or depth_scaled.")
-    if config.get("branch_norm") not in (None, "none", "hidden_rms"):
-        raise ValueError(f"{name}.branch_norm must be none or hidden_rms.")
     if config.get("input_shortcuts") not in (None, "learned", "fixed"):
         raise ValueError(f"{name}.input_shortcuts must be learned or fixed.")
     spatial_base = config.get("rope_spatial_base")
@@ -361,6 +344,19 @@ def training_overrides(
         or not math.isfinite(spatial_base) or spatial_base <= 1
     ):
         raise ValueError(f"{name}.rope_spatial_base must be finite and > 1.")
+    for key in ("scale_augmentation", "scale_anisotropic", "inference_scale_views", "inference_symbolic_guards",
+                "inference_rescore", "rescore_prefix_cache"):
+        if key in config and not isinstance(config[key], bool):
+            raise ValueError(f"{name}.{key} must be a boolean.")
+    scale_specs = config.get("scale_max_specs", 12)
+    if isinstance(scale_specs, bool) or not isinstance(scale_specs, int) or scale_specs < 1:
+        raise ValueError(f"{name}.scale_max_specs must be an integer >= 1.")
+    if config.get("compile_scope") not in (None, "model", "blocks", "none"):
+        raise ValueError(f"{name}.compile_scope must be 'model', 'blocks' or 'none'.")
+    for key in ("rearc_pairs_per_epoch", "rearc_max_demos"):
+        value = config.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise ValueError(f"{name}.{key} must be an integer >= 1.")
     diagnostics = config.get("depth_diagnostics_every", 0)
     if isinstance(diagnostics, bool) or not isinstance(diagnostics, int) or diagnostics < 0:
         raise ValueError(f"{name}.depth_diagnostics_every must be an integer >= 0.")
@@ -368,6 +364,14 @@ def training_overrides(
         every = config.get(key, 0)
         if isinstance(every, bool) or not isinstance(every, int) or every < 0:
             raise ValueError(f"{name}.{key} must be an integer >= 0.")
+    if not isinstance(config.get("cautious_weight_decay", False), bool):
+        raise ValueError(f"{name}.cautious_weight_decay must be a boolean.")
+    for key in ("compiled_autograd", "compile_regions", "coordinate_descent_tuning"):
+        if not isinstance(config.get(key, False), bool):
+            raise ValueError(f"{name}.{key} must be a boolean.")
+    compile_mode = config.get("compile_mode", "default")
+    if compile_mode not in ("default", "max-autotune-no-cudagraphs", "max-autotune", "reduce-overhead"):
+        raise ValueError(f"{name}.compile_mode must be default, max-autotune-no-cudagraphs, max-autotune or reduce-overhead.")
     residual_lr = config.get("normuon_residual_output_lr_multiplier", 1.0)
     if (isinstance(residual_lr, bool) or not isinstance(residual_lr, (int, float))
             or not math.isfinite(residual_lr) or residual_lr < 0):
@@ -402,25 +406,6 @@ def training_overrides(
                 f"{name}.mtp_decay must be [start, end, final_multiplier] with finite "
                 "values satisfying 0 <= start < end <= 1 and 0 <= final_multiplier <= 1."
             )
-    method = config.get("finetune_method", "full")
-    if method not in ("full", "lora"):
-        raise ValueError(f"{name}.finetune_method must be full or lora.")
-    blocks = config.get("finetune_trainable_blocks")
-    if blocks is not None and (
-        not isinstance(blocks, list) or len(blocks) != 2 or method == "lora"
-        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in blocks)
-        or sum(blocks) < 1
-    ):
-        raise ValueError(f"{name}.finetune_trainable_blocks must be [first, last] nonnegative integers "
-                         "selecting at least one block, without LoRA.")
-    rank = config.get("lora_rank", 16)
-    if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
-        raise ValueError(f"{name}.lora_rank must be an integer >= 1.")
-    for key, positive in (("lora_alpha", True), ("lora_lr", True), ("lora_weight_decay", False)):
-        value = config.get(key, 1.0)
-        if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
-                or value < 0 or (positive and value == 0)):
-            raise ValueError(f"{name}.{key} must be finite and {'> 0' if positive else '>= 0'}.")
     return config
 
 
@@ -443,22 +428,41 @@ def normalize_fa_config(config: dict[str, Any], name: str) -> None:
             raise ValueError(f"{name}: FA=4 requires attention_dropout=0.0.")
 
 
+def greedy_inference(config: dict[str, Any]) -> bool:
+    temperature, top_k = config.get("inference_temperature"), config.get("inference_top_k")
+    return (temperature is not None and temperature <= 0) or (temperature is None and top_k is None) or top_k == 1
+
+
+def default_speculative_off_when_sampling(config: dict[str, Any], explicit: bool) -> None:
+    """Speculative decoding is on by default for greedy decodes only; an explicit request is validated.
+
+    "auto" resolves here: speculative exactly when the decode is greedy.
+    """
+    if config.get("inference_speculative") == "auto":
+        config["inference_speculative"] = greedy_inference(config)
+    if not explicit and config.get("inference_speculative") and not greedy_inference(config):
+        config["inference_speculative"] = False
+
+
 def validate_eval_mode(config: dict[str, Any], name: str) -> None:
-    budget = config.get("prefill_token_budget", 524288)
-    if type(budget) is not int or budget <= 0:
-        raise ValueError(f"{name}.prefill_token_budget must be a positive integer.")
     prefix = config.get("checkpoint_task_id_prefix")
     if prefix is not None and (not isinstance(prefix, str) or not prefix or not prefix.endswith("/")):
         raise ValueError(f"{name}.checkpoint_task_id_prefix must be a nonempty namespace ending in '/'.")
-    if config.get("mode") not in ("full-decode", "accuracy-only", "intermediate-diagnostic"):
-        raise ValueError(f'{name}.mode must be full-decode, accuracy-only or intermediate-diagnostic.')
-    cases = config.get("diagnostic_cases", 64)
-    if type(cases) is not int or cases < 1:
-        raise ValueError(f"{name}.diagnostic_cases must be a positive integer")
-    if config.get("inference_speculative") is True and config.get("mode") == "full-decode":
-        temperature, top_k = config.get("inference_temperature"), config.get("inference_top_k")
-        greedy = (temperature is not None and temperature <= 0) or (temperature is None and top_k is None) or top_k == 1
-        if not greedy:
+    if config.get("mode") not in ("full-decode", "accuracy-only", "rescore"):
+        raise ValueError(f'{name}.mode must be "full-decode", "accuracy-only" or "rescore".')
+    if config.get("mode") == "rescore" and name != "eval_defaults" and not isinstance(config.get("candidates_path"), str):
+        raise ValueError(f"{name}.candidates_path must name a decode's candidates.json.gz for rescore.")
+    top_k = config.get("rescore_top_k")
+    if top_k is not None and (isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1):
+        raise ValueError(f"{name}.rescore_top_k must be a positive integer.")
+    budget = config.get("prefill_token_budget")
+    if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or budget < 1):
+        raise ValueError(f"{name}.prefill_token_budget must be a positive integer or null.")
+    loops = config.get("eval_loop_iterations")
+    if loops is not None and (isinstance(loops, bool) or not isinstance(loops, int) or loops < 2):
+        raise ValueError(f"{name}.eval_loop_iterations must be null or an integer >= 2.")
+    if config.get("inference_speculative") and config.get("mode") == "full-decode":
+        if not greedy_inference(config):
             raise ValueError(f"{name}.inference_speculative requires greedy inference (temperature=0).")
 
 
@@ -631,8 +635,6 @@ def stage_dir(run_dir: Path, stage: str, name: str | None = None) -> Path:
 
 def stage_summary(stage: dict[str, Any]) -> dict[str, Any]:
     summary = {
-        "batch_size_per_gpu": stage["batch_size"],
-        "gradient_accumulation_steps": stage["gradient_accumulation_steps"],
         "epochs": stage["epochs"],
         "FA": stage.get("FA"),
         "max_augments": stage["max_augments"],
@@ -640,26 +642,36 @@ def stage_summary(stage: dict[str, Any]) -> dict[str, Any]:
             "checkpoint" if stage.get("checkpoint_path") else "full_task_prefix"
         ),
         "rearc_pairs_per_epoch": stage.get("rearc_pairs_per_epoch"),
+        "rearc_max_demos": stage.get("rearc_max_demos"),
+        "compile_scope": stage.get("compile_scope", "blocks"),
         "nvarc_pairs_per_epoch": stage.get("nvarc_pairs_per_epoch"),
         "nvarc_puzzles_per_epoch": stage.get("nvarc_puzzles_per_epoch"),
         "checkpoint_epochs": stage["checkpoint_epochs"],
         "checkpoint_keep_last": stage.get("checkpoint_keep_last"),
         "kept_checkpoint_every": stage.get("kept_checkpoint_every", 0),
         "rolling_checkpoint_every": stage.get("rolling_checkpoint_every", 0),
+        "cautious_weight_decay": stage.get("cautious_weight_decay", False),
         "resume_warmup_pct": stage["resume_warmup_pct"],
         "mtp_decay": stage["mtp_decay"],
         "train_log_file": stage["train_log_file"],
         "save_path": stage["save_path"],
+        "batch_size_per_gpu": stage["batch_size"],
+        "gradient_accumulation_steps": stage["gradient_accumulation_steps"],
         "training_demo_schedule": stage.get("training_demo_schedule", "all"),
-        "max_training_demos": stage.get("max_training_demos", 6),
-        "predict_intermediate_grids": stage.get("predict_intermediate_grids"),
+        "max_training_demos": stage.get("max_training_demos"),
+        "stable_cross_entropy": stage.get("stable_cross_entropy", False),
     }
     if stage.get("checkpoint_path"):
         summary["checkpoint_path"] = stage["checkpoint_path"]
+    if stage.get("scale_augmentation"):
+        summary["scale_augmentation"] = {"max_specs": stage.get("scale_max_specs", 12),
+                                         "anisotropic": stage.get("scale_anisotropic", True)}
+    if stage.get("inference_scale_views"):
+        summary["inference_scale_views"] = {"max_specs": stage.get("scale_max_specs", 12),
+                                            "anisotropic": stage.get("scale_anisotropic", True)}
     if summary["FA"] is None:
         summary.pop("FA")
     for key, fresh_default in (("n_predict", 4), ("mtp_weight", 0.3), ("rope_spatial_base", 1000.0),
-                               ("residual_init", "xavier"), ("branch_norm", "none"),
                                ("task_embeddings", True), ("dihedral_embeddings", False),
                                ("attention_pattern", "dense")):
         value = stage.get(key)
@@ -698,10 +710,6 @@ def checkpoint_is_saved(stage: dict[str, Any], epoch: int) -> bool:
 
 def resolve_checkpoint_ref(ref: str, plan: dict[str, Any]) -> Path:
     parts = ref.split(".")
-    if len(parts) == 2 and parts[0] == "input":
-        if parts[1] not in plan.get("evaluation_checkpoints", {}):
-            raise ValueError(f"Unknown evaluation input: {ref}")
-        return plan["run_dir"] / "inputs" / f"{parts[1]}.pt"
     if parts == ["checkpoint"]:
         if not plan.get("eval_only", False):
             raise ValueError(
@@ -748,7 +756,8 @@ def resolve_checkpoint_ref(ref: str, plan: dict[str, Any]) -> Path:
         # The final file takes one retention slot; keep_last=1 saves it only once.
         retained = retained[-(keep_last - 1):] if keep_last > 1 else []
         if epoch not in retained:
-            raise ValueError(f"{ref} will be removed by checkpoint_keep_last={keep_last}; use a final checkpoint or increase retention.")
+            raise ValueError(f"{ref} will be removed by checkpoint_keep_last={keep_last}; "
+                             "use a final checkpoint or increase retention.")
     return checkpoint_path_for_epoch(stage["save_path"], epoch, stage["epochs"])
 
 
@@ -762,11 +771,6 @@ def load_spec(path: Path) -> dict[str, Any]:
 
 def build_dataset_config(raw_dataset_cfg: dict[str, Any]) -> dict[str, Any]:
     reject_unknown_keys(raw_dataset_cfg, DATASET_KEYS, "dataset")
-    if "prepared" in raw_dataset_cfg:
-        from dataset_building_scripts.intermediate_grids import validate_identity
-        validate_identity(raw_dataset_cfg["prepared"])
-        if "pretrain_data" in raw_dataset_cfg:
-            raise ValueError("prepared cannot be combined with pretrain_data")
     if (raw_dataset_cfg.get("pretrain_data") or {}).get("kind") == "family_sampled":
         from dataset_building_scripts.family_data import normalize_config
         return merge_dicts(DEFAULT_DATASET, normalize_config(raw_dataset_cfg, REPO_ROOT))
@@ -775,18 +779,13 @@ def build_dataset_config(raw_dataset_cfg: dict[str, Any]) -> dict[str, Any]:
 
         evaluation_datasets = {
             "arc1_eval": "arc1", "arc2_eval": "arc2", "conceptarc": "conceptarc",
-            "arc2_train": "arc2", "arc1_filtered": "arc1", "arc_heavy100": "arc2", "arc_new80": "arc2",
+            "arc2_train": "arc2", "arc1_filtered": "arc1",
         }
         default_source = {"arc1": "arc1_eval", "arc2": "arc2_eval", "conceptarc": "conceptarc"}.get(
             raw_dataset_cfg.get("dataset", "arc2")
         )
         evaluation = dict(expect_dict(raw_dataset_cfg.get("evaluation"), "dataset.evaluation"))
-        reject_unknown_keys(evaluation, {"source", "split_manifest", "extra_tasks"}, "dataset.evaluation")
-        if "extra_tasks" in evaluation:
-            if not evaluation.get("split_manifest"):
-                raise ValueError("dataset.evaluation.extra_tasks extends a parent split's evaluation group")
-            reject_unknown_keys(expect_dict(evaluation["extra_tasks"], "dataset.evaluation.extra_tasks"),
-                                {"challenges", "solutions", "group", "prefix"}, "dataset.evaluation.extra_tasks")
+        reject_unknown_keys(evaluation, {"source", "split_manifest"}, "dataset.evaluation")
         evaluation.setdefault("source", default_source)
         eval_source = evaluation["source"]
         if not isinstance(eval_source, str) or eval_source not in evaluation_datasets:
@@ -795,9 +794,7 @@ def build_dataset_config(raw_dataset_cfg: dict[str, Any]) -> dict[str, Any]:
         if raw_dataset_cfg.get("dataset", dataset_name) != dataset_name:
             raise ValueError("dataset.dataset and dataset.evaluation.source disagree")
         split_path = evaluation.get("split_manifest")
-        if eval_source in {"conceptarc", "arc2_train", "arc1_filtered"} or (
-            eval_source == "arc2_eval" and split_path
-        ):
+        if eval_source in {"conceptarc", "arc2_train", "arc1_filtered"}:
             manifest, _ = load_parent_split(REPO_ROOT, split_path)
             if manifest["source"] != eval_source:
                 raise ValueError("Parent split source must match dataset.evaluation.source")
@@ -1071,10 +1068,7 @@ def build_plan(spec: dict[str, Any], spec_path: Path) -> dict[str, Any]:
         raise ValueError("Public-answer pretraining requires skip_evals=true; public eval is part of training")
     if dataset_cfg.get("pretrain_data", {}).get("mode") == "full" and (not skip_evals or spec.get("enable_finetune", True)):
         raise ValueError("Full family data requires skip_evals=true and enable_finetune=false; public answers belong to training")
-    if isinstance(spec.get("checkpoint"), dict) and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", run_name):
-        raise ValueError("A Drive checkpoint requires run_name to be a single safe directory name.")
-    standalone_checkpoint, drive_checkpoint = resolve_input_checkpoint(spec.get("checkpoint"), run_dir)
-    evaluation_checkpoints = resolve_evaluation_checkpoints(spec, run_dir)
+    standalone_checkpoint = resolve_input_checkpoint(spec.get("checkpoint"), run_dir)
     if eval_only and standalone_checkpoint is None:
         raise ValueError("eval_only requires a top-level checkpoint path.")
     if eval_only and skip_evals:
@@ -1089,8 +1083,8 @@ def build_plan(spec: dict[str, Any], spec_path: Path) -> dict[str, Any]:
     if skip_evals and spec.get("evals") not in (None, {}):
         raise ValueError("skip_evals cannot be combined with evals.")
 
-    task_data_mode = "pretrain_data" in dataset_cfg or "prepared" in dataset_cfg
-    variation_mode = dataset_cfg.get("pretrain_data", {}).get("kind") in {"task_variations", "family_sampled"}
+    task_data_mode = "pretrain_data" in dataset_cfg
+    variation_mode = task_data_mode and dataset_cfg["pretrain_data"]["kind"] in {"task_variations", "family_sampled"}
     assets_root = run_dir / "data" if task_data_mode else REPO_ROOT / "assets"
     assets = {
         "train_data_path": assets_root / "challenges.json",
@@ -1116,7 +1110,7 @@ def build_plan(spec: dict[str, Any], spec_path: Path) -> dict[str, Any]:
         "solutions_path": assets_root / "solutions.json",
     }
     eval_groups = {}
-    if task_data_mode and dataset_cfg.get("evaluation", {}).get("split_manifest"):
+    if task_data_mode and dataset_cfg["evaluation"].get("split_manifest"):
         from dataset_building_scripts.task_splits import load_parent_split
 
         manifest, _ = load_parent_split(REPO_ROOT, dataset_cfg["evaluation"]["split_manifest"])
@@ -1138,6 +1132,8 @@ def build_plan(spec: dict[str, Any], spec_path: Path) -> dict[str, Any]:
         training_overrides(spec.get("defaults"), "defaults"),
     )
     normalize_fa_config(shared, "defaults")
+    speculative_explicit = "inference_speculative" in (spec.get("defaults") or {})
+    default_speculative_off_when_sampling(shared, speculative_explicit)
 
     pretrain_dir = stage_dir(run_dir, "pretrain")
     pretrain = merge_dicts(
@@ -1153,6 +1149,9 @@ def build_plan(spec: dict[str, Any], spec_path: Path) -> dict[str, Any]:
             "nvarc_full_path": assets["nvarc_full_path"],
             "checkpoint_path": standalone_checkpoint,
             "checkpoint_mode": "resume",
+            # A resumed checkpoint trained without scale keeps its recipe unless the spec sets the flag.
+            "scale_augmentation_explicit": any("scale_augmentation" in (spec.get(key) or {})
+                                               for key in ("defaults", "pretrain")),
             "train_log_file": pretrain_dir / "training_log.txt",
             "save_path": pretrain_dir / "tiny.pt",
         },
@@ -1160,10 +1159,6 @@ def build_plan(spec: dict[str, Any], spec_path: Path) -> dict[str, Any]:
     if pretrain.get("reset_training_state", False):
         pretrain["checkpoint_mode"] = "finetune"
     normalize_fa_config(pretrain, "pretrain")
-    if "prepared" in dataset_cfg and (
-            pretrain.get("attention_pattern") != "pair_group"
-            or pretrain.get("pair_identity_vertices", 0)):
-        raise ValueError("Prepared grid chains require pair_group attention and no pair identities")
     validate_research_options(pretrain, n_layers=pretrain["n_layers"])
     if standalone_checkpoint is None and (pretrain.get("loop_iterations") or 1) > 1:
         if pretrain.get("loop_start_layer") is None or pretrain.get("loop_end_layer") is None:
@@ -1209,7 +1204,6 @@ def build_plan(spec: dict[str, Any], spec_path: Path) -> dict[str, Any]:
         {
             "mode": "full-decode",
             "batch_size": 120,
-            "prefill_token_budget": 524288,
             "max_augments": shared["max_augments"],
             "enable_aug": shared["enable_aug"],
             "augmentation_sampling_mode": shared["augmentation_sampling_mode"],
@@ -1217,8 +1211,6 @@ def build_plan(spec: dict[str, Any], spec_path: Path) -> dict[str, Any]:
             "inference_temperature": shared["inference_temperature"],
             "inference_top_k": shared["inference_top_k"],
             "inference_speculative": shared["inference_speculative"],
-            "residual_init": shared["residual_init"],
-            "branch_norm": shared["branch_norm"],
             "allow_missing_tasks": True,
             "extend_checkpoint_task_ids": True,
         },
@@ -1229,6 +1221,8 @@ def build_plan(spec: dict[str, Any], spec_path: Path) -> dict[str, Any]:
         ),
     )
     normalize_fa_config(eval_defaults, "eval_defaults")
+    speculative_explicit = speculative_explicit or "inference_speculative" in (spec.get("eval_defaults") or {})
+    default_speculative_off_when_sampling(eval_defaults, speculative_explicit)
     validate_eval_mode(eval_defaults, "eval_defaults")
     raw_evals = {} if skip_evals else expect_dict(spec.get("evals"), "evals")
     if not raw_evals and not skip_evals:
@@ -1276,6 +1270,8 @@ def build_plan(spec: dict[str, Any], spec_path: Path) -> dict[str, Any]:
             }),
         )
         normalize_fa_config(evals[name], f"evals.{name}")
+        default_speculative_off_when_sampling(
+            evals[name], speculative_explicit or "inference_speculative" in (overrides or {}))
         validate_eval_mode(evals[name], f"evals.{name}")
         evals[name].pop("from", None)
 
@@ -1298,20 +1294,9 @@ def build_plan(spec: dict[str, Any], spec_path: Path) -> dict[str, Any]:
         "assets": assets,
         "shared": shared,
         "pretrain": pretrain,
-        "drive_checkpoint": drive_checkpoint,
-        "evaluation_checkpoints": evaluation_checkpoints,
         "finetunes": finetunes,
         "evals": evals,
     }
-    if "checkpoint_adaptation" in spec:
-        from src.checkpoint_adaptation import validate_config
-        if (standalone_checkpoint is None or enable_finetune or eval_only or not skip_evals
-                or not plan["skip_data_build"] or nproc != 1
-                or any(key in spec for key in ("training_benchmark", "backend_benchmark",
-                    "speculative_benchmark", "evaluation_budget_benchmark"))):
-            raise ValueError("checkpoint_adaptation requires a checkpoint, skip_data_build=true, "
-                             "skip_evals=true, enable_finetune=false and one process")
-        plan["checkpoint_adaptation"] = validate_config(spec["checkpoint_adaptation"])
     if nproc > 1 and not eval_only:
         for stage in (pretrain, *finetunes.values()):
             if stage["device"] != "cuda":
@@ -1336,7 +1321,6 @@ def build_plan(spec: dict[str, Any], spec_path: Path) -> dict[str, Any]:
 def preview_plan(plan: dict[str, Any]) -> dict[str, Any]:
     preview = {
         "distributed": plan["distributed"],
-        **({"checkpoint_adaptation": plan["checkpoint_adaptation"]} if "checkpoint_adaptation" in plan else {}),
         "run_name": plan["run_name"],
         "eval_only": plan["eval_only"],
         "skip_data_build": plan["skip_data_build"],
@@ -1346,8 +1330,7 @@ def preview_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "timing_path": plan["run_dir"] / "timing.txt",
         "dataset": plan["dataset"],
         "pretrain": (
-            None if plan["eval_only"] or plan.get("finetune_only") or plan.get("checkpoint_adaptation")
-            else stage_summary(plan["pretrain"])
+            None if plan["eval_only"] or plan.get("finetune_only") else stage_summary(plan["pretrain"])
         ),
         "finetunes": (
             {}
@@ -1367,14 +1350,11 @@ def preview_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 **({"FA": stage["FA"]} if "FA" in stage else {}),
                 "max_augments": stage["max_augments"],
                 "batch_size": stage["batch_size"],
-                "prefill_token_budget": stage["prefill_token_budget"],
-                "residual_init": stage["residual_init"] or "checkpoint",
-                "branch_norm": stage["branch_norm"] or "checkpoint",
                 **(
-                    {"diagnostic_path": stage_dir(plan["run_dir"], "eval", name) / "intermediate_diagnostic.json"}
-                    if stage["mode"] == "intermediate-diagnostic" else
                     {"accuracy_path": stage_dir(plan["run_dir"], "eval", name) / "accuracy.json"}
                     if stage["mode"] == "accuracy-only"
+                    else {"rescore_path": stage_dir(plan["run_dir"], "eval", name) / "rescore.json"}
+                    if stage["mode"] == "rescore"
                     else {
                         "submission_path": stage_dir(plan["run_dir"], "eval", name) / "submission.json",
                         "score_path": stage_dir(plan["run_dir"], "eval", name) / "score.json",
@@ -1386,8 +1366,6 @@ def preview_plan(plan: dict[str, Any]) -> dict[str, Any]:
     }
     if plan["eval_only"]:
         preview["source_checkpoint"] = plan["pretrain"]["checkpoint_path"]
-    if plan["drive_checkpoint"]:
-        preview["drive_checkpoint"] = plan["drive_checkpoint"]
     if plan.get("training_benchmark"):
         preview["training_benchmark"] = plan["training_benchmark"]
     if plan.get("backend_benchmark"):
@@ -1399,14 +1377,7 @@ def preview_plan(plan: dict[str, Any]) -> dict[str, Any]:
     return preview
 
 
-def validate_distributed_gpu_count(resolved: dict[str, Any], num_gpus: int) -> None:
-    nproc = 1 if resolved.get("eval_only") else resolved.get("distributed", {}).get("nproc_per_node", 1)
-    if nproc > num_gpus:
-        raise ValueError(f"DDP requires {nproc} GPUs but the infrastructure policy requests {num_gpus}; "
-                         "set num_gpus explicitly before launching")
-
-
-def run_training_stage_distributed(plan, stage, label):
+def run_training_stage_distributed(plan: dict[str, Any], stage: dict[str, Any], label: str) -> None:
     from distributed_training import training_process
 
     with training_process(plan.get("distributed", {}).get("nproc_per_node", 1)):
@@ -1417,81 +1388,19 @@ def run_training_stage(stage: dict[str, Any], label: str) -> None:
     load_runtime_modules()
     Path(stage["save_path"]).parent.mkdir(parents=True, exist_ok=True)
     cfg = argparse.Namespace(**stage)
-    if os.environ.get("MDLARC_REPORT_FIRST_UPDATE"):
-        print("MDLARC_STARTUP_EVENT model_setup", flush=True)
     print(f"Building {label}...")
     model, dataset, dataloader, device, data_path = build.build_model_and_data(cfg)
-    import parameter_efficient
-    adaptation = parameter_efficient.configure_finetune(model, cfg)
-    if adaptation is not None:
-        print(f"Fine-tune adaptation: {json.dumps(adaptation)}", flush=True)
     print(f"Starting {label}...")
-    if os.environ.get("MDLARC_REPORT_FIRST_UPDATE"):
-        print("MDLARC_STARTUP_EVENT compiling_training", flush=True)
     t_start = perf_counter()
-    with training_stats(Path(stage["save_path"]).parent / "finetune_stats.json", model, adaptation):
-        train.train_model(
-            cfg,
-            model=model,
-            dataloader=dataloader,
-            dataset=dataset,
-            device=device,
-            data_path=data_path,
-        )
+    train.train_model(
+        cfg,
+        model=model,
+        dataloader=dataloader,
+        dataset=dataset,
+        device=device,
+        data_path=data_path,
+    )
     print(f"{label} finished in {perf_counter() - t_start:.2f}s")
-
-
-def cuda_memory() -> dict[str, Any]:
-    import torch
-    if not torch.cuda.is_available():
-        return {}
-    return {"peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
-            "peak_reserved_gib": torch.cuda.max_memory_reserved() / 2**30, "gpu": torch.cuda.get_device_name()}
-
-
-@contextmanager
-def training_stats(path: Path, model: Any, adaptation: dict[str, Any] | None):
-    """Per-epoch wall seconds (CUDA-synchronised), optimizer updates and peak GPU memory of one training stage."""
-    import torch
-    stats = {"adaptation": adaptation or {"method": "full"},
-             "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
-             "stored_parameters": sum(p.numel() for p in model.parameters()),
-             "epoch_seconds": [], "optimizer_updates": 0}
-    write = os.environ.get("RANK", "0") == "0"
-    original_epoch, original_optimizer = train.train_one_epoch, train._build_optimizer
-
-    def counted_optimizer(*args, **kwargs):
-        optimizer = original_optimizer(*args, **kwargs)
-        def count(*_):
-            stats["optimizer_updates"] += 1
-        optimizer.register_step_post_hook(count)
-        return optimizer
-
-    def timed_epoch(*args, **kwargs):
-        started = perf_counter()
-        result = original_epoch(*args, **kwargs)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        stats["epoch_seconds"].append(perf_counter() - started)
-        stats.update(cuda_memory())
-        if write:
-            write_json(path, stats)
-            print(f"[ftstat] epoch {len(stats['epoch_seconds'])} {stats['epoch_seconds'][-1]:.2f}s "
-                  f"updates={stats['optimizer_updates']} peak_allocated_gib={stats.get('peak_allocated_gib', -1):.2f}",
-                  flush=True)
-        return result
-
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-    train.train_one_epoch, train._build_optimizer = timed_epoch, counted_optimizer
-    started = perf_counter()
-    try:
-        yield stats
-    finally:
-        train.train_one_epoch, train._build_optimizer = original_epoch, original_optimizer
-    stats.update(seconds=perf_counter() - started, **cuda_memory())
-    if write:
-        write_json(path, stats)
 
 
 def run_training_stage_isolated(plan: dict[str, Any], stage_name: str) -> None:
@@ -1507,13 +1416,20 @@ def run_training_stage_isolated(plan: dict[str, Any], stage_name: str) -> None:
     ]
     nproc = plan.get("distributed", {}).get("nproc_per_node", 1)
     if nproc > 1:
+        # Single-node DDP: torchrun starts one worker per GPU (src/distributed_training.py).
         command = [sys.executable, "-u", "-m", "torch.distributed.run", "--standalone",
                    "--nnodes=1", f"--nproc-per-node={nproc}", "--max-restarts=0", *command[2:]]
     print(
         f"Starting training stage {stage_name!r} in an isolated process...",
         flush=True,
     )
-    subprocess.run(command, check=True, cwd=REPO_ROOT)
+    # Packed sequences change length every micro-batch, which fragments the caching
+    # allocator (a d384 x6 ReARC run reserved 125-139 GiB for 56 GiB live). Expandable
+    # segments let the allocator grow mappings instead of hoarding whole blocks; an
+    # explicit PYTORCH_CUDA_ALLOC_CONF in the environment wins.
+    env = dict(os.environ)
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    subprocess.run(command, check=True, cwd=REPO_ROOT, env=env)
 
 
 def run_eval_stage(plan: dict[str, Any], name: str, eval_cfg: dict[str, Any]) -> None:
@@ -1532,10 +1448,6 @@ def run_eval_stage(plan: dict[str, Any], name: str, eval_cfg: dict[str, Any]) ->
             },
         )
     )
-    import torch
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-    eval_started = perf_counter()
     result = evaluate.run_evaluation(
         cfg,
         run_name=str(eval_cfg["run_name"]),
@@ -1547,16 +1459,13 @@ def run_eval_stage(plan: dict[str, Any], name: str, eval_cfg: dict[str, Any]) ->
         task_ids=None,
         timing_path=plan["run_dir"] / "timing.txt",
     )
-    write_run_stats(Path(result[2]).parent, Path(checkpoint_path), perf_counter() - eval_started)
-    if eval_cfg["mode"] in ("accuracy-only", "intermediate-diagnostic"):
-        print(f"Evaluation complete for {name}. Metrics saved to {result[2]}.")
+    if eval_cfg["mode"] == "accuracy-only":
+        print(f"Evaluation complete for {name}. Accuracy saved to {result[2]}.")
+        return
+    if eval_cfg["mode"] == "rescore":
+        print(f"Evaluation complete for {name}. Rescore report saved to {result[2]}.")
         return
     submission_path = result[2]
-    # Keep the candidates before the isolated evaluator process exits. This
-    # permits oracle coverage analysis without repeating model inference.
-    import gzip
-    with gzip.open(Path(submission_path).with_name("generated_candidates.json.gz"), "wt", encoding="utf-8") as handle:
-        json.dump(result[1], handle, separators=(",", ":"))
     print(f"Evaluation complete for {name}. submission.json generated.")
     if plan["score_results"]:
         score_result = utils.score_arc_submission(solutions_path, submission_path)
@@ -1581,23 +1490,6 @@ def run_eval_stage(plan: dict[str, Any], name: str, eval_cfg: dict[str, Any]) ->
             utils.visualize_submissions(submission_path, mode="submission")
 
 
-def write_run_stats(directory: Path, checkpoint_path: Path, eval_seconds: float) -> None:
-    """run_stats.json beside the scores: the evaluated fine-tune's training stats and this decode's cost."""
-    import statistics
-    train_stats_path = checkpoint_path.parent / "finetune_stats.json"
-    training = json.loads(train_stats_path.read_text()) if train_stats_path.is_file() else None
-    stats = {"train": training, "eval": {"seconds": eval_seconds, **cuda_memory()}}
-    write_json(directory / "run_stats.json", stats)
-    if training and training["epoch_seconds"]:
-        epochs = training["epoch_seconds"]
-        print("[ftstat] summary "
-              f"s_per_epoch={statistics.median(epochs[1:] or epochs):.2f} epoch1_s={epochs[0]:.0f} "
-              f"train_s={training.get('seconds', sum(epochs)):.0f} "
-              f"peak_train_gib={training.get('peak_allocated_gib', -1):.1f} updates={training['optimizer_updates']} "
-              f"trainable={training['trainable_parameters']} eval_s={eval_seconds:.0f} "
-              f"peak_eval_gib={stats['eval'].get('peak_allocated_gib', -1):.1f}", flush=True)
-
-
 def run_eval_stage_isolated(plan: dict[str, Any], name: str) -> None:
     """Run evaluation with compiler/CUDA state independent from training."""
     command = [
@@ -1620,11 +1512,6 @@ def run_eval_stage_isolated(plan: dict[str, Any], name: str) -> None:
 def prepare_data(plan: dict[str, Any]) -> None:
     if plan["skip_data_build"]:
         raise ValueError("The selected spec skips data building")
-    if "prepared" in plan["dataset"]:
-        from dataset_building_scripts.intermediate_grids import build_prepared_dataset
-        result = build_prepared_dataset(plan["dataset"]["prepared"], plan["run_dir"] / "data", root=REPO_ROOT)
-        print(f"Prepared grid data: {result}")
-        return
     if "pretrain_data" in plan["dataset"]:
         if plan["dataset"]["pretrain_data"]["kind"] == "family_sampled":
             from dataset_building_scripts.family_data import build_family_dataset
@@ -1642,10 +1529,6 @@ def prepare_data(plan: dict[str, Any]) -> None:
 
 def validate_run_split(plan: dict[str, Any]) -> None:
     """Keep cached data tied to the split requested by the current spec."""
-    if "prepared" in plan.get("dataset", {}):
-        from dataset_building_scripts.intermediate_grids import build_prepared_dataset
-        build_prepared_dataset(plan["dataset"]["prepared"], plan["run_dir"] / "data", root=REPO_ROOT)
-        return
     family_data = plan.get("dataset", {}).get("pretrain_data", {})
     if family_data.get("kind") == "family_sampled":
         from dataset_building_scripts.family_data import sha, encoded
@@ -1674,18 +1557,10 @@ def validate_run_split(plan: dict[str, Any]) -> None:
 def execute_plan(plan: dict[str, Any]) -> None:
     print(f"Using experiment spec: {plan['spec_path']}")
     print(f"Resolved run name: {plan['run_name']}")
-    if plan.get("checkpoint_adaptation"):
-        from src.checkpoint_adaptation import run_adaptation
-        run_adaptation(plan)
-        return
-    if os.environ.get("MDLARC_REPORT_FIRST_UPDATE"):
-        print("MDLARC_STARTUP_EVENT preparing_data", flush=True)
     if not plan["skip_data_build"]:
         prepare_data(plan)
     validate_run_split(plan)
-    if os.environ.get("MDLARC_REPORT_FIRST_UPDATE"):
-        print("MDLARC_STARTUP_EVENT data_ready", flush=True)
-    if plan.get("validate_cuda", False) and os.environ.get("MDLARC_SKIP_CUDA_VALIDATION") != "1":
+    if plan.get("validate_cuda", False):
         subprocess.run([sys.executable, "-u", str(SRC_DIR / "ablation_validation.py"),
                         str(plan["run_dir"] / "cuda_validation.json"),
                         str(plan["pretrain"].get("FA", 2))], check=True, cwd=REPO_ROOT)
@@ -1730,11 +1605,7 @@ def execute_plan(plan: dict[str, Any]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a local mdlARC experiment spec.")
-    parser.add_argument(
-        "--config",
-        default=str(DEFAULT_SPEC_PATH),
-        help="Path to a JSON experiment spec (default: specs/pretrain_eval.json).",
-    )
+    parser.add_argument("--config", required=True, help="Path to a JSON experiment spec.")
     parser.add_argument(
         "--preview",
         action="store_true",
@@ -1758,10 +1629,6 @@ def main() -> None:
     update_env_from_file(os.environ, DATASET_BUILD_ENV_PATH)
     spec_path = Path(args.config).expanduser().resolve()
     plan = build_plan(load_spec(spec_path), spec_path)
-    needs_training_input = args.eval_stage is None
-    if (plan["drive_checkpoint"] and needs_training_input and not args.preview
-            and not plan["pretrain"]["checkpoint_path"].is_file()):
-        raise FileNotFoundError("Drive checkpoint has not been staged; launch this spec with scripts/run_on_colab.py.")
     if args.prepare_data:
         prepare_data(plan)
         return

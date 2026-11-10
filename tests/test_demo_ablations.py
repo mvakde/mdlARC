@@ -12,7 +12,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from common import ARCExampleDataset, collate_examples, compute_positions_3d, encode_context
-from demo_schedule import MAX_CONTEXT_DEMOS, half_or_more_demonstrations
+from demo_schedule import half_or_more_demonstrations
 from pair_identity import balanced_pair_vertices, leave_one_out, simplex_table
 from tinytransformer import TinyTransformer, TinyTransformerConfig
 from test_mtp import _batch, _set_path
@@ -24,136 +24,26 @@ def test_omissions_balanced_at_every_prefix_and_replay(count):
     totals = Counter({i: 0 for i in range(count)})
     for visit in range(80):
         visible = leave_one_out(range(count), visit=visit, seed=71)
-        assert len(visible) == max(0, min(6, count - 1))
+        assert len(visible) == max(0, count - 1)
         assert visible == leave_one_out(range(count), visit=visit, seed=71)
         totals.update(set(range(count)) - set(visible))
         if totals:
             assert max(totals.values()) - min(totals.values()) <= 1
 
 
-@pytest.mark.parametrize('count', [0, 1, 2, 3, 4, 6, 7, 9, 11, 12, 21, 100])
-def test_capped_schedule_balances_sizes_and_demo_use_at_every_prefix(count):
-    sizes = Counter()
-    totals = Counter({i: 0 for i in range(count)})
-    upper = min(MAX_CONTEXT_DEMOS, count)
-    lower = min(upper, max(2, (count + 1) // 2))
-    for visit in range(180):
+@pytest.mark.parametrize('count', [3, 4, 7, 11])
+def test_historical_schedule_balances_sizes_and_exhausts_subsets(count):
+    seen = {}; sizes = Counter()
+    import math
+    for visit in range(1000):
         subset = half_or_more_demonstrations(range(count), visit=visit, seed=41)
         k = len(subset); sizes[k] += 1
-        assert lower <= k <= upper
-        assert len(set(subset)) == k
-        totals.update(subset)
-        if totals:
-            assert max(totals.values()) - min(totals.values()) <= 1
+        assert max(2, (count+1)//2) <= k <= count
+        bucket = seen.setdefault(k, set())
+        if len(bucket) == math.comb(count, k): bucket.clear()
+        assert subset not in bucket
+        bucket.add(subset)
     assert max(sizes.values()) - min(sizes.values()) <= 1
-    assert set(sizes) == set(range(lower, upper + 1))
-
-
-@pytest.mark.parametrize('count', [1, 2, 3, 4, 6, 7, 8, 10, 13, 21])
-@pytest.mark.parametrize('schedule', ['all', 'half_or_more', 'two'])
-def test_training_balances_within_epoch_and_each_target_across_epochs(tmp_path, count, schedule):
-    pairs = [{'input': [[i % 10]], 'output': [[(i + 1) % 10]]} for i in range(count)]
-    path = tmp_path / 'tasks.json'
-    path.write_text(json.dumps({'puzzle': {'train': pairs}}))
-    ds = ARCExampleDataset(path, splits=('train',), seed=41, attention_pattern='pair_group',
-                           training_demo_schedule=schedule)
-    histories = {ex.pair_index: Counter({i: 0 for i in range(count) if i != ex.pair_index})
-                 for ex in ds.examples}
-    rng_state, torch_state = random.getstate(), torch.get_rng_state()
-    saved = []
-    for visit in range(80):
-        epoch = Counter({i: 0 for i in range(count)})
-        for ex in ds.examples:
-            visible = ds.demonstration_indices(ex, visit)
-            assert ex.pair_index not in visible
-            assert len(visible) == len(set(visible)) <= 6
-            if schedule == 'two':
-                assert len(visible) == min(2, count - 1)
-            epoch.update(visible)
-            history = histories[ex.pair_index]
-            history.update(visible)
-            if history:
-                assert max(history.values()) - min(history.values()) <= 1
-            saved.append((ex, visit, visible))
-        assert len(set(epoch.values())) == 1
-    for ex, visit, visible in reversed(saved):
-        assert ds.demonstration_indices(ex, visit) == visible
-    ds.seed += 1
-    if count > 7 or (schedule == 'half_or_more' and count > 3) or (schedule == 'two' and count > 3):
-        assert any(ds.demonstration_indices(ex, visit) != visible for ex, visit, visible in saved)
-    assert random.getstate() == rng_state
-    assert torch.equal(torch_state, torch.get_rng_state())
-
-
-@pytest.mark.parametrize('count', [0, 1, 2, 5, 6, 7, 8, 10, 21])
-@pytest.mark.parametrize('policy', ['all', 'leave_one_out', 'two'])
-def test_inference_caps_after_loo_and_balances_all_eighty_prompts(tmp_path, count, policy):
-    import evaluate
-    pairs = [{'input': [[i % 10]], 'output': [[(i + 1) % 10]]} for i in range(count)]
-    path = tmp_path / 'tasks.json'
-    path.write_text(json.dumps({'puzzle': {'train': pairs, 'test': [{'input': [[9]], 'output': [[8]]}]}}))
-    ds = ARCExampleDataset(path, seed=41, attention_pattern='pair_group',
-        inference_demo_policy=policy, augmentation_sampling_mode='context_palette')
-    ex = next(ds.iter_examples(split='test'))
-    attempts = evaluate._build_inference_attempts(ds, 'test', None, None, 80, True)
-    assert len(attempts) == 80
-    totals = Counter({i: 0 for i in range(count)})
-    for visit, attempt in enumerate(attempts):
-        visible = ds.demonstration_indices(ex, visit)
-        expected_count = min(2, count) if policy == 'two' else max(0, min(6, count - int(policy == 'leave_one_out')))
-        assert len(visible) == expected_count
-        totals.update(visible)
-        if totals:
-            assert max(totals.values()) - min(totals.values()) <= 1
-        expected, sep = encode_context([pairs[i] for i in visible], {'input': [[9]]},
-            attempt.dihedral_index, torch.tensor(attempt.color_mapping))
-        assert attempt.prompt == expected.tolist() and len(attempt.prompt) == sep + 1
-
-
-@pytest.mark.parametrize('count', [1, 2, 6])
-@pytest.mark.parametrize('is_eval', [False, True])
-def test_two_demo_mode_builds_training_and_both_evaluation_splits(tmp_path, monkeypatch, count, is_eval):
-    from types import SimpleNamespace
-    import build
-
-    pairs = [{'input': [[i]], 'output': [[i + 1]]} for i in range(count)]
-    path = tmp_path / 'tasks.json'
-    path.write_text(json.dumps({'puzzle': {'train': pairs, 'test': [TARGET]}}))
-    monkeypatch.setattr(build, 'resolve_device', lambda _: torch.device('cpu'))
-    args = SimpleNamespace(seed=42, device='cpu', checkpoint_path=None, data_path=path,
-        attention_pattern='pair_group', training_demo_schedule='two', inference_demo_policy='two',
-        batch_size=2, enable_aug=False, max_augments=1, d_model=24, n_heads=4,
-        d_ff=48, n_layers=1, num_task_embedding_latents=2, n_predict=1)
-    _, ds, _, _, _ = build.build_model_and_data(args, is_eval=is_eval,
-        eval_splits=('train', 'test'), build_dataloader=False)
-    for ex in ds.examples:
-        for visit in range(8):
-            visible = ds.demonstration_indices(ex, visit)
-            assert len(visible) == min(2, count - int(ex.split == 'train'))
-            if ex.split == 'train':
-                assert ex.pair_index not in visible
-
-
-def test_training_cap_reaches_built_model_dataset_without_target_leakage(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    import build
-
-    pairs = [{'input': [[i % 10]], 'output': [[(i + 1) % 10]]} for i in range(8)]
-    path = tmp_path / 'tasks.json'
-    path.write_text(json.dumps({'puzzle': {'train': pairs}}))
-    monkeypatch.setattr(build, 'resolve_device', lambda _: torch.device('cpu'))
-    args = SimpleNamespace(seed=42, device='cpu', checkpoint_path=None, data_path=path,
-        attention_pattern='pair_group', training_demo_schedule='half_or_more', max_training_demos=3,
-        batch_size=2, enable_aug=False, max_augments=1, d_model=24, n_heads=4,
-        d_ff=48, n_layers=1, num_task_embedding_latents=2, n_predict=1)
-    _, ds, _, _, _ = build.build_model_and_data(args, build_dataloader=False)
-    for visit in range(20):
-        counts = Counter({i: 0 for i in range(8)})
-        for ex in ds.examples:
-            shown = ds.demonstration_indices(ex, visit)
-            assert len(shown) == 3 and ex.pair_index not in shown
-            counts.update(shown)
-        assert len(set(counts.values())) == 1
 
 
 def test_simplex_geometry_and_physical_pair_balance_without_rng_use():
@@ -174,15 +64,14 @@ def test_simplex_geometry_and_physical_pair_balance_without_rng_use():
     with pytest.raises(ValueError): balanced_pair_vertices(range(12), visit=0, seed=42, vertices=11)
 
 
-def dataset(tmp_path, extra_demos=0, **options):
+def dataset(tmp_path, **options):
     path = tmp_path / 'tasks.json'
-    path.write_text(json.dumps({'puzzle': {'train': DEMOS + [TARGET] * (1 + extra_demos), 'test': [{'input': [[9]]}]}}))
+    path.write_text(json.dumps({'puzzle': {'train': DEMOS + [TARGET], 'test': [{'input': [[9]]}]}}))
     return ARCExampleDataset(path, seed=42, attention_pattern='pair_group', **options)
 
 
-@pytest.mark.parametrize('extra_demos', [0, 8])
-def test_pair_tokens_boundaries_target_neutral_and_worker_resume(tmp_path, extra_demos):
-    ds = dataset(tmp_path, extra_demos=extra_demos, pair_identity_vertices=11)
+def test_pair_tokens_boundaries_target_neutral_and_worker_resume(tmp_path):
+    ds = dataset(tmp_path, pair_identity_vertices=11)
     batch = [replace(ds.examples[0], augment_epoch_override=visit) for visit in [0, 1, 10, 11, 79]]
     direct = collate_examples(batch, ds)
     loader = torch.utils.data.DataLoader(batch, batch_size=5, num_workers=2,
@@ -264,17 +153,16 @@ def test_old_checkpoint_formats_preserve_attention_and_strict_weights():
         with pytest.raises(ValueError): _validate_checkpoint_format(checkpoint)
 
 
-@pytest.mark.parametrize('policy', ['leave_one_out', 'two'])
-def test_subset_prompts_unchanged_augments_and_no_test_answers(tmp_path, policy):
+def test_loo_prompts_unchanged_augments_and_no_test_answers(tmp_path):
     import evaluate
-    ds = dataset(tmp_path, inference_demo_policy=policy, augmentation_sampling_mode='single_grid_prefix')
+    ds = dataset(tmp_path, inference_demo_policy='leave_one_out', augmentation_sampling_mode='single_grid_prefix')
     ex = next(ds.iter_examples(split='test'))
     torch_state, random_state = torch.get_rng_state(), random.getstate()
     attempts = evaluate._build_inference_attempts(ds, 'test', None, None, 80, True)
     ds.inference_demo_policy = 'all'
     full = evaluate._build_inference_attempts(ds, 'test', None, None, 80, True)
     assert len(attempts) == len(full) <= 80  # unique-input augmentation may exhaust
-    ds.inference_demo_policy = policy
+    ds.inference_demo_policy = 'leave_one_out'
     for visit,(a,b) in enumerate(zip(attempts,full)):
         assert a.dihedral_index == b.dihedral_index and a.color_mapping == b.color_mapping
         visible = ds.demonstration_indices(ex, visit)
@@ -313,14 +201,11 @@ def test_simplex_cached_decode_and_future_output_isolation(monkeypatch,native):
 def test_named_checkpoint_plan_validation_and_paired_breakdown(tmp_path, monkeypatch):
     import launch_run
     from evaluation_comparison import compare_submissions
-    identity={'drive_id':'example','name':'pretrain__tiny.pt','size':100,'sha256':'a'*64}
-    spec=json.loads((Path(__file__).resolve().parents[1]/'specs/pretrain_eval.json').read_text())
-    spec.update(run_name='multi-eval',eval_only=True,enable_finetune=False,checkpoint=identity,
-        evaluation_checkpoints={'older':identity},evals={'a':{'checkpoint':'checkpoint'},'b':{'checkpoint':'input.older'}})
+    spec=json.loads((Path(__file__).resolve().parents[1]/'tests/fixtures/specs/pretrain_eval.json').read_text())
+    spec.update(run_name='multi-eval',eval_only=True,enable_finetune=False,checkpoint='saved.pt',
+        evals={'a':{'checkpoint':'checkpoint'}})
     plan=launch_run.build_plan(spec,tmp_path/'spec.json')
-    assert launch_run.resolve_checkpoint_ref('input.older',plan)==plan['run_dir']/'inputs/older.pt'
-    for name in ['../escape','pretrain','a.b']:
-        with pytest.raises(ValueError):launch_run.resolve_evaluation_checkpoints(dict(spec,evaluation_checkpoints={name:identity}),tmp_path)
+    assert launch_run.resolve_checkpoint_ref('checkpoint',plan)==Path('saved.pt')
     with pytest.raises(ValueError):launch_run.resolve_checkpoint_ref('input.absent',plan)
     challenge={'x':{'train':[{'output':[[1]]}]*3},'y':{'train':[{'output':[[1]]}]*5}}
     solutions={'x':[[[1]],[[2]]],'y':[[[3]]]}

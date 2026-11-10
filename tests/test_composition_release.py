@@ -77,7 +77,6 @@ def test_resample_exact_members_and_counts_survive_package(corpus, monkeypatch):
     assert observed == {3, 7}
 
 
-
 def test_heldout_ancestry_still_excludes_resampled_family(corpus):
     c = corpus; job, family = composition(c, 'selected', ['b', 'b'])
     _, base = release(c, family, job)
@@ -140,23 +139,6 @@ def test_authorized_single_seed_omission_is_explicit_and_preserves_family(corpus
     assert cat['families'][family]['ancestors']==['arc2_eval/b']
 
 
-def test_preparation_pins_fresh_run_identity_without_changing_recipe(corpus,monkeypatch):
-    import sys
-    from scripts import prepare_family_data as prepare
-    c=corpus;recipe=c.root/'recipe.json'
-    save(recipe,{'run_name':'old-identity','dataset':c.raw})
-    before=recipe.read_bytes();output=c.root/'specs/temp specs/new.json'
-    monkeypatch.setattr(prepare,'ROOT',c.root)
-    monkeypatch.setattr(sys,'argv',['prepare_family_data','--spec',str(recipe),'--synth-root',str(c.synth),
-        '--audit-dir',str(c.root/'results/audit'),'--package',str(c.root/'assets_tmp/new.zip'),
-        '--output-spec',str(output),'--run-name','fresh-counts-identity'])
-    prepare.main()
-    result=json.loads(output.read_bytes())
-    assert result['run_name']=='fresh-counts-identity'
-    assert result['dataset']['pretrain_data']['catalog']['sha256']==fd.file_sha(c.root/'assets_tmp/new.zip')
-    assert recipe.read_bytes()==before
-
-
 def test_two_omissions_require_explicit_family_exception(corpus):
     c=corpus;job,family=composition(c,'selected',['b','b'])
     identity,base=release(c,family,job,[[0,2,1],[1,4,3],[2,3,1]])
@@ -183,31 +165,3 @@ def test_two_omissions_require_explicit_family_exception(corpus):
     assert cat['summary']['ready'] and cat['families'][family]['sampling_omissions']==items
 
 
-def test_preparation_audits_complete_recovery_cache_once(corpus,monkeypatch):
-    import sys
-    from scripts import prepare_family_data as prepare
-    from dataset_building_scripts import family_recovery
-    c=corpus;recipe=c.root/'recipe.json'
-    save(recipe,{'run_name':'fixture','dataset':c.raw})
-    # A missing source file is available only through its exact cached bytes.
-    cached=family_recovery.RecoveryCache(c.root/'results/recovery')
-    missing=c.synth/'results/task-variations/arc2/training/a/samples/seed-0.json'
-    raw=missing.read_bytes();assert cached.save(raw,fd.sha(raw));missing.unlink()
-    calls=[];real_discover=prepare.discover
-    def checked(*args,**kwargs):
-        assert isinstance(kwargs['recovery'],family_recovery.RecoveryCache)
-        calls.append(True)
-        return real_discover(*args,**kwargs)
-    def unnecessary(*args,**kwargs):
-        pytest.fail('A complete cache must not trigger recovery or a second audit')
-    monkeypatch.setattr(prepare,'ROOT',c.root)
-    monkeypatch.setattr(prepare,'discover',checked)
-    monkeypatch.setattr(family_recovery,'recover_catalog',unnecessary)
-    monkeypatch.setattr(sys,'argv',['prepare_family_data','--spec',str(recipe),'--synth-root',str(c.synth),
-        '--audit-dir',str(c.root/'results/audit'),'--recovery-cache',str(c.root/'results/recovery'),
-        '--package',str(c.root/'assets_tmp/once.zip'),'--output-spec',str(c.root/'specs/temp specs/once.json')])
-    prepare.main()
-    assert calls==[True]
-    with zipfile.ZipFile(c.root/'assets_tmp/once.zip') as z:
-        cat=json.loads(z.read('family_catalog.json'))
-    assert cat['summary']['ready'] and cat['summary']['instances_per_epoch']==2

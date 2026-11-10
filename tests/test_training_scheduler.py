@@ -113,26 +113,6 @@ def test_scheduler_resume_restores_group_lrs_and_continues_progress() -> None:
     assert resumed.last_epoch == 1.75
 
 
-def test_resumed_wsd_can_cool_existing_optimizer_groups_after_stable_phase():
-    parameters = [nn.Parameter(torch.tensor(1.0)) for _ in range(2)]
-    optimizer = torch.optim.SGD([
-        {"params": [parameters[0]], "lr": 0.004},
-        {"params": [parameters[1]], "lr": 0.00072},
-    ])
-    original_args = Namespace(epochs=330, warmup_pct=0.005,
-                              wsd_decay_start_pct=0.8, lr_floor=0.0001)
-    original = _FractionalLambdaLR(optimizer, train._base_lr_schedule(original_args, optimizer))
-    original.step(30)
-    saved = original.state_dict()
-    continuation_args = Namespace(epochs=38, warmup_pct=0.005,
-                                  wsd_decay_start_pct=30 / 38, lr_floor=0.0001)
-    resumed = _FractionalLambdaLR(optimizer, train._base_lr_schedule(continuation_args, optimizer))
-    resumed.load_state_dict(saved)
-    assert resumed.get_last_lr() == pytest.approx([0.004, 0.00072])
-    resumed.step(34)
-    assert resumed.get_last_lr() == pytest.approx([0.0020002, 0.000360036])
-    resumed.step(38)
-    assert resumed.get_last_lr() == pytest.approx([0.0000004, 0.000000072])
 def test_runs_overwrite_a_rolling_checkpoint_and_keep_every_fiftieth_epoch(monkeypatch, tmp_path):
     model = _ScalarLossModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
@@ -211,8 +191,7 @@ def test_checkpoint_cadences_must_be_non_negative_integers(key, value):
 
 
 @pytest.mark.parametrize("completed,total_epochs", [(67, 84), (67, 672), (12, 15), (8, 41)])
-@pytest.mark.parametrize("resume_lr", [1.0, 0.61])
-def test_resume_keeps_optimizer_state_and_uses_checkpoint_epoch_and_selected_total(monkeypatch, completed, total_epochs, resume_lr):
+def test_resume_keeps_optimizer_state_and_uses_checkpoint_epoch_and_selected_total(monkeypatch, completed, total_epochs):
     model = _ScalarLossModel()
     original = torch.optim.SGD(model.parameters(), lr=1.0, momentum=0.9)
     model.weight.grad = torch.tensor(1.0)
@@ -226,7 +205,7 @@ def test_resume_keeps_optimizer_state_and_uses_checkpoint_epoch_and_selected_tot
         "optimizer_state": original.state_dict(),
         "scheduler_state": scheduler.state_dict(),
     }
-    restored = torch.optim.SGD(model.parameters(), lr=resume_lr, momentum=0.9)
+    restored = torch.optim.SGD(model.parameters(), lr=1.0, momentum=0.9)
     monkeypatch.setattr(train, "_build_optimizer", lambda *args: restored)
     updates = []
 
@@ -258,8 +237,8 @@ def test_resume_keeps_optimizer_state_and_uses_checkpoint_epoch_and_selected_tot
     assert updates[-1][0] == total_epochs
     decay_start = total_epochs * 0.8
     first_factor = 1.0 if completed + 1 < decay_start else 0.0001 + 0.9999 * (total_epochs - completed - 1) / (total_epochs - decay_start)
-    assert updates[0][1] == pytest.approx(resume_lr * first_factor)
-    assert updates[-1][1] == pytest.approx(resume_lr * 0.0001)
+    assert updates[0][1] == pytest.approx(first_factor)
+    assert updates[-1][1] == pytest.approx(0.0001)
     assert saved[-1]["global_step"] == total_epochs
     assert saved[-1]["epoch"] == total_epochs
 
@@ -285,10 +264,30 @@ def test_optimizer_resume_compares_base_lr_and_still_rejects_changed_hparams():
     assert not train._optimizer_hparams_changed(fresh, saved)
     changed_lr = torch.optim.SGD([parameter], lr=3.0, momentum=0.9)
     assert train._optimizer_hparams_changed(changed_lr, saved)
-    assert not train._optimizer_hparams_changed(changed_lr, saved, allow_lr_change=True)
     changed_momentum = torch.optim.SGD([parameter], lr=2.0, momentum=0.8)
     assert train._optimizer_hparams_changed(changed_momentum, saved)
-    assert train._optimizer_hparams_changed(changed_momentum, saved, allow_lr_change=True)
+
+
+def test_resumed_wsd_can_cool_existing_optimizer_groups_after_stable_phase():
+    parameters = [nn.Parameter(torch.tensor(1.0)) for _ in range(2)]
+    optimizer = torch.optim.SGD([
+        {"params": [parameters[0]], "lr": 0.004},
+        {"params": [parameters[1]], "lr": 0.00072},
+    ])
+    original_args = Namespace(epochs=330, warmup_pct=0.005,
+                              wsd_decay_start_pct=0.8, lr_floor=0.0001)
+    original = _FractionalLambdaLR(optimizer, train._base_lr_schedule(original_args, optimizer))
+    original.step(30)
+    saved = original.state_dict()
+    continuation_args = Namespace(epochs=38, warmup_pct=0.005,
+                                  wsd_decay_start_pct=30 / 38, lr_floor=0.0001)
+    resumed = _FractionalLambdaLR(optimizer, train._base_lr_schedule(continuation_args, optimizer))
+    resumed.load_state_dict(saved)
+    assert resumed.get_last_lr() == pytest.approx([0.004, 0.00072])
+    resumed.step(34)
+    assert resumed.get_last_lr() == pytest.approx([0.0020002, 0.000360036])
+    resumed.step(38)
+    assert resumed.get_last_lr() == pytest.approx([0.0000004, 0.000000072])
 
 
 def test_family_epoch_keeps_last_incomplete_accumulation_window():

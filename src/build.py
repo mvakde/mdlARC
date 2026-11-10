@@ -6,6 +6,8 @@ Contains: build_model_and_data, checkpoint loading, and related utilities.
 import argparse
 import hashlib
 import json
+import os
+import random
 from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
@@ -37,6 +39,28 @@ from variations import VariationTrainingDataset, create_variation_dataloader
 from research_options import RESEARCH_DEFAULTS, research_parameter_shapes
 
 
+def checkpoint_trained_capped_demos(checkpoint: Optional[Dict[str, Any]]) -> bool:
+    """Whether a checkpoint was trained on balanced capped demo contexts.
+
+    Recorded by maybe_save_model ("demo_selection"); family-sampled checkpoints
+    (the loop-composition-v3 recipe) always used them.
+    """
+    if not checkpoint:
+        return False
+    if (checkpoint.get("demo_selection") or {}).get("training") == "balanced_capped":
+        return True
+    return ((checkpoint.get("task_variations") or {}).get("sampling") or {}).get("unit") == "family"
+
+
+def _resolve_inference_max_demos(args: argparse.Namespace, checkpoint: Optional[Dict[str, Any]]) -> Optional[int]:
+    """Decode-context demo cap: explicit, else 6 for capped-context checkpoints, else uncapped (None)."""
+    cap = getattr(args, "inference_max_demos", None)
+    if cap is not None:
+        return int(cap)
+    from demo_schedule import MAX_CONTEXT_DEMOS
+    return MAX_CONTEXT_DEMOS if checkpoint_trained_capped_demos(checkpoint) else None
+
+
 # =============================================================================
 # Checkpoint Loading
 # =============================================================================
@@ -48,13 +72,6 @@ def _validate_checkpoint_format(checkpoint: Dict[str, Any]) -> None:
     # original combined attention. Never reinterpret them as two lookup.
     legacy = {"all_demo_pair_group_target_roles_v2", "half_or_more_pair_group_target_roles_v1"}
     actual = checkpoint.get("sequence_format")
-    from common import GRID_CHAIN_SEQUENCE_FORMAT, SUPERVISED_GRID_CHAIN_SEQUENCE_FORMAT
-    if checkpoint.get("config", {}).get("predict_intermediate_grids", False):
-        if actual != SUPERVISED_GRID_CHAIN_SEQUENCE_FORMAT or pattern != "pair_group":
-            raise ValueError("Supervised target grids require their own checkpoint sequence format")
-        return
-    if actual == GRID_CHAIN_SEQUENCE_FORMAT and pattern == "pair_group":
-        return
     if actual in legacy and pattern == "pair_group":
         if checkpoint["config"].get("split_target_demo_attention", False):
             raise ValueError("Legacy group format cannot use two-lookup attention")
@@ -116,10 +133,15 @@ def build_checkpoint_config(checkpoint: Dict[str, Any]) -> TinyTransformerConfig
     if version not in (None, 2):
         raise ValueError(f"Unsupported checkpoint architecture_version: {version!r}.")
     retired_settings = {
+        "residual_init": "xavier",
         "qk_norm": "none",
+        "branch_norm": "none",
         "rope_axes": "3d",
         "grid_role_embeddings": False,
         "grid_boundary_positions": "row_end",
+        # Intermediate-grid chains (loop-composition-v3 only) are not part of this model.
+        "ordered_grid_positions": False,
+        "predict_intermediate_grids": False,
     }
     for key, expected in retired_settings.items():
         if config_data.get(key, expected) != expected:
@@ -183,21 +205,36 @@ def should_reset_training_state(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "reset_training_state", False))
 
 
+def _configure_eval_loop_iterations(config: TinyTransformerConfig, iterations: Optional[int]) -> TinyTransformerConfig:
+    """Decode a looped checkpoint at another iteration count (evaluation only; paper row A7).
+
+    Deep supervision trains every iteration's exit through the shared coda, so a
+    checkpoint whose loop parameters do not depend on K can be read out at any K >= 2.
+    Unset (None) or the trained K leaves the checkpoint's configuration unchanged.
+    """
+    if iterations is None or iterations == config.loop_iterations:
+        return config
+    if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 2 or config.loop_iterations < 2:
+        raise ValueError("eval_loop_iterations needs a looped checkpoint and an integer >= 2.")
+    # Exits only shape the training loss; decoding reads the final iteration.
+    updated = replace(config, loop_iterations=iterations, loop_exit_iterations=None)
+    if research_parameter_shapes(updated) != research_parameter_shapes(config):
+        raise ValueError("eval_loop_iterations: this checkpoint has loop parameters that depend on the "
+                         "iteration count (streams, dense mixing, iteration embeddings, gates or norms).")
+    print(f"Evaluating the loop at {iterations} iterations (trained with {config.loop_iterations}).")
+    return updated
+
+
 def _configure_checkpoint_mtp(
     config: TinyTransformerConfig,
     args: argparse.Namespace,
     *,
     is_eval: bool,
 ) -> TinyTransformerConfig:
-    for key in ("residual_init", "branch_norm"):
-        value = getattr(args, key, None)
-        if value is not None and value != getattr(config, key):
-            raise ValueError(f"Checkpoint {key}={getattr(config, key)!r} must be preserved; "
-                             "these options configure fresh models only.")
     # Evaluation always uses the saved architecture. Unspecified training
     # options also inherit it, so old resume specs remain single-head runs.
     if is_eval or getattr(args, "eval_only", False):
-        return config
+        return _configure_eval_loop_iterations(config, getattr(args, "eval_loop_iterations", None))
     overrides = {
         key: getattr(args, key)
         for key in ("n_predict", "mtp_weight", "task_embeddings", "dihedral_embeddings", "input_shortcuts", "rope_spatial_base", "attention_pattern", *RESEARCH_DEFAULTS)
@@ -463,20 +500,17 @@ def build_model_and_data(
         else:
             splits = ("train",)
         training_demo_schedule = getattr(args, "training_demo_schedule", "all")
-        predict_intermediates = config.predict_intermediate_grids if config else bool(getattr(args, "predict_intermediate_grids", False))
-        requested = getattr(args, "predict_intermediate_grids", None)
-        if config is not None and requested is not None and requested != config.predict_intermediate_grids:
-            raise ValueError("Cannot change target grid-chain semantics while loading a checkpoint")
         inference_demo_policy = getattr(args, "inference_demo_policy", "all") if is_eval else "all"
-        inference_max_demos = int(getattr(args, "inference_max_demos", 6) or 6) if is_eval else 6
+        max_training_demos = getattr(args, "max_training_demos", None)
+        inference_max_demos = (_resolve_inference_max_demos(args, checkpoint) if is_eval else None)
         if is_eval:
             # Train-split evaluation still excludes its target, but the two-demo
             # inference policy applies to both train and test prompts.
             training_demo_schedule = "two" if inference_demo_policy == "two" else "all"
+            if training_demo_schedule != "two":
+                max_training_demos = None
         variation_index_path = getattr(args, "variation_index_path", None)
         if not is_eval and variation_index_path is not None:
-            if predict_intermediates:
-                raise ValueError("Supervised grid chains currently require the prepared originals dataset")
             dataset = VariationTrainingDataset(
                 json_path=data_path,
                 index_path=Path(variation_index_path),
@@ -485,7 +519,7 @@ def build_model_and_data(
                 augmentation_sampling_mode=mode,
                 attention_pattern=attention_pattern,
                 training_demo_schedule=training_demo_schedule,
-                max_training_demos=getattr(args, "max_training_demos", 6),
+                max_training_demos=max_training_demos,
                 pair_identity_vertices=config.pair_identity_vertices if config else getattr(args, "pair_identity_vertices", 0),
             )
             if checkpoint is not None:
@@ -519,12 +553,17 @@ def build_model_and_data(
                 index_present_tasks_only=is_eval,
                 selected_task_ids=eval_task_ids if is_eval else None,
                 training_demo_schedule=training_demo_schedule,
-                max_training_demos=getattr(args, "max_training_demos", 6),
                 inference_demo_policy=inference_demo_policy,
+                max_training_demos=max_training_demos,
                 inference_max_demos=inference_max_demos,
-                predict_intermediate_grids=predict_intermediates,
                 pair_identity_vertices=config.pair_identity_vertices if config else getattr(args, "pair_identity_vertices", 0),
+                scale_augmentation=not is_eval and bool(getattr(args, "scale_augmentation", False)),
+                scale_max_specs=int(getattr(args, "scale_max_specs", 12)),
+                scale_anisotropic=bool(getattr(args, "scale_anisotropic", True)),
+                rearc_max_demos=int(getattr(args, "rearc_max_demos", 4)),
             )
+            # Decode-time scale views (evaluate._build_inference_attempts); off by default.
+            dataset.inference_scale_views = is_eval and bool(getattr(args, "inference_scale_views", False))
 
     manifest_path = getattr(args, "dataset_manifest_path", None)
     if not is_eval and manifest_path is not None:
@@ -541,7 +580,28 @@ def build_model_and_data(
 
     use_aug = bool(getattr(args, "enable_aug", False))
     augmentor = None
+    if not is_eval and getattr(dataset, "scale_augmentation", False):
+        # On by default: it needs the augmented regular-task stream, and only ever scales regular
+        # ARC sequences (ReARC/NVARC examples are never scaled; see training_scale_factor).
+        if not use_aug or getattr(dataset, "has_variation_sampling", False):
+            dataset.scale_augmentation = False
+            print("Scale augmentation off: it needs enable_aug and is not defined for variation sampling.")
+        elif (checkpoint is not None and get_checkpoint_mode(args) == "resume"
+              and "scale_augmentation" not in checkpoint and not getattr(args, "scale_augmentation_explicit", True)):
+            dataset.scale_augmentation = False
+            print("Scale augmentation off: resuming a checkpoint trained without it "
+                  "(set scale_augmentation in the spec to change the recipe).")
+        else:
+            mixed = (getattr(dataset, "has_rearc_train_sampling", False)
+                     or getattr(dataset, "has_nvarc_train_sampling", False))
+            print(f"Scale augmentation: up to {dataset.scale_max_specs} block-upscale specs per sequence "
+                  f"(identity included), anisotropic={dataset.scale_anisotropic}"
+                  f"{'; regular ARC tasks only (ReARC/NVARC unscaled)' if mixed else ''}.")
 
+    if (not is_eval and mode == "context_palette" and getattr(dataset, "has_variation_sampling", False)
+            and dataset.variation_index.get("sampling", {}).get("unit") != "family"):
+        raise ValueError("context_palette supports regular ARC, ReARC and family-sampled tasks only")
+    # Variation datasets build their own augmentor in create_variation_dataloader.
     if (not is_eval and use_aug and mode == "context_palette"
             and not getattr(dataset, "has_variation_sampling", False)):
         from context_palette import ContextPaletteAugmentor
@@ -590,6 +650,7 @@ def build_model_and_data(
             getattr(args, "num_workers", None),
             max_workers=4 if is_eval else max(1, 8 // distributed.world_size()),
         )
+        # DDP: each rank takes its shard of one deterministic global batch.
         global_batch_size = args.batch_size * (1 if is_eval else distributed.world_size())
         if getattr(dataset, "has_variation_sampling", False):
             dataloader = create_variation_dataloader(
@@ -646,8 +707,6 @@ def build_model_and_data(
         config = TinyTransformerConfig(
             attention_pattern=attention_pattern,
             split_target_demo_attention=attention_pattern == "pair_group",
-            ordered_grid_positions=getattr(dataset, "has_intermediate_grids", False),
-            predict_intermediate_grids=getattr(dataset, "predict_intermediate_grids", False),
             pair_identity_vertices=getattr(args, "pair_identity_vertices", 0),
             pair_identity_strength=getattr(args, "pair_identity_strength", 0.25),
             max_seq_len=dataset.max_seq_len,
@@ -665,8 +724,6 @@ def build_model_and_data(
             FA=flash_attention_version,
             n_predict=4 if getattr(args, "n_predict", None) is None else args.n_predict,
             mtp_weight=0.3 if getattr(args, "mtp_weight", None) is None else args.mtp_weight,
-            residual_init="xavier" if getattr(args, "residual_init", None) is None else args.residual_init,
-            branch_norm="none" if getattr(args, "branch_norm", None) is None else args.branch_norm,
             input_shortcuts=getattr(args, "input_shortcuts", None) or "learned",
             rope_spatial_base=1000.0 if getattr(args, "rope_spatial_base", None) is None else args.rope_spatial_base,
             **{key: default if getattr(args, key, None) is None else getattr(args, key)
@@ -679,8 +736,6 @@ def build_model_and_data(
             # more demonstrations than the tasks used to train the checkpoint.
             config.max_seq_len = max(config.max_seq_len, dataset.max_seq_len)
 
-    dataset.prepare_target_demo_layout = config.split_target_demo_attention
-
     if dataset.num_examples != config.num_examples:
         if extend_checkpoint_task_ids and dataset.num_examples > config.num_examples:
             config.num_examples = dataset.num_examples
@@ -691,6 +746,7 @@ def build_model_and_data(
                 f"currently exposes {dataset.num_examples}. Please ensure the dataset/task whitelist matches."
             )
     model = TinyTransformer(config).to(device)
+    model.stable_cross_entropy = bool(getattr(args, "stable_cross_entropy", False))
     if config.loop_iterations > 1:
         print(f"Depth loop: layers [{config.loop_start_layer}, {config.loop_end_layer}) "
               f"x {config.loop_iterations}; {config.n_layers} physical blocks, "
@@ -716,12 +772,24 @@ def build_model_and_data(
         )
         if not should_reset_training_state(args):
             states = checkpoint.get("rng_state_by_rank") if not is_eval else None
-            if states is not None and len(states) != distributed.world_size():
+            # Opt-in: resume across a different DDP world size (the d1024 e270 -> e440 continuation).
+            reseed_ranks = (states is not None and len(states) != distributed.world_size()
+                            and os.environ.get("MDLARC_RESUME_RESEED_RANKS") == "1")
+            if states is not None and len(states) != distributed.world_size() and not reseed_ranks:
                 raise ValueError("Resume must preserve the checkpoint's DDP world size; "
-                                 "use checkpoint_mode='finetune' to change it")
-            rng_state = states[distributed.rank()] if states is not None else checkpoint.get("rng_state")
-            if isinstance(rng_state, dict):
-                restore_rng_state(rng_state, device)
+                                 "use checkpoint_mode='finetune' to change it "
+                                 "(or MDLARC_RESUME_RESEED_RANKS=1 to re-derive per-rank RNG streams)")
+            if reseed_ranks:
+                # Model, optimizer, scheduler and epoch resume exactly; only per-rank RNG streams are re-derived.
+                import numpy as np
+                seed = 1_000_003 * (int(checkpoint.get("epoch", 0)) + 1) + distributed.rank()
+                random.seed(seed); np.random.seed(seed % 2**32); torch.manual_seed(seed)
+                print(f"Resume across DDP world size {len(states)} -> {distributed.world_size()}: "
+                      f"rank {distributed.rank()} RNG reseeded ({seed}).", flush=True)
+            else:
+                rng_state = states[distributed.rank()] if states is not None else checkpoint.get("rng_state")
+                if isinstance(rng_state, dict):
+                    restore_rng_state(rng_state, device)
 
     # Stash checkpoint for downstream consumers (e.g., so train_model can restore the optimizer).
     model._loaded_checkpoint = checkpoint

@@ -19,7 +19,8 @@ from test_mtp import _batch, _set_path
 
 TREATMENTS = [dict(rope_spatial_base=base) for base in (100.0, 1000.0, 10000.0)]
 REMOVED_SETTINGS = dict(rope_axes="3d", rope_role_base=1000.0, grid_role_embeddings=False,
-                        grid_boundary_positions="row_end", qk_norm="none")
+                        grid_boundary_positions="row_end", qk_norm="none", branch_norm="none",
+                        residual_init="xavier")
 
 
 def _model(**options):
@@ -173,7 +174,7 @@ def test_removed_settings_are_no_longer_configurable(key, value):
 @pytest.mark.parametrize("key,value", [
     ("rope_axes", "2d"), ("rope_role_base", 10000.), ("grid_role_embeddings", True),
     ("grid_boundary_positions", "row_start"), ("qk_norm", "rms"),
-    ("branch_norm", "rms"), ("residual_init", "zero"),
+    ("branch_norm", "hidden_rms"), ("residual_init", "depth_scaled"),
 ])
 def test_incompatible_ablation_checkpoints_are_rejected(key, value):
     config = {**asdict(_model().config), **REMOVED_SETTINGS, key: value}
@@ -208,3 +209,22 @@ def test_fresh_run_defaults_keep_r1_architecture_and_objective():
     assert (summary["rope_spatial_base"], summary["n_predict"], summary["mtp_weight"]) == (1000., 4, .3)
     assert not REMOVED_SETTINGS.keys() & defaults.keys()
     assert not REMOVED_SETTINGS.keys() & summary.keys()
+
+
+def test_shared_rope_tables_match_per_call_gathers_in_any_layout():
+    """Packed training gathers cos/sin once and rotates [T, H, D] tensors with [T, 1, D] tables."""
+    rope = RotaryEmbedding3D(64)
+    torch.manual_seed(0)
+    positions = torch.stack((torch.randint(0, 32, (2, 9)), torch.randint(0, 32, (2, 9)),
+                             torch.randint(0, 7, (2, 9))), dim=-1)
+    q, k = torch.randn(2, 4, 9, 64), torch.randn(2, 4, 9, 64)
+    expected_q, expected_k = rope.apply_rotary(q, k, positions)
+    cos, sin = rope.tables(positions.reshape(-1, 3))
+    assert cos.shape == (18, 64) and sin.shape == (18, 64)
+    tables = (cos.unsqueeze(1), sin.unsqueeze(1))
+    packed_q, packed_k = rope.apply_rotary(q.transpose(1, 2).reshape(18, 4, 64),
+                                           k.transpose(1, 2).reshape(18, 4, 64), tables=tables)
+    torch.testing.assert_close(packed_q, expected_q.transpose(1, 2).reshape(18, 4, 64), rtol=0, atol=0)
+    torch.testing.assert_close(packed_k, expected_k.transpose(1, 2).reshape(18, 4, 64), rtol=0, atol=0)
+    with pytest.raises(ValueError, match="pos_xyz"):
+        rope.apply_rotary(q, k)

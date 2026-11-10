@@ -11,7 +11,18 @@ def schedule_seed(seed, *identity):
 
 
 def leave_one_out(eligible, *, visit, seed):
-    """Match a training target's context, with at most six complete demos."""
+    """Omit one complete demo per attempt, including the sole-demo case."""
+    eligible = tuple(eligible)
+    if not eligible:
+        return ()
+    cycle, slot = divmod(int(visit), len(eligible))
+    order = list(eligible)
+    random.Random(schedule_seed(seed, 'omission', cycle)).shuffle(order)
+    return tuple(i for i in eligible if i != order[slot])
+
+
+def balanced_leave_one_out(eligible, *, visit, seed):
+    """Match a training target's context, with at most six complete demos (capped schedule)."""
     eligible = tuple(eligible)
     return balanced_demonstrations(eligible, count=len(eligible) - 1, visit=visit, seed=seed)
 

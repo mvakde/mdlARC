@@ -40,11 +40,14 @@ def test_latent_bf16_generation_matches_greedy(eager, horizon, budget, split, mo
     model = latent_model(horizon, split_target_demo_attention=split,
                          attention_pattern="pair_group" if split else "dense").to(torch.bfloat16)
     monkeypatch.setattr(model, "predict_mtp", lambda *a: pytest.fail("NextLat used MTP"))
+    drafts = []
+    propose = model.predict_next_latent
+    monkeypatch.setattr(model, "predict_next_latent", lambda *a: drafts.append(1) or propose(*a))
     kwargs = dict(model=model, prompts=PROMPTS, example_ids=[0, 1],
                   device=torch.device("cpu"), max_new_tokens=budget)
     assert evaluate.batched_greedy_generate(**kwargs, speculative=True) == evaluate.batched_greedy_generate(**kwargs)
     if budget > 1:
-        assert hasattr(model, "_compiled_next_latent")
+        assert drafts  # both the split-cache and the full-cache routes draft with NextLat
 
 
 class ScriptedLatentModel(ScriptedModel):
@@ -55,10 +58,9 @@ class ScriptedLatentModel(ScriptedModel):
 
     def predict_next_latent(self, hidden_states, pending):
         offsets = hidden_states[:, 0].long().clamp(max=7)
-        identities = hidden_states[:, 1].long()  # Rows are compacted as they finish.
         # Finished rows may contain EOS; every active row's pending token must
         # align with the verified transformer state rather than a draft state.
-        expected = self.answers[identities].gather(1, offsets[:, None]).squeeze(1)
+        expected = self.answers.gather(1, offsets[:, None]).squeeze(1)
         assert torch.all((pending == expected) | (pending == END_PAIR_TOKEN_ID))
         return super().predict_mtp(hidden_states)
 
@@ -76,13 +78,13 @@ def test_latent_heterogeneous_acceptance_eos_and_positions(eager, errors):
     assert actual == evaluate.batched_greedy_generate(**kwargs)
     if errors == (None, None):
         assert len(calls) == 2
-    for slots, positions, _, identities in calls:
-        for row, identity in enumerate(identities.tolist()):
+    for slots, positions, _ in calls:
+        for row in range(2):
             offset = int(slots[row, 0]) - model.prompt_len
-            if offset >= len(actual[identity]) - len(PROMPTS[identity]):
+            if offset >= len(actual[row]) - len(PROMPTS[row]):
                 continue
-            expected = compute_positions_3d(torch.tensor(actual[identity])[None])[0]
-            assert torch.equal(positions[row, 0], expected[len(PROMPTS[identity]) + offset])
+            expected = compute_positions_3d(torch.tensor(actual[row])[None])[0]
+            assert torch.equal(positions[row, 0], expected[len(PROMPTS[row]) + offset])
 
 
 def test_latent_cache_capacity_tail_and_greedy_only(eager):

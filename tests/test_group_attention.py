@@ -259,15 +259,11 @@ def test_all_demos_training_evaluation_and_checkpoint_roundtrip(tmp_path, monkey
             build._validate_checkpoint_format(dict(checkpoint, sequence_format=old_format))
 
 
-def test_large_context_has_wide_separator_and_distinct_target_roles(tmp_path, monkeypatch):
+def test_large_context_has_wide_separator_and_distinct_target_roles(tmp_path):
     pair = {"input": [[1] * 30 for _ in range(30)], "output": [[2] * 30 for _ in range(30)]}
     path = tmp_path / "large.json"
     path.write_text(json.dumps({"task": {"train": [pair] * 20, "test": [pair]}}))
-    # Normal sampling caps contexts at six demos. Deliberately supply a larger
-    # synthetic context to test the serializer's int32 separator boundary.
-    dataset = ARCExampleDataset(path, splits=("test",), attention_pattern="pair_group",
-                                max_seq_len=1 + 21 * 1860)
-    monkeypatch.setattr(dataset, "demonstration_indices", lambda example, visit: tuple(range(20)))
+    dataset = ARCExampleDataset(path, splits=("test",), attention_pattern="pair_group", max_seq_len=None)
     batch = collate_examples([dataset.examples[0]], dataset)
     assert batch["sep_indices"].item() > 32767
     assert batch["max_seqlen"] == 1 + 21 * 1860
@@ -300,7 +296,7 @@ def test_variation_context_uses_its_own_full_pool_and_capacity(tmp_path, monkeyp
 
 
 def test_reusable_group_spec_selects_fresh_group_training():
-    path = ROOT / "specs/group_attention_pretrain_eval.json"
+    path = ROOT / "tests/fixtures/specs/group_attention_pretrain_eval.json"
     plan = launch_run.build_plan(launch_run.load_spec(path), path)
     assert plan["pretrain"]["attention_pattern"] == "pair_group"
     assert plan["pretrain"].get("checkpoint_path") is None
@@ -426,3 +422,180 @@ def test_invalid_attention_pattern_is_rejected(value):
         TinyTransformerConfig(attention_pattern=value)
     with pytest.raises(ValueError, match="attention_pattern"):
         launch_run.training_overrides({"attention_pattern": value}, "defaults")
+
+
+@pytest.mark.parametrize("pattern", ["dense", "pair_group"])
+def test_collated_layout_matches_the_device_build_and_is_adopted(tmp_path, monkeypatch, pattern):
+    """The collate builds the attention layout on the CPU; the model adopts it without rebuilding."""
+    import tinytransformer as model_module
+    import train
+    from target_demo_attention import packed_prefix_lm_layout_fields
+
+    path = tmp_path / "tasks.json"
+    path.write_text(json.dumps({"a": {"train": [DEMOS[0], DEMOS[1], TARGET], "test": []},
+                                "b": {"train": [DEMOS[2], TARGET], "test": []}}))
+    dataset = ARCExampleDataset(path, splits=("train",), attention_pattern=pattern)
+    batch = collate_examples([dataset[index] for index in range(len(dataset))], dataset)
+    layout = batch["prefix_layout"]
+    assert layout["attention_pattern"] == pattern
+    assert (layout.get("split_target_demo_layout") is not None) == (pattern == "pair_group")
+    rebuilt = packed_prefix_lm_layout_fields(
+        batch["cu_seqlens"], int(batch["input_ids"].numel()), batch["sep_indices"].clamp(min=0) + 1,
+        batch["input_ids"], attention_pattern=pattern, split_target_demo=pattern == "pair_group")
+    for name, value in rebuilt.items():
+        if torch.is_tensor(value):
+            assert torch.equal(layout[name], value), name
+        elif not isinstance(value, dict):
+            assert layout[name] == value, name
+    # Nested layout tensors travel with the batch through the device mover.
+    moved = train._move_batch_to_device(batch, torch.device("cpu"))
+    assert torch.equal(moved["prefix_layout"]["prefix_token_indices"], layout["prefix_token_indices"])
+    if pattern == "pair_group":
+        assert moved["prefix_layout"]["split_target_demo_layout"]["hub"]["mq"] == layout["split_target_demo_layout"]["hub"]["mq"]
+
+    inputs = dict(input_ids=batch["input_ids"], example_ids=batch["example_ids"], sep_indices=batch["sep_indices"],
+                  positions_3d=batch["positions_3d"], cu_seqlens=batch["cu_seqlens"], max_seqlen=batch["max_seqlen"],
+                  dihedral_ids=batch["dihedral_ids"])
+    variants = [False, True] if pattern == "pair_group" else [False]
+    for split in variants:
+        torch.manual_seed(7)
+        model = TinyTransformer(TinyTransformerConfig(
+            d_model=24, n_heads=4, d_ff=48, n_layers=3, num_examples=2, num_task_embedding_latents=3,
+            n_predict=4, dropout=0, attention_dropout=0, attention_pattern=pattern,
+            split_target_demo_attention=split))
+        _set_path(model, monkeypatch, "packed")
+        plain = model(**inputs)
+        fallback = model(**inputs, prefix_layout=dict(layout, attention_pattern="other"))
+        torch.testing.assert_close(fallback["loss"], plain["loss"], rtol=0, atol=0)
+
+        def rebuild_forbidden(*args, **kwargs):
+            raise AssertionError("adopted layouts must not be rebuilt on the device")
+
+        monkeypatch.setattr(model_module, "packed_prefix_lm_layout_fields", rebuild_forbidden)
+        adopted = model(**inputs, prefix_layout=layout)
+        torch.testing.assert_close(adopted["loss"], plain["loss"], rtol=0, atol=0)
+        torch.testing.assert_close(adopted["logits"], plain["logits"], rtol=0, atol=0)
+        monkeypatch.undo()
+        _set_path(model, monkeypatch, "packed")
+
+
+def _split_batch_inputs(tmp_path):
+    path = tmp_path / "tasks.json"
+    path.write_text(json.dumps({"a": {"train": [DEMOS[0], DEMOS[1], TARGET], "test": []},
+                                "b": {"train": [DEMOS[2], TARGET], "test": []}}))
+    dataset = ARCExampleDataset(path, splits=("train",), attention_pattern="pair_group")
+    batch = collate_examples([dataset[index] for index in range(len(dataset))], dataset)
+    inputs = dict(input_ids=batch["input_ids"], example_ids=batch["example_ids"], sep_indices=batch["sep_indices"],
+                  positions_3d=batch["positions_3d"], cu_seqlens=batch["cu_seqlens"], max_seqlen=batch["max_seqlen"],
+                  dihedral_ids=batch["dihedral_ids"])
+    return batch, inputs
+
+
+def test_merged_non_causal_groups_match_separate_attention_calls(tmp_path, monkeypatch):
+    batch, inputs = _split_batch_inputs(tmp_path)
+    layout = batch["prefix_layout"]
+    split = layout["split_target_demo_layout"]
+    assert "spokes_cross" in split
+    merged = split["spokes_cross"]
+    assert merged["first_rows"] == split["spokes"]["q"].numel()
+    assert merged["cq"][-1].item() == split["spokes"]["q"].numel() + split["cross"]["q"].numel()
+    torch.manual_seed(7)
+    model = TinyTransformer(TinyTransformerConfig(
+        d_model=24, n_heads=4, d_ff=48, n_layers=3, num_examples=2, num_task_embedding_latents=3,
+        n_predict=4, dropout=0, attention_dropout=0, attention_pattern="pair_group",
+        split_target_demo_attention=True))
+    _set_path(model, monkeypatch, "packed")
+    merged_result = model(**inputs, prefix_layout=layout)
+    separate_split = {key: value for key, value in split.items() if key != "spokes_cross"}
+    separate_result = model(**inputs, prefix_layout=dict(layout, split_target_demo_layout=separate_split))
+    torch.testing.assert_close(merged_result["logits"], separate_result["logits"], rtol=0, atol=0)
+    merged_result["loss"].backward()
+    merged_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+    model.zero_grad(set_to_none=True)
+    separate_result = model(**inputs, prefix_layout=dict(layout, split_target_demo_layout=separate_split))
+    separate_result["loss"].backward()
+    for name, p in model.named_parameters():
+        if p.grad is not None:
+            torch.testing.assert_close(p.grad, merged_grads[name], rtol=1e-5, atol=1e-6, msg=name)
+
+
+def test_block_compile_region_compiles_and_matches_eager(monkeypatch, training_compile_settings):
+    """The padded SDPA path has no compiler-disabled oracle, so the nested region must capture fully."""
+    import tinytransformer as model_module
+
+    sequences = [encode_context(DEMOS, TARGET), encode_context(DEMOS[:1], TARGET)]
+    inputs = _batch(sequences=sequences)
+    torch.manual_seed(7)
+    model = TinyTransformer(TinyTransformerConfig(
+        d_model=24, n_heads=4, d_ff=48, n_layers=4, num_examples=2, num_task_embedding_latents=3,
+        n_predict=4, dropout=0, attention_dropout=0, attention_pattern="pair_group",
+        split_target_demo_attention=True, loop_iterations=3, loop_start_layer=1, loop_end_layer=3,
+        loop_exit_weight=0.3))
+    expected = model(**inputs)
+    expected["loss"].backward()
+    expected_grads = {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+    model.zero_grad(set_to_none=True)
+    assert model_module.mark_block_compile_region() is True
+    try:
+        assert model_module.TransformerBlock._compile_region_marked is True
+        counter = CompileCounterWithBackend("aot_eager")
+        actual = torch.compile(model, backend=counter)(**inputs)
+        torch.testing.assert_close(actual["loss"], expected["loss"], rtol=2e-5, atol=1e-6)
+        actual["loss"].backward()
+        for name, p in model.named_parameters():
+            if name in expected_grads:
+                torch.testing.assert_close(p.grad, expected_grads[name], rtol=3e-4, atol=2e-6, msg=name)
+        assert counter.frame_count > 0
+    finally:
+        model_module.unmark_block_compile_region()
+    assert model_module.TransformerBlock._compile_region_marked is False
+
+
+def test_compile_options_reach_the_trainer_and_the_launcher_plan(monkeypatch):
+    import train
+    import tinytransformer as model_module
+    from argparse import Namespace
+
+    monkeypatch.setattr(torch._dynamo.config, "compiled_autograd", False)
+    monkeypatch.setattr(torch._inductor.config, "coordinate_descent_tuning", False)
+    defaults = {"compiled_autograd": False, "compile_regions": False,
+                "compile_mode": "default", "coordinate_descent_tuning": False}
+    assert train.configure_compile(Namespace()) == defaults
+    assert torch._dynamo.config.compiled_autograd is False
+    enabled = train.configure_compile(Namespace(
+        compiled_autograd=True, compile_regions=True, compile_mode="max-autotune-no-cudagraphs",
+        coordinate_descent_tuning=True))
+    try:
+        assert enabled == {"compiled_autograd": True, "compile_regions": True,
+                           "compile_mode": "max-autotune-no-cudagraphs", "coordinate_descent_tuning": True}
+        assert torch._dynamo.config.compiled_autograd is True
+        assert torch._inductor.config.coordinate_descent_tuning is True
+        assert model_module.TransformerBlock._compile_region_marked is True
+    finally:
+        model_module.unmark_block_compile_region()
+    with pytest.raises(ValueError, match="compile_mode"):
+        train.configure_compile(Namespace(compile_mode="fast"))
+    # The shared entry point hands the mode to torch.compile (the probe once measured the default).
+    seen = {}
+
+    def fake_compile(module, **kwargs):
+        seen.update(kwargs)
+        return module
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    module = torch.nn.Linear(2, 2)
+    compiled, options = train.compile_training_model(
+        module, Namespace(compile_mode="max-autotune-no-cudagraphs", compile_scope="model"))
+    assert compiled is module and seen == {"mode": "max-autotune-no-cudagraphs"}
+    assert options["compile_mode"] == "max-autotune-no-cudagraphs"
+    plan = launch_run.build_plan({"defaults": {
+        "compiled_autograd": True, "compile_regions": True, "compile_mode": "max-autotune",
+        "coordinate_descent_tuning": True}}, ROOT / "tests/fixtures/specs/example.json")
+    assert plan["pretrain"]["compiled_autograd"] is True and plan["pretrain"]["compile_regions"] is True
+    assert plan["pretrain"]["compile_mode"] == "max-autotune" and plan["pretrain"]["coordinate_descent_tuning"] is True
+    assert launch_run.build_plan({"defaults": {}}, ROOT / "tests/fixtures/specs/example.json")["pretrain"]["compile_mode"] == "default"
+    for key in ("compiled_autograd", "compile_regions", "coordinate_descent_tuning"):
+        with pytest.raises(ValueError, match=key):
+            launch_run.build_plan({"defaults": {key: "yes"}}, ROOT / "tests/fixtures/specs/example.json")
+    with pytest.raises(ValueError, match="compile_mode"):
+        launch_run.build_plan({"defaults": {"compile_mode": "fast"}}, ROOT / "tests/fixtures/specs/example.json")

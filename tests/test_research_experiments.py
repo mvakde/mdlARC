@@ -111,7 +111,7 @@ def test_invalid_research_settings_fail_before_training(key, value):
     with pytest.raises(ValueError, match=key):
         TinyTransformerConfig(**{key: value})
     with pytest.raises(ValueError, match=key):
-        launch_run.build_plan({"defaults": {key: value}}, ROOT / "specs/example.json")
+        launch_run.build_plan({"defaults": {key: value}}, ROOT / "tests/fixtures/specs/example.json")
 
 
 @pytest.mark.parametrize("options", [
@@ -121,13 +121,13 @@ def test_invalid_research_settings_fail_before_training(key, value):
 ])
 def test_invalid_loop_span_rejected_by_launcher(options):
     with pytest.raises(ValueError, match="loop_"):
-        launch_run.build_plan({"defaults": options}, ROOT / "specs/example.json")
+        launch_run.build_plan({"defaults": options}, ROOT / "tests/fixtures/specs/example.json")
 
 
 def test_merged_stage_loop_bounds_are_validated():
     with pytest.raises(ValueError, match="loop_"):
         launch_run.build_plan({"defaults": dict(loop_iterations=2, loop_start_layer=2, loop_end_layer=6),
-                               "pretrain": dict(n_layers=4)}, ROOT / "specs/example.json")
+                               "pretrain": dict(n_layers=4)}, ROOT / "tests/fixtures/specs/example.json")
 
 
 @pytest.mark.parametrize("factory", [loop_model, latent_model])
@@ -149,13 +149,13 @@ def test_research_parameters_are_grouped_exactly_once_with_normuon(factory):
         n_predict=1, mtp_weight=0.0)),
 ])
 def test_experiment_specs_preserve_baseline_protocol_except_requested_treatment(name, changes):
-    baseline = json.loads((ROOT / "specs/context_palette_schedule_two_lookup.json").read_text())
-    variant = json.loads((ROOT / "specs" / name).read_text())
+    baseline = json.loads((ROOT / "tests/fixtures/specs/context_palette_schedule_two_lookup.json").read_text())
+    variant = json.loads((ROOT / "tests/fixtures/specs" / name).read_text())
     expected = json.loads(json.dumps(baseline))
     expected["run_name"] = variant["run_name"]
     expected["defaults"].update(changes)
     assert variant == expected
-    plan = launch_run.build_plan(variant, ROOT / "specs" / name)
+    plan = launch_run.build_plan(variant, ROOT / "tests/fixtures/specs" / name)
     for key, value in changes.items():
         assert plan["pretrain"][key] == value
         assert launch_run.stage_summary(plan["pretrain"])[key] == value

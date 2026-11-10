@@ -1,29 +1,18 @@
+# Python
 venv/
-# Isolated worktrees may link to the existing environment.
 /venv
-__pycache__
+.venv*/
+__pycache__/
 .pytest_cache/
+.DS_Store
+
+# Downloaded and built datasets (rebuilt by dataset_building_scripts/)
+assets_tmp/
 .dataset-build-venv/
 .dataset-build.env
-.DS_Store
-.b2/
-train_eval_specs/*
-!train_eval_specs/README.md
-!train_eval_specs/tests/
-assets/
-assets_tmp/
-temp/
-.codex/
-results/
-colab_runs/
-experiments/
+
+# Run outputs: checkpoints, logs, submissions and scores
 runs/
-specs/temp specs/
-# Defense against accidentally copying OAuth credentials into the checkout.
-client_secret*.json
-*oauth-client*.json
-token.json
-token-*.json
-adc.json
-credentials.json
-scripts/colab_oauth/private/
+
+# Extracted Kaggle notebook runtimes
+out/

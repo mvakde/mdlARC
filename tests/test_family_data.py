@@ -471,39 +471,6 @@ def test_conceptarc_is_an_explicit_configurable_addition(corpus):
     assert catalog['summary']['instances_per_epoch'] == 3
 
 
-@pytest.mark.parametrize('mode', ['development', 'full'])
-def test_family_configs_preserve_default_scaling_ladder_recipe(mode):
-    base = json.loads((ROOT/'specs/pretrain_eval.json').read_text())
-    path = ROOT/f'specs/arc2_family_{mode}.json'
-    spec = json.loads(path.read_text())
-    # Data variants must not reintroduce the legacy FA2/dense training recipe.
-    for key in base.keys() - {'run_name', 'dataset', 'evals', 'skip_evals', 'score_results'}:
-        assert spec[key] == base[key], key
-    assert spec['dataset']['style'] == base['dataset']['style']
-    assert spec['dataset']['pretrain_data']['mode'] == mode
-    assert spec['dataset']['pretrain_data']['sources'] == ['arc2_train', 'arc2_eval']
-    assert 'catalog' not in spec['dataset']['pretrain_data']
-    plan = launch_run.build_plan(spec, path)
-    assert not plan['finetunes']
-    if mode == 'full':
-        assert plan['skip_evals'] and not plan['score_results']
-        assert plan['evals'] == {}
-        assert 'split_manifest' not in spec['dataset']['evaluation']
-        spec['skip_evals'] = False
-        with pytest.raises(ValueError, match='public answers'):
-            launch_run.build_plan(spec, path)
-        return
-    assert spec['skip_evals'] == base['skip_evals']
-    assert spec['score_results'] == base['score_results']
-    assert spec['evals']['final'] == {**base['evals']['final'], 'group': 'development_validation'}
-    assert plan['evals']['final']['group'] == 'development_validation'
-    frozen = ROOT/'results/scaling-ladder/experiments/arc2-development-split-v1.json'
-    tracked = ROOT/'dataset_building_scripts/dataset_splits/arc2_dev80_val40_v1.json'
-    if frozen.exists():assert frozen.read_bytes() == tracked.read_bytes()
-    manifest = json.loads(tracked.read_text())
-    assert (len(manifest['train']), len(manifest['eval_groups']['development_validation'])) == (80, 40)
-
-
 def test_pending_lineage_snapshots_block_packaging_without_shrinking_inventory(corpus):
     c = corpus
     job, key = composition(c, 'pending', ['b', 'b'])
@@ -538,31 +505,6 @@ def test_generated_pair_leak_excludes_family_and_every_descendant(corpus):
     catalog, _ = inventory(c)
     assert {key, child} <= set(catalog['excluded'])
     assert not ({key, child} & set(catalog['families']))
-
-
-def test_pinned_packages_are_included_in_local_source_snapshots(corpus, monkeypatch):
-    c = corpus
-    from scripts import run_on_colab
-    from workflows.vast import snapshot
-    catalog, payload = inventory(c)
-    identity = fd.package_catalog(catalog, payload, c.root/'assets_tmp/catalog.zip')
-    identity['archive_path'] = 'assets_tmp/catalog.zip'
-    spec = copy.deepcopy(c.raw); spec['pretrain_data']['catalog'] = identity
-    # Snapshot entry points consume a complete experiment object, not a dataset object.
-    full_spec = {'run_name': 'family-fixture', 'dataset': spec, 'defaults': {'FA': 4}}
-    for filename in ['launch_run.py', 'requirements.txt', 'scripts/run_layout.py']:
-        target = c.root/filename;target.parent.mkdir(parents=True, exist_ok=True);target.write_text('# fixture')
-    spec_path = c.root/'selected.json';save(spec_path, full_spec)
-    monkeypatch.setattr(run_on_colab, 'ROOT', c.root)
-    monkeypatch.setattr(run_on_colab, 'SOURCE_DIRS', [])
-    monkeypatch.setattr(run_on_colab, 'GROUPED_DIRS', [])
-    assert c.root/'assets_tmp/catalog.zip' in run_on_colab.source_files(spec_path)
-    assert c.root/'assets_tmp/catalog.zip' in snapshot.source_files(c.root, spec_path)
-    (c.root/'assets_tmp/catalog.zip').write_bytes(b'changed')
-    with pytest.raises(ValueError, match='identity changed'):
-        run_on_colab.source_files(spec_path)
-    with pytest.raises(ValueError, match='identity changed'):
-        snapshot.source_files(c.root, spec_path)
 
 
 def test_inventory_cannot_be_packaged_after_source_metadata_changes(corpus):

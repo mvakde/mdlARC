@@ -73,7 +73,7 @@ def test_conceptarc_plan_evaluates_final_checkpoint_by_default():
 
 
 def test_conceptarc_pretrain_eval_spec_runs_90_epochs_and_scores():
-    spec_path = Path("specs/conceptarc_pretrain_eval.json").resolve()
+    spec_path = Path("tests/fixtures/specs/conceptarc_pretrain_eval.json").resolve()
     plan = launch_run.build_plan(launch_run.load_spec(spec_path), spec_path)
 
     assert plan["dataset"]["dataset"] == "conceptarc"
@@ -84,7 +84,7 @@ def test_conceptarc_pretrain_eval_spec_runs_90_epochs_and_scores():
 
 
 def test_conceptarc_smoke_spec_remains_train_only():
-    spec_path = Path("specs/conceptarc_smoke.json").resolve()
+    spec_path = Path("tests/fixtures/specs/conceptarc_smoke.json").resolve()
     plan = launch_run.build_plan(launch_run.load_spec(spec_path), spec_path)
 
     assert plan["pretrain"]["epochs"] == 2

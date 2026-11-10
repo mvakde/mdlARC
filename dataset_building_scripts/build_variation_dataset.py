@@ -31,8 +31,6 @@ SEED_NAME = re.compile(r"(.+)seed(\d+)\.json\Z")
 EVALUATION_FILES = {
     "arc1_eval": ("ARC-1/arc1_eval_challenges.json", "ARC-1/arc1_eval_solutions.json"),
     "arc2_eval": ("ARC-2/arc2_eval_challenges.json", "ARC-2/arc2_eval_solutions.json"),
-    "arc_heavy100": ("ARC-Heavy/heavy100_challenges.json", "ARC-Heavy/heavy100_solutions.json"),
-    "arc_new80": ("ARC-New80/new80_challenges.json", "ARC-New80/new80_solutions.json"),
 }
 
 
@@ -44,8 +42,15 @@ def _load(path: Path) -> dict:
     return value
 
 
+# The approved task-variations-v1.zip (assets_tmp/), pinned by size and SHA-256.
+VARIATION_ARCHIVE_IDENTITY = {
+    "dataset_size": 80119384,
+    "dataset_sha256": "195554ad7b731af5bd83655751414ec5d889b8d0b1bb046849c6ae4d53793d21",
+}
+
+
 def _archive_identity() -> tuple[Path, str]:
-    config = _load(ROOT / "scripts/colab_drive.json")
+    config = VARIATION_ARCHIVE_IDENTITY
     archive = ASSETS_TMP / "task-variations-v1.zip"
     if not archive.is_file() or archive.is_symlink():
         raise FileNotFoundError(f"Variation archive is required: {archive}")
@@ -193,8 +198,6 @@ def _evaluation_data(config: dict) -> tuple[dict, dict, dict, dict | None, dict 
                 }
                 solutions[task_id] = [pair["output"] for pair in task["test"]]
                 groups[group].append(task_id)
-        if evaluation.get("extra_tasks"):
-            _add_extra_tasks(evaluation["extra_tasks"], challenges, solutions, groups)
     else:
         challenge_file, solution_file = EVALUATION_FILES[source]
         challenges = _load(ASSETS_TMP / challenge_file)
@@ -208,39 +211,6 @@ def _evaluation_data(config: dict) -> tuple[dict, dict, dict, dict | None, dict 
         if len(task.get("test", [])) != len(solutions[task_id]):
             raise ValueError(f"Evaluation answer count mismatch: {task_id}")
     return challenges, solutions, groups, manifest, identity
-
-
-def _add_extra_tasks(extra: dict, challenges: dict, solutions: dict, groups: dict) -> None:
-    """Add the tasks of extra challenge/solution files to one evaluation group (adapted on and scored).
-
-    Tasks already in that group (same native ID) must match it exactly; the others become "<prefix>/<native ID>".
-    """
-    group, prefix = extra["group"], extra["prefix"]
-    if group not in groups:
-        raise ValueError(f"extra_tasks.group is not an evaluation group: {group!r}")
-    extra_challenges = _load(ROOT / extra["challenges"])
-    extra_solutions = _load(ROOT / extra["solutions"])
-    if set(extra_challenges) != set(extra_solutions):
-        raise ValueError("extra_tasks challenge and solution IDs differ")
-    existing = {task_id.rsplit("/", 1)[-1]: task_id for task_id in groups[group]}
-    for native_id, task in extra_challenges.items():
-        answers = extra_solutions[native_id]
-        if any("output" in pair for pair in task.get("test", [])) or len(task.get("test", [])) != len(answers):
-            raise ValueError(f"extra_tasks test pairs do not match their answers: {native_id}")
-        _solved_pairs({"train": task.get("train", []),
-                       "test": [{"input": pair["input"], "output": answer} for pair, answer in zip(task["test"], answers)]},
-                      native_id)
-        if native_id in existing:
-            task_id = existing[native_id]
-            if task != challenges[task_id] or answers != solutions[task_id]:
-                raise ValueError(f"extra_tasks differs from its held-out original: {native_id}")
-            continue
-        task_id = f"{prefix}/{native_id}"
-        if task_id in challenges:
-            raise ValueError(f"Duplicate extra task: {task_id}")
-        challenges[task_id] = {"train": task["train"], "test": [{"input": pair["input"]} for pair in task["test"]]}
-        solutions[task_id] = answers
-        groups[group].append(task_id)
 
 
 def _split_contents(split_identity: dict | None) -> bytes | None:

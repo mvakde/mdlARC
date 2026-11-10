@@ -14,6 +14,7 @@ from typing import Optional
 import torch
 from torch.utils.data import DataLoader, Sampler
 import distributed_training as distributed
+from demo_schedule import MAX_CONTEXT_DEMOS
 
 from common import (
     ARCExampleDataset,
@@ -36,7 +37,7 @@ class VariationTrainingDataset(ARCExampleDataset):
     def __init__(self, *, json_path: Path, index_path: Path, seed: int, max_augments: int,
                  augmentation_sampling_mode: Optional[str] = None,
                  attention_pattern: str = "dense", training_demo_schedule: str = "all",
-                 pair_identity_vertices: int = 0, max_training_demos: int = 6):
+                 pair_identity_vertices: int = 0, max_training_demos: Optional[int] = None):
         with Path(index_path).open(encoding="utf-8") as handle:
             self.variation_index = json.load(handle)
         self.variation_root = ROOT
@@ -57,6 +58,13 @@ class VariationTrainingDataset(ARCExampleDataset):
         self.eval_support_task_ids = set(self.variation_index["eval_support_task_ids"])
         self.variation_cache: OrderedDict[str, list[dict]] = OrderedDict()
         family_mode = self.variation_index.get("sampling", {}).get("unit") == "family"
+        if family_mode and max_training_demos is None:
+            # Family-sampled data always trains on balanced capped contexts (at most six demos).
+            max_training_demos = MAX_CONTEXT_DEMOS
+        capped = max_training_demos is not None or training_demo_schedule == "two"
+        if not (family_mode or capped):
+            # Uncapped task-variation training shows every demo, as before the capped schedules.
+            training_demo_schedule = "all"
         super().__init__(
             json_path=json_path,
             splits=("train",),
@@ -122,7 +130,7 @@ class VariationTrainingDataset(ARCExampleDataset):
             if key in index:
                 metadata[key] = index[key]
         metadata.update(seed=self.seed, max_augments=self.max_augments, enable_aug=bool(enable_aug))
-        if self.max_training_demos != 6:
+        if self.max_training_demos not in (None, MAX_CONTEXT_DEMOS):
             metadata['max_training_demos'] = self.max_training_demos
         if index.get("sampling", {}).get("unit") == "family":
             metadata.update(training_demo_schedule=self.training_demo_schedule,

@@ -183,7 +183,7 @@ def test_invalid_extension_settings_fail(key, value):
         TinyTransformerConfig(loop_iterations=2, loop_start_layer=1, loop_end_layer=3, **{key: value})
     with pytest.raises(ValueError, match=key):
         launch_run.build_plan({"defaults": {"loop_iterations": 2, "loop_start_layer": 2, "loop_end_layer": 6,
-                                            key: value}}, ROOT / "specs/example.json")
+                                            key: value}}, ROOT / "tests/fixtures/specs/example.json")
 
 
 def test_extensions_require_an_active_loop_and_reach_the_launcher_plan():
@@ -191,7 +191,7 @@ def test_extensions_require_an_active_loop_and_reach_the_launcher_plan():
         TinyTransformerConfig(loop_streams=3)
     options = dict(loop_iterations=3, loop_start_layer=0, loop_end_layer=8, loop_gate="token",
                    loop_gate_init=0.5, loop_streams=4, loop_dense_mixing=True)
-    plan = launch_run.build_plan({"defaults": options}, ROOT / "specs/example.json")
+    plan = launch_run.build_plan({"defaults": options}, ROOT / "tests/fixtures/specs/example.json")
     for key, value in options.items():
         assert plan["pretrain"][key] == value
         assert launch_run.stage_summary(plan["pretrain"])[key] == value
@@ -241,6 +241,42 @@ def test_deep_supervision_averages_exits_and_compiles():
     for (name, parameter), (_, reference) in zip(traced.named_parameters(), eager.named_parameters()):
         if reference.grad is not None:
             torch.testing.assert_close(parameter.grad, reference.grad, msg=name)
+
+
+@pytest.mark.parametrize("exits, coda_calls", [(None, 4), ([2], 2), ([1, 3], 3), ([3, 2, 1], 4)])
+def test_deep_supervision_exits_can_be_restricted_to_named_iterations(exits, coda_calls):
+    """loop_model has one coda block (3): one main pass plus one pass per exit."""
+    model = loop_model(loop_exit_weight=0.3, loop_iterations=4, loop_exit_iterations=exits)
+    calls = []
+    model.blocks[3].register_forward_hook(lambda *_: calls.append(1))
+    result = model(**_batch(True))
+    assert len(calls) == coda_calls
+    assert result["loop_exit_loss"] is not None and torch.isfinite(result["loop_exit_loss"])
+    if exits is not None and sorted(exits) == [1, 2, 3]:
+        assert model.config.loop_exit_iterations == (1, 2, 3)
+        reference = loop_model(loop_exit_weight=0.3, loop_iterations=4)(**_batch(True))
+        torch.testing.assert_close(result["loop_exit_loss"], reference["loop_exit_loss"], rtol=0, atol=0)
+    checkpoint = _checkpoint(model)
+    assert build.build_checkpoint_config(checkpoint).loop_exit_iterations == model.config.loop_exit_iterations
+
+
+@pytest.mark.parametrize("value", [[], [0], [4], [1, 1], "2", 2, [True], [1.0]])
+def test_invalid_exit_iterations_fail(value):
+    with pytest.raises(ValueError, match="loop_exit_iterations"):
+        TinyTransformerConfig(loop_iterations=4, loop_start_layer=1, loop_end_layer=3,
+                              loop_exit_weight=0.3, loop_exit_iterations=value)
+
+
+def test_exit_iterations_need_an_active_loop_and_a_positive_weight():
+    with pytest.raises(ValueError, match="loop_exit_iterations"):
+        TinyTransformerConfig(loop_exit_iterations=[1])
+    with pytest.raises(ValueError, match="loop_exit_weight"):
+        TinyTransformerConfig(loop_iterations=4, loop_start_layer=1, loop_end_layer=3, loop_exit_iterations=[2])
+    options = dict(loop_iterations=6, loop_start_layer=2, loop_end_layer=6, loop_exit_weight=0.3,
+                   loop_exit_iterations=[3, 5])
+    plan = launch_run.build_plan({"defaults": options}, ROOT / "tests/fixtures/specs/example.json")
+    assert plan["pretrain"]["loop_exit_iterations"] == [3, 5]
+    assert launch_run.stage_summary(plan["pretrain"])["loop_exit_iterations"] == [3, 5]
 
 
 def test_loop_learning_rate_multiplier_isolates_only_loop_parameters():

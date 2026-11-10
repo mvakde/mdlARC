@@ -6,8 +6,10 @@ The fixed pre-collated batches measure device training, not augmentation speed.
 """
 
 import argparse
+import gzip
 import json
 import math
+import re
 import subprocess
 import sys
 import threading
@@ -25,10 +27,15 @@ DEFAULTS = {
     "batch_multiple": 8,
     "warmup_steps": 3,
     "measure_steps": 8,
-    "warmup_epochs": 1,
-    "measure_epochs": 2,
     "trial_timeout_seconds": 900,
     "modes": ["sampled", "grid_20", "grid_30"],
+    # Speed probes: cycle several pre-collated batches so compiled shapes vary
+    # as in training, then record a bounded torch.profiler trace and summary.
+    "distinct_batches": 1,
+    "profile_steps": 0,
+    # A fixed probe reruns its candidate in a second process by default; a speed
+    # comparison on a box whose time is precious can skip that confirmation.
+    "confirm": True,
 }
 
 
@@ -41,14 +48,20 @@ def validate_config(value):
     config = {**DEFAULTS, **value}
     if not isinstance(config["search"], bool):
         raise ValueError("training_benchmark.search must be a boolean.")
+    if not isinstance(config["confirm"], bool):
+        raise ValueError("training_benchmark.confirm must be a boolean.")
+    if config["search"] and not config["confirm"]:
+        raise ValueError("A capacity search always confirms its boundary; confirm=false is for fixed probes.")
     for key in ("memory_limit_gb", "allocator_margin_gb"):
         if isinstance(config[key], bool) or not isinstance(config[key], (int, float)) or not math.isfinite(config[key]) or config[key] <= 0:
             raise ValueError(f"training_benchmark.{key} must be positive and finite.")
     if config["allocator_margin_gb"] >= config["memory_limit_gb"]:
         raise ValueError("Allocator margin must be smaller than the memory limit.")
-    for key in ("start_batch_size", "max_batch_size", "batch_multiple", "warmup_steps", "measure_steps", "warmup_epochs", "measure_epochs", "trial_timeout_seconds"):
+    for key in ("start_batch_size", "max_batch_size", "batch_multiple", "warmup_steps", "measure_steps", "trial_timeout_seconds", "distinct_batches"):
         if isinstance(config[key], bool) or not isinstance(config[key], int) or config[key] <= 0:
             raise ValueError(f"training_benchmark.{key} must be a positive integer.")
+    if isinstance(config["profile_steps"], bool) or not isinstance(config["profile_steps"], int) or config["profile_steps"] < 0:
+        raise ValueError("training_benchmark.profile_steps must be a non-negative integer.")
     if config["start_batch_size"] > config["max_batch_size"]:
         raise ValueError("start_batch_size exceeds max_batch_size.")
     if not config["search"] and config["start_batch_size"] != config["max_batch_size"]:
@@ -57,10 +70,10 @@ def validate_config(value):
         raise ValueError("Batch bounds must be divisible by batch_multiple.")
     if not isinstance(config["modes"], list) or not config["modes"] or len(set(config["modes"])) != len(config["modes"]):
         raise ValueError("training_benchmark.modes must be a nonempty unique list.")
-    if any(mode not in ("epoch", "sampled", "longest", "variation_longest", "grid_15", "grid_20", "grid_25", "grid_30") for mode in config["modes"]):
+    if any(mode not in ("training", "sampled", "longest", "variation_longest", "grid_15", "grid_20", "grid_25", "grid_30") for mode in config["modes"]):
         raise ValueError("Unsupported training_benchmark batch mode.")
-    if "epoch" in config["modes"] and config["search"]:
-        raise ValueError("Full-epoch timing requires a fixed batch size (search=false).")
+    if config["warmup_steps"] < 2 * config["distinct_batches"]:
+        raise ValueError("warmup_steps must cover every distinct batch twice so compilation settles before timing.")
     return config
 
 
@@ -78,10 +91,9 @@ def write_json(path, data):
 
 
 def variation_profile(index_path, attention_pattern=None):
-    """Scan the corpus once; bound contexts by their six longest eligible demos."""
+    """Scan the selected, verified corpus once; include all-demo context lengths."""
     import numpy as np
     from common import normalize_attention_pattern
-    from demo_schedule import MAX_CONTEXT_DEMOS
 
     attention_pattern = normalize_attention_pattern(attention_pattern)
     index = json.loads(Path(index_path).read_text())
@@ -96,13 +108,10 @@ def variation_profile(index_path, attention_pattern=None):
             variant_count += 1
             pair_lengths = [1 + sum(sum(len(row) for row in grid) + len(grid)
                                     for grid in (pair["input"], pair["output"])) for pair in pairs]
-            longest = sorted(range(len(pairs)), key=pair_lengths.__getitem__, reverse=True)[:MAX_CONTEXT_DEMOS + 1]
+            context_length = 1 + sum(length - 1 for length in pair_lengths)
             for pair_index, pair in enumerate(pairs):
                 grids = (pair["input"], pair["output"])
-                length = pair_lengths[pair_index]
-                if attention_pattern == "pair_group":
-                    demos = [i for i in longest if i != pair_index][:MAX_CONTEXT_DEMOS]
-                    length += sum(pair_lengths[i] - 1 for i in demos)
+                length = context_length if attention_pattern == "pair_group" else pair_lengths[pair_index]
                 lengths.append(length)
                 if length > maximum:
                     maximum, longest_refs = length, []
@@ -118,7 +127,7 @@ def variation_profile(index_path, attention_pattern=None):
         raise ValueError(f"Variation length {maximum} exceeds the current model limit {MAX_SEQ_LEN}.")
     return {"snapshot": index["snapshot"], "archive_sha256": index["archive_sha256"],
         "attention_pattern": attention_pattern,
-        "sequence_length_scope": "capped_demo_context_upper_bound" if attention_pattern == "pair_group" else "target_pair",
+        "sequence_length_scope": "all_demo_context" if attention_pattern == "pair_group" else "target_pair",
         "parents": len(index["parents"]), "variants": variant_count, "solved_pairs": len(lengths),
         "sequence_length_percentiles": dict(zip(["min", "p50", "p90", "p95", "p99", "max"],
             np.percentile(lengths, [0, 50, 90, 95, 99, 100]).tolist())), "longest_refs": longest_refs}
@@ -158,13 +167,14 @@ def run_benchmark(plan):
         if not config["search"]:
             candidate = config["start_batch_size"]
             record = probe(mode, candidate)
-            confirmation = probe(mode, candidate, repeat=True) if record["status"] == "fits" else None
+            fits = record["status"] == "fits"
+            confirmation = probe(mode, candidate, repeat=True) if fits and config["confirm"] else None
             if confirmation is not None and confirmation["status"] != "fits":
                 raise RuntimeError(f"Fixed probe failed independent confirmation: {mode}/{candidate}")
             results["summary"][mode] = {
                 "tested_batch": candidate, "status": record["status"],
                 "largest_confirmed_batch": candidate if confirmation else None,
-                "first_rejected_batch": None if confirmation else candidate,
+                "first_rejected_batch": None if fits else candidate,
                 "confirmation": confirmation,
             }
             write_json(output / "results.json", results)
@@ -219,16 +229,157 @@ def run_benchmark(plan):
     print("TRAINING_BENCHMARK_SUMMARY " + json.dumps(results["summary"]), flush=True)
 
 
-class RepeatedBatch:
-    def __init__(self, batch, count):
-        self.batch, self.count = batch, count
+class CycledBatches:
+    """Pre-collated CPU batches repeated in order; one batch is the fixed probe."""
+
+    def __init__(self, batches, count):
+        self.batches, self.count = list(batches), count
 
     def __iter__(self):
-        for _ in range(self.count):
-            yield self.batch
+        for index in range(self.count):
+            yield self.batches[index % len(self.batches)]
 
     def __len__(self):
         return self.count
+
+
+# Device kernel names, matched in order; inductor's fused kernels come before the
+# aten index/elementwise names they may embed.
+KERNEL_CATEGORIES = (
+    # FA2 names are flash_fwd_kernel/flash_bwd_*; FA3 (hopper) wraps FlashAttnFwdSm90/
+    # FlashAttnBwdSm90 in cutlass::device_kernel, so it must match before "cutlass".
+    ("attention", re.compile(r"flash_(fwd|bwd)|FlashAttn|fmha|attention", re.I)),
+    ("gemm", re.compile(r"gemm|cutlass|xmma|cublas|nvjet|gemv|sm\d\d_", re.I)),
+    ("memory", re.compile(r"Memcpy|Memset", re.I)),
+    ("fused", re.compile(r"^triton_", re.I)),
+    ("index", re.compile(r"index|gather|scatter", re.I)),
+    ("scan", re.compile(r"cub::|DeviceScan|DeviceSelect|DeviceReduce|radix|cumsum|nonzero|unique|sort", re.I)),
+    ("reduce", re.compile(r"reduce", re.I)),
+    ("elementwise", re.compile(r"elementwise|vectorized|unrolled|fill|copy|Cat", re.I)),
+    ("optimizer", re.compile(r"multi_tensor|foreach|adam", re.I)),
+)
+HOST_SYNC_NAMES = ("cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaMemcpyAsync",
+                   "cudaLaunchKernel", "cuLaunchKernel", "cuLaunchKernelEx",
+                   "aten::item", "aten::_local_scalar_dense", "aten::nonzero", "aten::unique_consecutive")
+LAUNCH_API_NAMES = ("cudaLaunchKernel", "cuLaunchKernel", "cuLaunchKernelEx")
+MARKER_NAMES = ("packed_layout", "forward", "backward", "optimizer_step")
+
+
+def categorize_kernel(name):
+    for category, pattern in KERNEL_CATEGORIES:
+        if pattern.search(name):
+            return category
+    return "other"
+
+
+def _union_seconds(intervals):
+    """Total covered time of possibly overlapping (start, end) microsecond intervals."""
+    total, current = 0.0, None
+    for start, end in sorted(intervals):
+        if current is None or start > current[1]:
+            if current is not None:
+                total += current[1] - current[0]
+            current = [start, end]
+        else:
+            current[1] = max(current[1], end)
+    if current is not None:
+        total += current[1] - current[0]
+    return total / 1e6
+
+
+def summarize_records(records, wall_seconds, steps):
+    """Summarize (name, is_device, start_us, end_us) events from a profiled training window.
+
+    Device events are compute kernels plus copies/memsets. ``gpu_busy`` is the
+    union of kernel time only, so copy-engine time never masquerades as SM work;
+    ``gpu_occupied`` adds copies and memsets, so ``1 - gpu_occupied_fraction`` is
+    the time the device had nothing queued at all. Copies that run alone (the
+    clone inside an out-of-place index_add, for example) show up as the gap
+    between the two fractions, not as idle time.
+    """
+    categories, kernels, intervals, device_intervals, kernel_count = {}, {}, [], [], 0
+    host = {name: {"count": 0, "seconds": 0.0} for name in (*HOST_SYNC_NAMES, *MARKER_NAMES)}
+    for name, is_device, start, end in records:
+        duration = (end - start) / 1e6
+        if is_device:
+            category = categorize_kernel(name)
+            categories[category] = categories.get(category, 0.0) + duration
+            entry = kernels.setdefault(name, {"seconds": 0.0, "count": 0})
+            entry["seconds"] += duration
+            entry["count"] += 1
+            device_intervals.append((start, end))
+            if category != "memory":
+                intervals.append((start, end))
+                kernel_count += 1
+        elif name in host:
+            host[name]["count"] += 1
+            host[name]["seconds"] += duration
+    busy = _union_seconds(intervals)
+    occupied = _union_seconds(device_intervals)
+    launch_calls = sum(host[name]["count"] for name in LAUNCH_API_NAMES)
+    top = sorted(kernels.items(), key=lambda item: item[1]["seconds"], reverse=True)[:40]
+    return {
+        "steps": steps, "wall_seconds": wall_seconds, "seconds_per_step": wall_seconds / max(steps, 1),
+        "gpu_busy_seconds": busy, "gpu_busy_fraction": busy / wall_seconds if wall_seconds else None,
+        "gpu_occupied_seconds": occupied,
+        "gpu_occupied_fraction": occupied / wall_seconds if wall_seconds else None,
+        "gpu_idle_fraction": 1.0 - occupied / wall_seconds if wall_seconds else None,
+        "kernel_seconds_by_category": dict(sorted(categories.items(), key=lambda item: item[1], reverse=True)),
+        "kernels_per_step": kernel_count / max(steps, 1), "launch_api_calls_per_step": launch_calls / max(steps, 1),
+        "host_events": {name: value for name, value in host.items() if value["count"]},
+        "top_kernels": [{"name": name, "seconds": value["seconds"], "count": value["count"],
+                         "mean_us": 1e6 * value["seconds"] / value["count"]} for name, value in top],
+    }
+
+
+def _is_annotation(name):
+    """Kineto projects record_function ranges onto the GPU timeline; they are not kernels."""
+    return name in MARKER_NAMES or "#" in name or name.startswith("ProfilerStep")
+
+
+def profile_records(profiler):
+    import torch
+    device_type = getattr(torch.autograd, "DeviceType", None)
+    records = []
+    for event in profiler.events():
+        is_device = device_type is not None and getattr(event, "device_type", None) == device_type.CUDA
+        if is_device and _is_annotation(event.name):
+            continue
+        records.append((event.name, is_device, event.time_range.start, event.time_range.end))
+    return records
+
+
+def export_profile(profiler, output, label, wall_seconds, steps):
+    """Write the gzipped Chrome trace and the category summary next to the trial record."""
+    summary = summarize_records(profile_records(profiler), wall_seconds, steps)
+    trace = output / f"{label}.trace.json"
+    profiler.export_chrome_trace(str(trace))
+    with trace.open("rb") as source, gzip.open(str(trace) + ".gz", "wb") as target:
+        target.writelines(source)
+    trace.unlink()
+    summary["trace"] = trace.name + ".gz"
+    write_json(output / f"{label}.profile.json", summary)
+    print("PROFILE_SUMMARY " + json.dumps({key: summary[key] for key in (
+        "seconds_per_step", "gpu_busy_fraction", "gpu_occupied_fraction", "gpu_idle_fraction",
+        "kernels_per_step", "launch_api_calls_per_step",
+        "kernel_seconds_by_category", "host_events")}), flush=True)
+    return summary
+
+
+def training_batches(dataloader, count):
+    """The first ``count`` real epoch-0 batches, prepared exactly as the trainer prepares its loader."""
+    batch_sampler = getattr(dataloader, "batch_sampler", None)
+    if batch_sampler is not None and hasattr(batch_sampler, "drop_last"):
+        batch_sampler.drop_last = True
+    augmentor = getattr(dataloader, "augmentor", None)
+    if hasattr(augmentor, "prepare_training_schedule"):
+        augmentor.prepare_training_schedule(batch_sampler)
+    if augmentor is not None:
+        augmentor.set_epoch(0)
+    if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
+        batch_sampler.set_epoch(0)
+    iterator = iter(dataloader)
+    return [next(iterator) for _ in range(count)]
 
 
 def _training_sequence_lengths(dataset):
@@ -242,14 +393,13 @@ def _training_sequence_lengths(dataset):
 
 
 def _synthetic_demo_count(dataset):
-    from demo_schedule import MAX_CONTEXT_DEMOS
     if getattr(dataset, "attention_pattern", "dense") != "pair_group":
         return 2
     counts = [max(0, sum(pair.get("output") is not None for pair in pairs) - 1)
               for pairs in dataset.pairs_by_task.values()]
     counts.extend(max(0, int(item["pair_count"]) - 1)
                   for variants in getattr(dataset, "variation_parents", {}).values() for item in variants)
-    return min(MAX_CONTEXT_DEMOS, max(counts, default=0))
+    return max(counts, default=0)
 
 
 def make_batch(dataset, mode, batch_size, seed):
@@ -342,21 +492,12 @@ def run_trial(request):
     try:
         args = argparse.Namespace(**plan["pretrain"])
         args.batch_size = request["batch_size"]
-        full_epoch = request["mode"] == "epoch"
-        if not full_epoch:
-            args.num_workers = 0
-        model, dataset, dataloader, device, _ = build.build_model_and_data(args, build_dataloader=full_epoch)
-        if full_epoch:
-            # Match _train_single_model: science training drops the incomplete
-            # final physical batch after constructing the dataloader.
-            if hasattr(dataloader.batch_sampler, "drop_last"):
-                dataloader.batch_sampler.drop_last = True
-            augmentor = getattr(dataloader, "augmentor", None)
-            if hasattr(augmentor, "prepare_training_schedule"):
-                augmentor.prepare_training_schedule(dataloader.batch_sampler)
+        args.num_workers = 0
+        training_mode = request["mode"] == "training"
+        model, dataset, dataloader, device, _ = build.build_model_and_data(args, build_dataloader=training_mode)
         record["model_config"] = vars(model.config)
-        lengths = np.asarray([] if full_epoch else _training_sequence_lengths(dataset))
-        record["dataset_profile"] = {"regular_training_pairs": len(dataset.examples) if full_epoch else len(lengths), "task_embeddings": dataset.num_examples,
+        lengths = np.asarray(_training_sequence_lengths(dataset))
+        record["dataset_profile"] = {"regular_training_pairs": len(lengths), "task_embeddings": dataset.num_examples,
             "sequence_length_scope": "training_context", "sequence_length_geometry": "identity",
             "sequence_length_percentiles": dict(zip(["min", "p50", "p90", "p95", "p99", "max"],
                 np.percentile(lengths, [0, 50, 90, 95, 99, 100]).tolist())) if len(lengths) else None}
@@ -367,76 +508,49 @@ def run_trial(request):
             if args.enable_aug:
                 from variations import VariationAugmentor
                 dataset.augmentor = VariationAugmentor(dataset, seed=args.seed, max_augments=args.max_augments)
-        if not full_epoch:
-            batch = make_batch(dataset, request["mode"], args.batch_size, args.seed)
-            record["tokens_per_batch"] = int(batch["input_ids"].numel())
-            record["max_sequence_length"] = int(batch["max_seqlen"])
+        if training_mode:
+            batches = training_batches(dataloader, config["distinct_batches"])
+        else:
+            batches = [make_batch(dataset, request["mode"], args.batch_size, args.seed + index)
+                       for index in range(config["distinct_batches"])]
+        batch = batches[0]
+        record["tokens_per_batch"] = int(batch["input_ids"].numel())
+        record["max_sequence_length"] = int(batch["max_seqlen"])
+        record["distinct_batches"] = [{"tokens": int(item["input_ids"].numel()), "max_seqlen": int(item["max_seqlen"])}
+                                      for item in batches]
         optimizer = train._build_optimizer(args, model, device,
             args.attention_weight_decay, args.token_embedding_weight_decay, args.task_embedding_weight_decay)
-        train._enable_compile_scalar_capture()
-        compiled_model = torch.compile(model)
+        compiled_model, record["compile_options"] = train.compile_training_model(model, args)
 
         def steps(count, label):
-            train.train_one_epoch(compiled_model, RepeatedBatch(batch, count), optimizer,
+            train.train_one_epoch(compiled_model, CycledBatches(batches, count), optimizer,
                 device, args.grad_clip, gradient_accumulation_steps=1,
                 train_log_mode="last_step", log_location="terminal", log_prefix=label)
 
         torch.cuda.reset_peak_memory_stats(device)
-        if full_epoch:
-            scheduler = train._FractionalLambdaLR(optimizer, train._base_lr_schedule(args, optimizer))
-            if hasattr(optimizer, "configure_muon_schedule"):
-                sampler = dataloader.batch_sampler
-                if hasattr(sampler, 'set_epoch'):
-                    total_steps = 0
-                    for planned_epoch in range(args.epochs):
-                        sampler.set_epoch(planned_epoch)
-                        total_steps += len(dataloader)
-                    sampler.set_epoch(0)
-                else:
-                    total_steps = args.epochs * len(dataloader)
-                optimizer.configure_muon_schedule(total_steps=total_steps, start_step=0)
-            record.update(timing_scope="full_training_epoch_including_cpu_collation_and_transfer",
-                          steps_per_epoch=len(dataloader), epoch_timings=[])
-            global_step = 0
-            for epoch in range(config["warmup_epochs"] + config["measure_epochs"]):
-                augmentor = getattr(dataloader, "augmentor", None)
-                if augmentor is not None:
-                    augmentor.set_epoch(epoch)
-                if hasattr(dataloader.batch_sampler, "set_epoch"):
-                    dataloader.batch_sampler.set_epoch(epoch)
-                torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        steps(config["warmup_steps"], "benchmark_warmup")
+        torch.cuda.synchronize(device)
+        record["warmup_seconds"] = time.perf_counter() - start
+        start = time.perf_counter()
+        steps(config["measure_steps"], "benchmark_measured")
+        torch.cuda.synchronize(device)
+        elapsed = time.perf_counter() - start
+        measured_tokens = sum(record["distinct_batches"][index % len(batches)]["tokens"]
+                              for index in range(config["measure_steps"]))
+        record.update(measure_steps=config["measure_steps"], measured_seconds=elapsed,
+                      seconds_per_step=elapsed / config["measure_steps"],
+                      examples_per_second=args.batch_size * config["measure_steps"] / elapsed,
+                      tokens_per_second=measured_tokens / elapsed)
+        if config["profile_steps"]:
+            from torch.profiler import ProfilerActivity, profile
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as profiler:
                 start = time.perf_counter()
-                global_step = train.train_one_epoch(compiled_model, dataloader, optimizer,
-                    device, args.grad_clip, gradient_accumulation_steps=1, start_step=global_step,
-                    epoch=epoch, steps_per_epoch=len(dataloader), total_epochs=args.epochs, scheduler=scheduler,
-                    mtp_decay=args.mtp_decay, train_log_mode=args.train_log_mode,
-                    log_location="terminal", log_prefix="epoch_benchmark")
+                steps(config["profile_steps"], "benchmark_profiled")
                 torch.cuda.synchronize(device)
-                timing = dict(epoch=epoch + 1, seconds=time.perf_counter() - start,
-                              warmup=epoch < config["warmup_epochs"])
-                record["epoch_timings"].append(timing)
-                print("EPOCH_TIMING " + json.dumps(timing), flush=True)
-                write_json(Path(request["output"]), record)
-            measured = [t["seconds"] for t in record["epoch_timings"] if not t["warmup"]]
-            elapsed = sum(measured)
-            record.update(warmup_seconds=sum(t["seconds"] for t in record["epoch_timings"] if t["warmup"]),
-                seconds_per_epoch=float(np.median(measured)), measured_seconds=elapsed,
-                measure_steps=len(dataloader) * len(measured),
-                seconds_per_step=elapsed / (len(dataloader) * len(measured)),
-                examples_per_second=args.batch_size * len(dataloader) * len(measured) / elapsed)
-        else:
-            start = time.perf_counter()
-            steps(config["warmup_steps"], "benchmark_warmup")
-            torch.cuda.synchronize(device)
-            record["warmup_seconds"] = time.perf_counter() - start
-            start = time.perf_counter()
-            steps(config["measure_steps"], "benchmark_measured")
-            torch.cuda.synchronize(device)
-            elapsed = time.perf_counter() - start
-            record.update(measure_steps=config["measure_steps"], measured_seconds=elapsed,
-                          seconds_per_step=elapsed / config["measure_steps"],
-                          examples_per_second=args.batch_size * config["measure_steps"] / elapsed,
-                          tokens_per_second=record["tokens_per_batch"] * config["measure_steps"] / elapsed)
+                profiled = time.perf_counter() - start
+            record["profile"] = export_profile(profiler, Path(request["output"]).parent,
+                                               Path(request["output"]).stem, profiled, config["profile_steps"])
         if not all(bool(torch.isfinite(parameter).all()) for parameter in model.parameters()):
             raise FloatingPointError("Nonfinite model parameters after the probe.")
         record["status"] = "fits"

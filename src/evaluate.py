@@ -5,13 +5,15 @@ For model/data building, see build.py.
 """
 
 import argparse
+import contextlib
+import gzip
 import hashlib
 import json
 import math
 import os
 import random
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from itertools import groupby
 from pathlib import Path
 from time import perf_counter
@@ -43,9 +45,18 @@ from common import (
     invert_color_mapping,
     is_rectangular_grid,
     tokens_to_grid,
+    IDENTITY_SCALE,
+    demo_bounded_scale_specs,
+    downscale_grid_exact,
+    inference_scale_schedule,
+    is_identity_scale,
+    oriented_scale_factor,
+    symbolic_guard_rejection,
+    symbolic_guards,
+    upscale_grid,
 )
-from tinytransformer import TinyTransformer
-import target_demo_attention
+from target_demo_attention import choose_kv_cache_kernel, split_prompt_cache
+from tinytransformer import TinyTransformer, build_output_targets_and_mask
 
 
 # =============================================================================
@@ -58,19 +69,13 @@ DEFAULT_MAX_NEW_TOKENS = 30 * (30 + 1)
 PREFILL_TOKEN_BUDGET = int(os.environ.get("MDLARC_PREFILL_TOKEN_BUDGET", "524288"))
 DEFAULT_EVAL_BATCH_SIZE = 120
 PROMPT_LENGTH_BUCKET_SIZE = 512
-
-
-def _limit_target_grids(logits, next_z, target_input_z=None):
-    """After two intermediates, the remaining grid must be the final output."""
-    if target_input_z is None:
-        return logits
-    anchor = target_input_z.squeeze(-1)
-    if next_z.dim() > 1:
-        anchor = anchor[:, None]
-    capped = logits.clone()
-    capped[..., IO_SEPARATOR_TOKEN_ID] = torch.where(next_z - anchor >= 3,
-        float("-inf"), capped[..., IO_SEPARATOR_TOKEN_ID])
-    return capped
+# Split target/demo models decode over a split demo/target KV cache ("split")
+# unless MDLARC_DECODE_CACHE=full selects the older single padded buffer.
+DECODE_CACHE = os.environ.get("MDLARC_DECODE_CACHE", "split").strip().lower()
+# Greedy split-cache steps replay as CUDA graphs unless MDLARC_DECODE_CUDA_GRAPHS=0.
+DECODE_CUDA_GRAPHS = os.environ.get("MDLARC_DECODE_CUDA_GRAPHS", "1").strip() != "0"
+if DECODE_CACHE not in ("split", "full"):
+    raise ValueError("MDLARC_DECODE_CACHE must be split or full.")
 
 
 def _grid_update(state, token_ids, start_id, sep_id, end_id, nl_id):
@@ -101,14 +106,7 @@ def _grid_update(state, token_ids, start_id, sep_id, end_id, nl_id):
     return torch.stack([next_x, next_y, next_z], dim=-1), torch.stack([pos_x, pos_y, pos_z], dim=-1)
 
 
-def _compile_inference(function, **kwargs):
-    # Compaction, prompt buckets and final speculative widths change shapes.
-    # Generalize tensor dimensions and retain Dynamo's bounded eager fallback:
-    # fullgraph=True turns its normal recompile limit into a fatal run error.
-    return torch.compile(function, mode="default", dynamic=True, fullgraph=False, **kwargs)
-
-
-_compiled_grid_update = _compile_inference(_grid_update)
+_compiled_grid_update = torch.compile(_grid_update, mode="default", fullgraph=True)
 
 
 def _speculative_grid_positions(state, tokens):
@@ -121,9 +119,13 @@ def _speculative_grid_positions(state, tokens):
     return torch.stack(states, dim=1), torch.stack(positions, dim=1)
 
 
-def _commit_speculative_block(draft, targets, hidden, grid_states, cache_lengths,
-                              attention_mask, emitted, finished, generated, token_limit):
-    """Commit a main-head-approved prefix and leave the correction uncached."""
+def _commit_speculative_tokens(draft, targets, hidden, grid_states, emitted, finished, generated, token_limit):
+    """Accept the main-head-approved draft prefix plus its correction.
+
+    Returns (anchor, grid_state, advance, emitted, finished, pending); advance is
+    each row's number of cached block tokens to keep (the pending token and the
+    accepted drafts). The correction stays uncached as the next pending token.
+    """
     width = targets.size(1)
     accepted = (draft == targets[:, :-1]).long().cumprod(dim=1).sum(dim=1)
     correction = targets.gather(1, accepted[:, None]).squeeze(1)
@@ -140,12 +142,21 @@ def _commit_speculative_block(draft, targets, hidden, grid_states, cache_lengths
     generated.scatter_(1, slots, torch.where(valid, outgoing, END_PAIR_TOKEN_ID))
     emitted = emitted + valid.long().sum(dim=1)
     finished = finished | (valid & is_end).any(dim=1) | (emitted >= token_limit)
-    cache_lengths = cache_lengths + torch.where(active, accepted + 1, 0)
-    attention_mask &= torch.arange(attention_mask.size(1), device=targets.device)[None, :] < cache_lengths[:, None]
+    advance = torch.where(active, accepted + 1, 0)
     anchor = hidden.gather(1, accepted[:, None, None].expand(-1, 1, hidden.size(-1))).squeeze(1)
     grid_state = grid_states.gather(1, (accepted + 1)[:, None, None].expand(-1, 1, 3)).squeeze(1)
     grid_state = torch.where(active[:, None], grid_state, grid_states[:, 0])
     pending = torch.where(finished, END_PAIR_TOKEN_ID, correction)
+    return anchor, grid_state, advance, emitted, finished, pending
+
+
+def _commit_speculative_block(draft, targets, hidden, grid_states, cache_lengths,
+                              attention_mask, emitted, finished, generated, token_limit):
+    """Commit a main-head-approved prefix and leave the correction uncached."""
+    anchor, grid_state, advance, emitted, finished, pending = _commit_speculative_tokens(
+        draft, targets, hidden, grid_states, emitted, finished, generated, token_limit)
+    cache_lengths = cache_lengths + advance
+    attention_mask &= torch.arange(attention_mask.size(1), device=targets.device)[None, :] < cache_lengths[:, None]
     return anchor, grid_state, cache_lengths, emitted, finished, pending
 
 
@@ -158,37 +169,8 @@ def _finish_generated_sequences(prompts, generated):
     return results
 
 
-def _decode_mask(model, attention_mask, cache_position, device):
-    # Split target/demo attention implements its own masks. In particular, do not
-    # synchronize cache_position to the CPU to build an unused Flex block mask.
-    if (device.type != "cuda" or getattr(model.config, "split_target_demo_attention", False)
-            or not hasattr(model, "build_decode_block_mask_for_step")):
-        return None
-    return model.build_decode_block_mask_for_step(
-        attention_mask, cache_position, attention_mask.size(1), device)
-
-
-def _compact_decode_batch(past_key_values, attention_mask, shared, keep):
-    """Amortize cache copies by shrinking only after at least 25% finish."""
-    batch_size = attention_mask.size(0)
-    def select(value):
-        if torch.is_tensor(value):
-            return value.index_select(0, keep) if value.ndim and value.size(0) == batch_size else value
-        if isinstance(value, tuple):
-            return tuple(select(item) for item in value)
-        return value
-    selected = {name: select(value) for name, value in shared.items() if name != "target_decode_cache"}
-    if "target_decode_cache" in shared:
-        rows = keep.cpu().tolist()
-        selected["target_decode_cache"] = tuple(
-            {"demo": target_demo_attention.select_decode_cache(layer["demo"], rows)}
-            for layer in shared["target_decode_cache"])
-    return select(tuple(past_key_values)), attention_mask.index_select(0, keep), selected
-
-
 def _batched_speculative_decode(model, outputs, past_key_values, attention_mask,
-                                initial_state, finished, current_len, token_limit, shared,
-                                compact_finished=True, compile_decode=True):
+                                initial_state, finished, current_len, token_limit, shared):
     """One pending main-head token plus K-1 auxiliary proposals per pass."""
     batch_size, capacity = attention_mask.shape
     latent_draft = getattr(model.config, "next_latent_prediction", False)
@@ -208,73 +190,473 @@ def _batched_speculative_decode(model, outputs, past_key_values, attention_mask,
     cache_lengths = torch.full_like(emitted, current_len)
     grid_state = initial_state
     anchor = outputs["hidden_states"][:, -1]
-    original_rows = torch.arange(batch_size, device=device)
-    completed = generated.new_full(generated.shape, END_PAIR_TOKEN_ID)
-    if compile_decode and not hasattr(model, "_compiled_verify"):
-        model._compiled_verify = _compile_inference(model.forward_verify)
-    if compile_decode and latent_draft and not hasattr(model, "_compiled_next_latent"):
-        model._compiled_next_latent = _compile_inference(model.predict_next_latent)
-    if compile_decode and not hasattr(model, "_compiled_mtp"):
-        model._compiled_mtp = _compile_inference(model.predict_mtp)
-        model._compiled_spec_positions = _compile_inference(_speculative_grid_positions)
-        model._compiled_spec_commit = _compile_inference(_commit_speculative_block)
-    verify = model._compiled_verify if compile_decode else model.forward_verify
-    if latent_draft:
-        next_latent = model._compiled_next_latent if compile_decode else model.predict_next_latent
-        draft_tokens = lambda anchor, pending: next_latent(anchor, pending)
-    else:
-        mtp = model._compiled_mtp if compile_decode else model.predict_mtp
-        draft_tokens = lambda anchor, pending: mtp(anchor)
-    grid_positions = model._compiled_spec_positions if compile_decode else _speculative_grid_positions
-    commit = model._compiled_spec_commit if compile_decode else _commit_speculative_block
+    if not hasattr(model, "_compiled_verify"):
+        model._compiled_verify = torch.compile(model.forward_verify, mode="default", fullgraph=True)
+    if latent_draft and not hasattr(model, "_compiled_next_latent"):
+        model._compiled_next_latent = torch.compile(model.predict_next_latent, mode="default", fullgraph=True)
+    if not latent_draft and not hasattr(model, "_compiled_mtp"):
+        model._compiled_mtp = torch.compile(model.predict_mtp, mode="default", fullgraph=True)
+    if not hasattr(model, "_compiled_spec_positions"):
+        model._compiled_spec_positions = torch.compile(_speculative_grid_positions, mode="default", fullgraph=True)
+        model._compiled_spec_commit = torch.compile(_commit_speculative_block, mode="default", fullgraph=True)
 
-    while True:
-        remaining = int((~finished).sum().item())
-        if not remaining:
-            break
-        if compact_finished and remaining * 4 <= finished.numel() * 3:
-            keep = (~finished).nonzero().flatten()
-            completed.index_copy_(0, original_rows, generated)
-            past_key_values, attention_mask, shared = _compact_decode_batch(
-                past_key_values, attention_mask, shared, keep)
-            generated, emitted, finished, pending, cache_lengths, grid_state, anchor, original_rows = (
-                value.index_select(0, keep) for value in
-                (generated, emitted, finished, pending, cache_lengths, grid_state, anchor, original_rows))
-            batch_size = remaining
+    while not bool(finished.all()):
         torch.compiler.cudagraph_mark_step_begin()
         # Shrink only at cache capacity; draft rejection never changes width.
         largest_start = int(torch.where(finished, 0, cache_lengths).max().item())
         width = min(width_limit, capacity - largest_start)
-        draft = draft_tokens(anchor, pending)[:, :width - 1] if width > 1 else pending.new_empty((batch_size, 0))
+        if width > 1:
+            proposals = model._compiled_next_latent(anchor, pending) if latent_draft else model._compiled_mtp(anchor)
+            draft = proposals[:, :width - 1]
+        else:
+            draft = pending.new_empty((batch_size, 0))
         tokens = torch.cat([pending[:, None], draft], dim=1)
         starts = torch.where(finished, cache_lengths.clamp(max=capacity - width), cache_lengths)
         slots = starts[:, None] + torch.arange(width, device=device)[None, :]
-        grid_states, positions = grid_positions(grid_state, tokens)
+        grid_states, positions = model._compiled_spec_positions(grid_state, tokens)
         key_valid = (~finished)[:, None] & (tokens != END_PAIR_TOKEN_ID).long().cumprod(dim=1).bool()
         key_valid = torch.where(finished[:, None], attention_mask.gather(1, slots), key_valid)
         attention_mask.scatter_(1, slots, key_valid)
-        block_mask = _decode_mask(model, attention_mask, slots, device)
-        verified = verify(input_ids=tokens, positions_3d=positions,
+        block_mask = model.build_decode_block_mask_for_step(attention_mask, slots, capacity, device) if device.type == "cuda" else None
+        verified = model._compiled_verify(input_ids=tokens, positions_3d=positions,
                                           past_key_values=tuple(past_key_values), attention_mask=attention_mask,
                                           cache_position=slots, decode_block_mask=block_mask,
                                           **shared)
-        verified_logits = _limit_target_grids(verified["logits"], grid_states[:, 1:, 2], shared.get("target_input_z"))
-        anchor, grid_state, cache_lengths, emitted, finished, pending = commit(
-            draft, verified_logits.argmax(dim=-1), verified["hidden_states"], grid_states,
+        active_rows = (~finished).long().sum()
+        previous_lengths = cache_lengths
+        anchor, grid_state, cache_lengths, emitted, finished, pending = model._compiled_spec_commit(
+            draft, verified["logits"].argmax(dim=-1), verified["hidden_states"], grid_states,
             cache_lengths, attention_mask, emitted, finished, generated, token_limit)
-    completed.index_copy_(0, original_rows, generated)
-    return completed[:, :token_limit]
+        # Diagnostics only, kept on device: each active row caches its accepted
+        # drafts plus the pending token, so the length change counts acceptances.
+        _speculative_stats(model, device).add_(torch.stack([
+            active_rows, (cache_lengths - previous_lengths).sum() - active_rows, active_rows * (width - 1)]))
+    return generated[:, :token_limit]
+
+
+def _speculative_stats(model, device):
+    """[active row verifications, accepted drafts, proposed drafts] for this process."""
+    stats = getattr(model, "_speculative_acceptance", None)
+    if stats is None:
+        stats = model._speculative_acceptance = torch.zeros(3, dtype=torch.long, device=device)
+    return stats
+
+
+def speculative_summary(model) -> Optional[str]:
+    stats = getattr(model, "_speculative_acceptance", None)
+    if stats is None:
+        return None
+    verifications, accepted, proposed = (int(value) for value in stats.tolist())
+    rate = accepted / proposed if proposed else 0.0
+    per_pass = (accepted + verifications) / verifications if verifications else 0.0
+    return (f"Speculative acceptance: {accepted}/{proposed} drafts ({100 * rate:.2f}%), "
+            f"{per_pass:.3f} tokens per verification over {verifications} row verifications")
+
+
+class _DoneMonitor:
+    """Sync-free stop check for a decode loop.
+
+    Each step copies its all-rows-finished flag into pinned host memory and
+    records an event. Before step i the loop reads the flag of step i - LAG,
+    whose event has long completed, so the CPU never waits on the step it just
+    queued and stays at most LAG steps ahead of the GPU. The cost is up to
+    LAG - 1 extra steps after the last row finishes; finished rows only emit
+    END, so outputs are unchanged. On the CPU the flag is read directly.
+    """
+
+    LAG = 4
+
+    def __init__(self, flag: torch.Tensor) -> None:
+        self.flag = flag
+        self.cuda = flag.device.type == "cuda"
+        if self.cuda:
+            self.host = torch.zeros(self.LAG, dtype=torch.bool, pin_memory=True)
+            self.events = [torch.cuda.Event() for _ in range(self.LAG)]
+
+    def record(self, index: int) -> None:
+        if self.cuda:
+            slot = index % self.LAG
+            self.host[slot:slot + 1].copy_(self.flag.view(1), non_blocking=True)
+            self.events[slot].record()
+
+    def done(self, index: int) -> bool:
+        if not self.cuda:
+            return bool(self.flag)
+        if index < self.LAG:
+            return False
+        slot = index % self.LAG
+        self.events[slot].synchronize()
+        return bool(self.host[slot])
+
+
+# Captured graphs and capture failures, for tests and logs.
+DECODE_GRAPH_STATS = {"captured": 0, "failed": 0}
+
+
+class _GraphedStep:
+    """Runs one decode step function per call, replayed as a CUDA graph.
+
+    The step reads and writes only fixed buffers. The first call runs a real
+    step on a side stream, which compiles kernels and initializes libraries
+    outside capture, then captures the same step without running it; every
+    later call replays the graph. Each call therefore executes exactly one step.
+    A failed capture is reported once per model and the step runs uncaptured.
+    """
+
+    def __init__(self, function, enabled: bool, owner) -> None:
+        self.function = function
+        self.enabled = enabled and not getattr(owner, "_decode_graph_failed", False)
+        self.owner = owner
+        self.graph = None
+
+    def __call__(self) -> None:
+        if self.graph is not None:
+            self.graph.replay()
+            return
+        if not self.enabled:
+            self.function()
+            return
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            self.function()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+                self.function()
+        except Exception as error:  # noqa: BLE001 - keep the evaluation running uncaptured
+            DECODE_GRAPH_STATS["failed"] += 1
+            self.enabled = False
+            self.owner._decode_graph_failed = True
+            print(f"CUDA graph capture of the decode step failed ({type(error).__name__}: {error}); "
+                  "decoding continues without graphs.", flush=True)
+            return
+        DECODE_GRAPH_STATS["captured"] += 1
+        self.graph = graph
+
+
+def _compiled_step(model, function):
+    """One compiled entry per step function and model (own Dynamo cache per function)."""
+    name = f"_compiled{function.__name__}"
+    compiled = model.__dict__.get(name)
+    if compiled is None:
+        compiled = torch.compile(function, mode="default", fullgraph=True)
+        setattr(model, name, compiled)
+    return compiled
+
+
+@contextlib.contextmanager
+def _decode_compile_settings():
+    """Compile a decode step once for all batch shapes.
+
+    Without this, every batch's new sizes (rows, demo and target slots), and
+    coincidences between them under duck shaping, recompiled the step; at the
+    recompile limit Dynamo silently ran it eagerly. Sizes are marked dynamic
+    up front, equal sizes stay independent symbols, and the limit is raised.
+    """
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(torch._dynamo.config.patch(recompile_limit=64))
+        shape_config = getattr(getattr(torch.fx, "experimental", None), "_config", None)
+        if shape_config is not None and hasattr(shape_config, "use_duck_shape"):
+            stack.enter_context(shape_config.patch(use_duck_shape=False))
+        yield
+
+
+def _mark_dynamic(*entries):
+    """Trace the varying dims (rows, cache slots) as symbols: ``(tensor, dims)`` pairs."""
+    mark = getattr(torch._dynamo, "maybe_mark_dynamic", None)
+    if mark is None:
+        return
+    for tensor, dims in entries:
+        if isinstance(tensor, torch.Tensor):
+            for dim in dims:
+                if dim < tensor.dim():
+                    mark(tensor, dim)
+
+
+def _mark_decode_dynamic(cache, *row_tensors):
+    """Batch rows and split-cache slots vary per decode batch."""
+    layers, demo_lengths, target_lengths, _ = cache
+    _mark_dynamic(*((tensor, (0,)) for tensor in (demo_lengths, target_lengths, *row_tensors)),
+                  *((tensor, (0, 1)) for layer in layers for tensor in layer))
+
+
+def _split_decode_step(model, next_token, logits, generated, step, finished, grid_state, cache, shared, all_done):
+    """One cached split-cache step over fixed buffers, with no host reads.
+
+    Picks the greedy token from ``logits`` unless ``next_token`` is given,
+    records it at column ``step``, advances the grid state, runs the cached
+    forward (which writes the token's keys at target_lengths) and leaves the
+    next logits in ``logits``. Finished rows keep emitting END.
+    """
+    if next_token is None:
+        next_token = logits[:, -1].argmax(dim=-1)
+    next_token = torch.where(finished, END_PAIR_TOKEN_ID, next_token)
+    generated.scatter_(1, step.expand(next_token.size(0), 1), next_token[:, None])
+    finished |= next_token == END_PAIR_TOKEN_ID
+    state, positions = _grid_update(grid_state, next_token, START_TOKEN_ID, IO_SEPARATOR_TOKEN_ID,
+                                    END_PAIR_TOKEN_ID, NEXT_LINE_TOKEN_ID)
+    grid_state.copy_(state)
+    output = model.forward_generate(input_ids=next_token[:, None], positions_3d=positions[:, None],
+                                    split_cache=cache, **shared)
+    logits.copy_(output["logits"])
+    cache[2].add_(1)
+    step.add_(1)
+    all_done.copy_(finished.all())
+
+
+def _split_greedy_decode(model, prefill_logits, cache, initial_state, finished, token_limit, shared,
+                         temperature, top_k, use_graphs):
+    """Token-at-a-time decode over a split cache; greedy steps replay as CUDA graphs."""
+    batch_size, device = finished.size(0), finished.device
+    generated = torch.full((batch_size, token_limit), END_PAIR_TOKEN_ID, dtype=torch.long, device=device)
+    if token_limit == 0:
+        return generated
+    greedy = (temperature is not None and temperature <= 0) or (temperature is None and top_k is None) or top_k == 1
+    logits = prefill_logits[:, -1:].clone()
+    step = torch.zeros(1, dtype=torch.long, device=device)
+    finished = finished.clone()
+    grid_state = initial_state.to(dtype=torch.int32).clone()
+    all_done = torch.zeros((), dtype=torch.bool, device=device)
+    compiled = _compiled_step(model, _split_decode_step)
+    buffers = (logits, generated, step, finished, grid_state, cache, shared, all_done)
+    _mark_decode_dynamic(cache, logits, generated, finished, grid_state, *_shared_row_tensors(shared))
+
+    def run(next_token=None):
+        with _decode_compile_settings():
+            compiled(model, next_token, *buffers)
+
+    runner = _GraphedStep(run, use_graphs and greedy and device.type == "cuda", model)
+    monitor = _DoneMonitor(all_done)
+    for index in range(token_limit):
+        if monitor.done(index):
+            break
+        if greedy:
+            runner()
+        else:
+            run(_select_next_token(logits, temperature=temperature, top_k=top_k))
+        monitor.record(index)
+    return generated
+
+
+def _shared_row_tensors(shared):
+    """Per-row tensors among the shared forward inputs (value embeddings may be None)."""
+    rows = [shared.get("example_ids"), shared.get("dihedral_ids"), shared.get("conditioning_embeds")]
+    rows.extend(shared.get("value_embeds") or ())
+    return [tensor for tensor in rows if isinstance(tensor, torch.Tensor)]
+
+
+def _split_speculative_step(model, anchor, pending, grid_state, cache, emitted, finished, generated, shared,
+                            all_done, stats, *, latent_draft, width, token_limit):
+    """Draft, verify and commit one block over fixed buffers, with no host reads."""
+    if latent_draft:
+        proposals = model.predict_next_latent(anchor, pending)
+    else:
+        proposals = model.predict_mtp(anchor)
+    draft = proposals[:, :width - 1]
+    tokens = torch.cat([pending[:, None], draft], dim=1)
+    grid_states, positions = _speculative_grid_positions(grid_state, tokens)
+    verified = model.forward_generate(input_ids=tokens, positions_3d=positions, split_cache=cache,
+                                      return_hidden_states=True, **shared)
+    active_rows = (~finished).long().sum()
+    new_anchor, new_state, advance, new_emitted, new_finished, new_pending = _commit_speculative_tokens(
+        draft, verified["logits"].argmax(dim=-1), verified["hidden_states"], grid_states,
+        emitted, finished, generated, token_limit)
+    # Diagnostics only, kept on device: each active row caches its accepted drafts plus the
+    # pending token, so advance counts acceptances (see speculative_summary).
+    stats.add_(torch.stack([active_rows, advance.sum() - active_rows, active_rows * (width - 1)]))
+    cache[2].add_(advance.to(cache[2].dtype))
+    anchor.copy_(new_anchor)
+    grid_state.copy_(new_state)
+    emitted.copy_(new_emitted)
+    finished.copy_(new_finished)
+    pending.copy_(new_pending)
+    all_done.copy_(finished.all())
+
+
+def _split_speculative_decode(model, outputs, cache, initial_state, finished, token_limit, width, shared, use_graphs):
+    """Self-speculative greedy decode over a split cache.
+
+    The target buffers leave ``width`` spare slots, so every block has the full
+    width (no capacity check); stale keys past a row's length are never read.
+    """
+    latent_draft = getattr(model.config, "next_latent_prediction", False)
+    if not getattr(model, "_speculative_mode_reported", False):
+        print(f"Speculative decoding: {'NextLat' if latent_draft else 'MTP'}; "
+              f"{width - 1} draft tokens per verification; greedy main-head verification.", flush=True)
+        model._speculative_mode_reported = True
+    batch_size, device = finished.size(0), finished.device
+    generated = torch.full((batch_size, token_limit + width), END_PAIR_TOKEN_ID, dtype=torch.long, device=device)
+    if token_limit == 0:
+        return generated[:, :0]
+    pending = torch.where(finished, END_PAIR_TOKEN_ID, outputs["logits"][:, -1].argmax(dim=-1))
+    generated[:, 0] = pending
+    emitted = torch.ones(batch_size, dtype=torch.long, device=device)
+    finished = finished | (pending == END_PAIR_TOKEN_ID) | (emitted >= token_limit)
+    anchor = outputs["hidden_states"][:, -1].clone()
+    grid_state = initial_state.clone()
+    all_done = finished.all().clone()
+    compiled = _compiled_step(model, _split_speculative_step)
+    stats = _speculative_stats(model, device)
+    buffers = (anchor, pending, grid_state, cache, emitted, finished, generated, shared, all_done, stats)
+    _mark_decode_dynamic(cache, anchor, pending, grid_state, emitted, finished, generated, *_shared_row_tensors(shared))
+
+    def run():
+        with _decode_compile_settings():
+            compiled(model, *buffers, latent_draft=latent_draft, width=width, token_limit=token_limit)
+
+    runner = _GraphedStep(run, use_graphs and device.type == "cuda", model)
+    monitor = _DoneMonitor(all_done)
+    # Every pass emits at least one token for each unfinished row.
+    for index in range(token_limit):
+        if monitor.done(index):
+            break
+        runner()
+        monitor.record(index)
+    return generated[:, :token_limit]
+
+
+def _full_decode_step(model, next_token, logits, generated, step, finished, grid_state, past_key_values,
+                      attention_mask, cache_position, shared, all_done):
+    """The ordinary step over the single padded cache, on fixed buffers (for graph replay)."""
+    if next_token is None:
+        next_token = logits[:, -1].argmax(dim=-1)
+    next_token = torch.where(finished, END_PAIR_TOKEN_ID, next_token)
+    generated.scatter_(1, step.expand(next_token.size(0), 1), next_token[:, None])
+    finished |= next_token == END_PAIR_TOKEN_ID
+    state, positions = _grid_update(grid_state, next_token, START_TOKEN_ID, IO_SEPARATOR_TOKEN_ID,
+                                    END_PAIR_TOKEN_ID, NEXT_LINE_TOKEN_ID)
+    grid_state.copy_(state)
+    attention_mask.scatter_(1, cache_position.expand(next_token.size(0), 1), (~finished)[:, None])
+    output = model.forward_generate(input_ids=next_token[:, None], positions_3d=positions[:, None],
+                                    past_key_values=past_key_values, attention_mask=attention_mask,
+                                    cache_position=cache_position, **shared)
+    logits.copy_(output["logits"])
+    cache_position.add_(1)
+    step.add_(1)
+    all_done.copy_(finished.all())
+
+
+def _full_speculative_step(model, anchor, pending, grid_state, past_key_values, attention_mask, cache_lengths,
+                           emitted, finished, generated, shared, all_done, stats, *, latent_draft, width, token_limit):
+    """The speculative block over the single padded cache, on fixed buffers (for graph replay).
+
+    The buffer keeps ``width`` spare slots, so blocks never shrink at capacity.
+    """
+    if latent_draft:
+        proposals = model.predict_next_latent(anchor, pending)
+    else:
+        proposals = model.predict_mtp(anchor)
+    draft = proposals[:, :width - 1]
+    tokens = torch.cat([pending[:, None], draft], dim=1)
+    capacity = attention_mask.size(1)
+    starts = torch.where(finished, cache_lengths.clamp(max=capacity - width), cache_lengths)
+    slots = starts[:, None] + torch.arange(width, device=tokens.device)[None, :]
+    grid_states, positions = _speculative_grid_positions(grid_state, tokens)
+    key_valid = (~finished)[:, None] & (tokens != END_PAIR_TOKEN_ID).long().cumprod(dim=1).bool()
+    key_valid = torch.where(finished[:, None], attention_mask.gather(1, slots), key_valid)
+    attention_mask.scatter_(1, slots, key_valid)
+    verified = model.forward_generate(input_ids=tokens, positions_3d=positions, past_key_values=past_key_values,
+                                      attention_mask=attention_mask, cache_position=slots,
+                                      return_hidden_states=True, **shared)
+    active_rows = (~finished).long().sum()
+    new_anchor, new_state, new_lengths, new_emitted, new_finished, new_pending = _commit_speculative_block(
+        draft, verified["logits"].argmax(dim=-1), verified["hidden_states"], grid_states,
+        cache_lengths, attention_mask, emitted, finished, generated, token_limit)
+    stats.add_(torch.stack([active_rows, (new_lengths - cache_lengths).sum() - active_rows,
+                            active_rows * (width - 1)]))
+    anchor.copy_(new_anchor)
+    grid_state.copy_(new_state)
+    cache_lengths.copy_(new_lengths)
+    emitted.copy_(new_emitted)
+    finished.copy_(new_finished)
+    pending.copy_(new_pending)
+    all_done.copy_(finished.all())
+
+
+def _graphed_full_decode(model, outputs, prompt_kvs, attention_mask, demo_mask, initial_state, finished,
+                         current_len, token_limit, width, shared, speculative):
+    """Greedy decode over the single padded cache with sync-free, graph-replayed steps.
+
+    For A/B comparison with the split cache (MDLARC_DECODE_CACHE=full on CUDA).
+    """
+    batch_size, device = finished.size(0), finished.device
+    capacity = (current_len + token_limit + width + 127) // 128 * 128
+    past_key_values = []
+    for keys, values in prompt_kvs:
+        buffers = []
+        for tensor in (keys, values):
+            buffer = tensor.new_zeros((*tensor.shape[:2], capacity, tensor.size(-1)))
+            buffer[:, :, :current_len] = tensor
+            buffers.append(buffer)
+        past_key_values.append(tuple(buffers))
+    past_key_values = tuple(past_key_values)
+    mask = torch.zeros((batch_size, capacity), dtype=torch.bool, device=device)
+    mask[:, :current_len] = attention_mask
+    full_demo = torch.zeros_like(mask)
+    full_demo[:, :current_len] = demo_mask
+    shared = dict(shared, demo_attention_mask=full_demo)
+    all_done = torch.zeros((), dtype=torch.bool, device=device)
+    dims = [(tensor, (0, 2)) for layer in past_key_values for tensor in layer]
+    dims += [(mask, (0, 1)), (full_demo, (0, 1))]
+    dims += [(tensor, (0,)) for tensor in _shared_row_tensors(shared)]
+    if speculative:
+        latent_draft = getattr(model.config, "next_latent_prediction", False)
+        generated = torch.full((batch_size, token_limit + width), END_PAIR_TOKEN_ID, dtype=torch.long, device=device)
+        if token_limit == 0:
+            return generated[:, :0]
+        pending = torch.where(finished, END_PAIR_TOKEN_ID, outputs["logits"][:, -1].argmax(dim=-1))
+        generated[:, 0] = pending
+        emitted = torch.ones(batch_size, dtype=torch.long, device=device)
+        finished = finished | (pending == END_PAIR_TOKEN_ID) | (emitted >= token_limit)
+        cache_lengths = torch.full_like(emitted, current_len)
+        anchor = outputs["hidden_states"][:, -1].clone()
+        grid_state = initial_state.clone()
+        all_done.copy_(finished.all())
+        compiled = _compiled_step(model, _full_speculative_step)
+        buffers = (anchor, pending, grid_state, past_key_values, mask, cache_lengths, emitted, finished,
+                   generated, shared, all_done, _speculative_stats(model, device))
+        _mark_dynamic(*dims, *((tensor, (0,)) for tensor in (anchor, pending, grid_state, cache_lengths,
+                                                              emitted, finished, generated)))
+
+        def run():
+            with _decode_compile_settings():
+                compiled(model, *buffers, latent_draft=latent_draft, width=width, token_limit=token_limit)
+    else:
+        generated = torch.full((batch_size, token_limit), END_PAIR_TOKEN_ID, dtype=torch.long, device=device)
+        if token_limit == 0:
+            return generated
+        logits = outputs["logits"][:, -1:].clone()
+        step = torch.zeros(1, dtype=torch.long, device=device)
+        cache_position = torch.tensor([current_len], dtype=torch.long, device=device)
+        finished = finished.clone()
+        grid_state = initial_state.to(dtype=torch.int32).clone()
+        compiled = _compiled_step(model, _full_decode_step)
+        buffers = (logits, generated, step, finished, grid_state, past_key_values, mask, cache_position,
+                   shared, all_done)
+        _mark_dynamic(*dims, *((tensor, (0,)) for tensor in (logits, generated, finished, grid_state)))
+
+        def run():
+            with _decode_compile_settings():
+                compiled(model, None, *buffers)
+    runner = _GraphedStep(run, True, model)
+    monitor = _DoneMonitor(all_done)
+    for index in range(token_limit):
+        if monitor.done(index):
+            break
+        runner()
+        monitor.record(index)
+    return generated[:, :token_limit]
 
 
 class BatchGridState:
-    def __init__(self, initial_state: torch.Tensor, *, compiled=True) -> None:
+    def __init__(self, initial_state: torch.Tensor) -> None:
         self.state = initial_state.to(dtype=torch.int32)
-        self.compiled = compiled
 
     def update(self, token_ids: torch.Tensor) -> torch.Tensor:
         token_ids = token_ids.view(-1).to(device=self.state.device)
-        update = _compiled_grid_update if self.compiled else _grid_update
-        self.state, positions = update(
+        self.state, positions = _compiled_grid_update(
             self.state, token_ids, START_TOKEN_ID, IO_SEPARATOR_TOKEN_ID, END_PAIR_TOKEN_ID, NEXT_LINE_TOKEN_ID
         )
         return positions
@@ -360,31 +742,50 @@ def _derive_initial_state_from_prompt(input_ids: torch.Tensor, positions_3d: tor
     return initial_state, finished
 
 
-@torch.inference_mode()
-def batched_greedy_generate(
-    model, prompts, example_ids, device, max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
-    cached_positions=None, temperature: Optional[float] = None, top_k: Optional[int] = None,
-    padded_prompt_length: Optional[int] = None,
-    dihedral_ids=None,
-    pair_identity_ids=None,
-    speculative=False,
-    compact_finished: bool = True,
-    use_prepared_cache: bool = True,
-    compile_decode: bool = True,
-    forced_prefixes=None,
-):
-    model.eval()
-    batch_size = len(prompts)
-    greedy = (temperature is not None and temperature <= 0) or (temperature is None and top_k is None) or top_k == 1
-    if speculative is True and not greedy:
-        raise ValueError("Self-speculative decoding requires greedy inference (temperature=0).")
-    if not isinstance(speculative, bool) and speculative != "auto":
-        raise ValueError("speculative must be a boolean or 'auto'.")
-    use_speculative = (speculative is True or (speculative == "auto" and greedy)) and (
-        getattr(model.config, "next_latent_prediction", False) or model.config.n_predict > 1)
-    if forced_prefixes is not None:
-        use_speculative = False  # Oracle tokens must enter through causal cache updates.
+@dataclass
+class PromptPrefill:
+    outputs: Dict[str, object]
+    # Prompt KVs copied into (batch, heads, max_model_len, dim) buffers; None when the
+    # caller asked for the raw prompt cache only (``full_cache=False``).
+    past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]]
+    attention_mask: torch.Tensor  # (batch, max_model_len) key validity, prompt part filled
+    current_len: int
+    max_model_len: int
+    initial_state: torch.Tensor
+    finished: torch.Tensor
+    example_ids: torch.Tensor
+    dihedral_ids: torch.Tensor
+    conditioning_embeds: torch.Tensor
+    value_embeds: object
+    split_kwargs: Dict[str, torch.Tensor]
+    prompt_attention_mask: Optional[torch.Tensor] = None  # (batch, current_len)
+    prompt_demo_mask: Optional[torch.Tensor] = None  # (batch, current_len), split models only
 
+
+def _full_kv_buffers(prompt_kvs, max_model_len: int, device) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    past_key_values = []
+    for k, v in prompt_kvs:
+        B, H, L, D = k.shape
+        k_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.bfloat16, device=device)
+        v_buf = torch.zeros((B, H, max_model_len, D), dtype=torch.bfloat16, device=device)
+        k_buf[:, :, :L, :] = k
+        v_buf[:, :, :L, :] = v
+        past_key_values.append((k_buf, v_buf))
+    return past_key_values
+
+
+@torch.inference_mode()
+def _prefill_prompts(
+    model, prompts, example_ids, device, *, max_new_tokens: int, cached_positions=None,
+    padded_prompt_length: Optional[int] = None, dihedral_ids=None, pair_identity_ids=None,
+    return_hidden_states: bool = False, full_cache: bool = True,
+) -> PromptPrefill:
+    """Left-pad and prefill prompts into KV buffers with room for ``max_new_tokens`` more tokens.
+
+    With ``full_cache=False`` the prompt KVs stay in ``outputs["past_key_values"]`` and no
+    padded decode buffers are allocated (the split-cache decode builds its own).
+    """
+    batch_size = len(prompts)
     example_ids_tensor = torch.tensor(example_ids, dtype=torch.int32, device=device)
     dihedral_ids_tensor = torch.tensor(
         [0] * batch_size if dihedral_ids is None else dihedral_ids,
@@ -415,12 +816,11 @@ def batched_greedy_generate(
         prompt_positions = compute_positions_3d(input_ids, attention_mask).to(device=device, dtype=torch.int32)
 
     initial_state, finished = _derive_initial_state_from_prompt(input_ids, prompt_positions)
-    grid_state = BatchGridState(initial_state, compiled=compile_decode)
-    current_len = input_ids.size(1)
 
     full_attention_mask = torch.zeros((batch_size, max_model_len), dtype=torch.bool, device=device)
     full_attention_mask[:, :current_len] = attention_mask
     split_kwargs = {}
+    demo_mask = None
     if getattr(model.config, "split_target_demo_attention", False):
         # Keep prefix membership explicitly with the KV cache. Output slots
         # always belong to the target branch, including speculative blocks.
@@ -440,99 +840,157 @@ def batched_greedy_generate(
         dihedral_ids=dihedral_ids_tensor,
         positions_3d=prompt_positions, attention_mask=attention_mask, conditioning_embeds=conditioning_embeds,
         value_embeds=value_embeds,
-        return_hidden_states=use_speculative,
+        return_hidden_states=return_hidden_states,
         **identity_kwargs,
     )
-    prompt_kvs = outputs["past_key_values"]
+    past_key_values = _full_kv_buffers(outputs["past_key_values"], max_model_len, device) if full_cache else None
+    return PromptPrefill(outputs, past_key_values, full_attention_mask, current_len, max_model_len,
+                         initial_state, finished, example_ids_tensor, dihedral_ids_tensor,
+                         conditioning_embeds, value_embeds, split_kwargs,
+                         prompt_attention_mask=attention_mask, prompt_demo_mask=demo_mask)
 
-    token_limit = min(max_new_tokens, max_model_len-current_len)
-    if getattr(model.config, "split_target_demo_attention", False) and use_prepared_cache:
-        past_key_values, demos, full_attention_mask, current_len = target_demo_attention.prepare_decode_cache(
-            prompt_kvs, full_demo_mask[:, :current_len], attention_mask, token_limit,
-            # One prepared demo cache per logical layer, so looped blocks get one per pass.
-            [model.blocks[layer_idx].attention for layer_idx in model.layer_schedule])
-        split_kwargs = {"target_decode_cache": tuple({"demo": cache} for cache in demos)}
-    else:
-        past_key_values = []
-        for pair in prompt_kvs:
-            buffers = []
-            for tensor in pair:
-                buffer = tensor.new_zeros((*tensor.shape[:2], max_model_len, tensor.size(-1)))
-                buffer[:, :, :tensor.size(2)] = tensor
-                buffers.append(buffer)
-            past_key_values.append(tuple(buffers))
-        del pair, tensor
-    # The full prompt caches otherwise remain live for the entire generation.
-    outputs = {name: value for name, value in outputs.items() if name != "past_key_values"}
-    del prompt_kvs
-    shared = dict(example_ids=example_ids_tensor, dihedral_ids=dihedral_ids_tensor,
-                  conditioning_embeds=conditioning_embeds, value_embeds=value_embeds, **split_kwargs)
-    if getattr(model.config, "predict_intermediate_grids", False):
-        shared["target_input_z"] = prompt_positions[:, -1, 2:3]
+
+@torch.inference_mode()
+def batched_greedy_generate(
+    model, prompts, example_ids, device, max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
+    cached_positions=None, temperature: Optional[float] = None, top_k: Optional[int] = None,
+    padded_prompt_length: Optional[int] = None,
+    dihedral_ids=None,
+    pair_identity_ids=None,
+    speculative: bool = False,
+    decode_cache: Optional[str] = None,
+    cuda_graphs: Optional[bool] = None,
+):
+    """Batched cached decoding of left-padded prompts.
+
+    Split target/demo models decode over a split demo/target cache read by
+    FlashAttention's cache kernel when available; greedy steps (ordinary and
+    speculative) are sync-free and replay as CUDA graphs. ``decode_cache``
+    ("split" or "full") and ``cuda_graphs`` override MDLARC_DECODE_CACHE and
+    MDLARC_DECODE_CUDA_GRAPHS for this call.
+    """
+    model.eval()
+    decode_cache = (decode_cache or DECODE_CACHE).lower()
+    if decode_cache not in ("split", "full"):
+        raise ValueError("decode_cache must be split or full.")
+    use_graphs = DECODE_CUDA_GRAPHS if cuda_graphs is None else bool(cuda_graphs)
+    batch_size = len(prompts)
+    greedy = (temperature is not None and temperature <= 0) or (temperature is None and top_k is None) or top_k == 1
+    if not isinstance(speculative, bool) and speculative != "auto":
+        raise ValueError("speculative must be a boolean or 'auto'.")
+    if speculative is True and not greedy:
+        raise ValueError("Self-speculative decoding requires greedy inference (temperature=0).")
+    # "auto": speculative exactly when the decode is greedy.
+    speculative = speculative is True or (speculative == "auto" and greedy)
+    use_speculative = speculative and (getattr(model.config, "next_latent_prediction", False)
+                                      or model.config.n_predict > 1)
+
+    prefill = _prefill_prompts(
+        model, prompts, example_ids, device, max_new_tokens=max_new_tokens, cached_positions=cached_positions,
+        padded_prompt_length=padded_prompt_length, dihedral_ids=dihedral_ids,
+        pair_identity_ids=pair_identity_ids, return_hidden_states=use_speculative, full_cache=False,
+    )
+    outputs = prefill.outputs
+    full_attention_mask, current_len, max_model_len = prefill.attention_mask, prefill.current_len, prefill.max_model_len
+    initial_state, finished = prefill.initial_state, prefill.finished
+    example_ids_tensor, dihedral_ids_tensor = prefill.example_ids, prefill.dihedral_ids
+    conditioning_embeds, value_embeds, split_kwargs = prefill.conditioning_embeds, prefill.value_embeds, prefill.split_kwargs
+    attention_mask, demo_mask = prefill.prompt_attention_mask, prefill.prompt_demo_mask
+    split_model = getattr(model.config, "split_target_demo_attention", False)
+
+    if decode_cache == "split" and split_model:
+        token_limit = min(max_new_tokens, max_model_len - current_len)
+        latent_draft = getattr(model.config, "next_latent_prediction", False)
+        width = (model.config.next_latent_horizon + 1 if latent_draft else model.config.n_predict) if use_speculative else 1
+        prompt_kvs = list(outputs.pop("past_key_values"))
+        head_dim = prompt_kvs[0][0].size(-1)
+        layers, demo_lengths, target_lengths = split_prompt_cache(
+            prompt_kvs, attention_mask, demo_mask, decode_slots=token_limit + width)
+        del prompt_kvs
+        kernel = choose_kv_cache_kernel(device, layers[0][0].dtype, head_dim, getattr(model.config, "FA", 2))
+        cache = (layers, demo_lengths, target_lengths, kernel)
+        shared = dict(example_ids=example_ids_tensor, dihedral_ids=dihedral_ids_tensor,
+                      conditioning_embeds=conditioning_embeds, value_embeds=value_embeds)
+        if use_speculative:
+            generated = _split_speculative_decode(model, outputs, cache, initial_state, finished,
+                                                  token_limit, width, shared, use_graphs)
+        else:
+            generated = _split_greedy_decode(model, outputs["logits"], cache, initial_state, finished,
+                                             token_limit, shared, temperature, top_k, use_graphs)
+        return _finish_generated_sequences(prompts, generated)
+
+    prompt_kvs = outputs["past_key_values"]
+    if use_graphs and greedy and device.type == "cuda" and split_model:
+        token_limit = min(max_new_tokens, max_model_len - current_len)
+        latent_draft = getattr(model.config, "next_latent_prediction", False)
+        width = (model.config.next_latent_horizon + 1 if latent_draft else model.config.n_predict) if use_speculative else 1
+        shared = dict(example_ids=example_ids_tensor, dihedral_ids=dihedral_ids_tensor,
+                      conditioning_embeds=conditioning_embeds, value_embeds=value_embeds)
+        generated = _graphed_full_decode(model, outputs, prompt_kvs, attention_mask, demo_mask, initial_state,
+                                         finished, current_len, token_limit, width, shared, use_speculative)
+        return _finish_generated_sequences(prompts, generated)
+
+    past_key_values = _full_kv_buffers(prompt_kvs, max_model_len, device)
+    grid_state = BatchGridState(initial_state)
 
     if use_speculative:
         generated = _batched_speculative_decode(
             model, outputs, past_key_values, full_attention_mask, initial_state, finished,
-            current_len, token_limit, shared, compact_finished=compact_finished, compile_decode=compile_decode)
+            current_len, min(max_new_tokens, max_model_len - current_len),
+            dict(example_ids=example_ids_tensor, dihedral_ids=dihedral_ids_tensor,
+                 conditioning_embeds=conditioning_embeds, value_embeds=value_embeds, **split_kwargs))
         return _finish_generated_sequences(prompts, generated)
 
-    if compile_decode and not hasattr(model, "_compiled_decode"):
+    if not hasattr(model, "_compiled_decode"):
         print("Compiling model for decoding step...")
-        model._compiled_decode = _compile_inference(model.forward_generate)
-    decode = model._compiled_decode if compile_decode else model.forward_generate
+        model._compiled_decode = torch.compile(model.forward_generate, mode="default", fullgraph=True)
 
     logits = outputs["logits"]
 
     cache_position = torch.tensor([current_len], dtype=torch.long, device=device)
-    steps_remaining = token_limit
+    steps_remaining = min(max_new_tokens, max_model_len - current_len)
     generated_tokens_buffer = torch.full((batch_size, steps_remaining), END_PAIR_TOKEN_ID, dtype=torch.long, device=device)
-    original_rows = torch.arange(batch_size, device=device)
-    forced = None
-    if forced_prefixes is not None:
-        if len(forced_prefixes) != batch_size or any(len(p) >= steps_remaining for p in forced_prefixes):
-            raise ValueError("Oracle prefixes require one row per prompt and room for the final grid")
-        forced = torch.full((batch_size, steps_remaining), -1, dtype=torch.long, device=device)
-        for row, prefix in enumerate(forced_prefixes):
-            forced[row, :len(prefix)] = torch.as_tensor(prefix, device=device)
 
+    all_done = torch.zeros((), dtype=torch.bool, device=device)
+    monitor = _DoneMonitor(all_done)
     for step_i in range(steps_remaining):
+        if monitor.done(step_i):
+            break
         torch.compiler.cudagraph_mark_step_begin()
         next_token = _select_next_token(
-            _limit_target_grids(logits, grid_state.state[:, 2:3], shared.get("target_input_z")),
+            logits,
             temperature=temperature,
             top_k=top_k,
         )
-        if forced is not None:
-            gold = forced[original_rows, step_i]
-            next_token = torch.where(gold >= 0, gold, next_token)
         next_token = torch.where(finished, torch.tensor(END_PAIR_TOKEN_ID, device=device), next_token)
-        generated_tokens_buffer[original_rows, step_i] = next_token
+        generated_tokens_buffer[:, step_i] = next_token
         finished = finished | (next_token == END_PAIR_TOKEN_ID)
-        remaining = int((~finished).sum().item())
-        if not remaining or step_i+1 == steps_remaining:
-            break
         token_positions = grid_state.update(next_token).unsqueeze(1)
-        # Sampling keeps its original row/RNG schedule. Greedy rows can be
-        # compacted without changing which output belongs to which attempt.
-        if compact_finished and greedy and remaining * 4 <= finished.numel() * 3:
-            keep = (~finished).nonzero().flatten()
-            past_key_values, full_attention_mask, shared = _compact_decode_batch(
-                past_key_values, full_attention_mask, shared, keep)
-            next_token, finished, token_positions, grid_state.state, original_rows = (
-                value.index_select(0, keep) for value in
-                (next_token, finished, token_positions, grid_state.state, original_rows))
         active_rows = ~finished
         full_attention_mask[:, cache_position] = active_rows.unsqueeze(1)
-        decode_block_mask = _decode_mask(model, full_attention_mask, cache_position, device)
-        outputs = decode(
-            input_ids=next_token.unsqueeze(1),
+        decode_block_mask = None
+        # The split two-lookup path masks with the cache masks and ignores this.
+        if not split_model and hasattr(model, "build_decode_block_mask_for_step"):
+            decode_block_mask = model.build_decode_block_mask_for_step(
+                attention_mask=full_attention_mask,
+                cache_position=cache_position,
+                kv_len=max_model_len,
+                device=device,
+            )
+        outputs = model._compiled_decode(
+            input_ids=next_token.unsqueeze(1), example_ids=example_ids_tensor,
+            dihedral_ids=dihedral_ids_tensor,
             past_key_values=tuple(past_key_values), positions_3d=token_positions,
             attention_mask=full_attention_mask, cache_position=cache_position,
+            conditioning_embeds=conditioning_embeds,
+            value_embeds=value_embeds,
             decode_block_mask=decode_block_mask,
-            **shared,
+            **split_kwargs,
         )
         logits = outputs["logits"]
         cache_position.add_(1)
+        all_done.copy_(finished.all())
+        monitor.record(step_i)
 
     return _finish_generated_sequences(prompts, generated_tokens_buffer)
 
@@ -549,6 +1007,8 @@ class InferenceAttempt:
     source_colors: List[int]
     original_input: List[List[int]]
     pair_identity_ids: Optional[List[int]] = None
+    # Block-upscale spec in the original orientation; identity unless scale views are on.
+    scale_factor: Tuple[int, int] = IDENTITY_SCALE
 
 
 @dataclass
@@ -1071,13 +1531,24 @@ def _build_inference_attempts(
                 augmentation_sampling_mode=mode,
                 protected_colors=getattr(dataset, "task_output_only_colors", {}).get(example.task_id, ()),
             )
+        scale_views = [IDENTITY_SCALE] * len(schedule)
+        if use_aug and getattr(dataset, "inference_scale_views", False):
+            # Specs every demonstration admits and that fit the projected test output
+            # (transductARC's demo bound), spread evenly over the existing views.
+            specs = demo_bounded_scale_specs(
+                target_input, [pair for pair in train_pairs if pair.get("output") is not None],
+                anisotropic=dataset.scale_anisotropic, max_specs=dataset.scale_max_specs)
+            scale_views = inference_scale_schedule(specs, len(schedule), _case_seed(
+                dataset.seed, example.task_id, example.pair_index, "scale-views"))
         for visit, schedule_item in enumerate(schedule):
+            scale = scale_views[visit]
             prompt_tensor, _ = dataset.build_context_sequence(
                 example,
                 {"input": target_input},
                 schedule_item.dihedral_index,
                 schedule_item.color_mapping,
                 visit=visit,
+                scale=None if is_identity_scale(scale) else scale,
             )
             prompt = prompt_tensor.tolist()
             prompt_tensor = prompt_tensor.unsqueeze(0)
@@ -1099,6 +1570,7 @@ def _build_inference_attempts(
                     original_input=[list(row) for row in target_input],
                     pair_identity_ids=dataset.pair_identity_ids(example, positions, visit=visit).tolist()
                         if getattr(dataset, "pair_identity_vertices", 0) else None,
+                    scale_factor=tuple(scale),
                 )
             )
     return attempts
@@ -1153,14 +1625,11 @@ def run_split_inference(
     task_ids: Optional[Sequence[str]] = None, pair_index: Optional[int] = None,
     temperature: Optional[float] = None, top_k: Optional[int] = None,
     augmentation_attempts: int = 0,
-    speculative=False,
-    prefill_token_budget: int = PREFILL_TOKEN_BUDGET,
-    oracle_intermediates: bool = False,
+    speculative: bool = False,
+    token_budget: Optional[int] = None,
 ) -> List[Dict[str, object]]:
-    chain = getattr(getattr(model, "config", None), "predict_intermediate_grids", False)
-    if oracle_intermediates and (split != "train" or not chain):
-        raise ValueError("Gold intermediates are restricted to labeled demo diagnostics, never test queries")
     use_aug = int(augmentation_attempts) > 0
+    token_budget = PREFILL_TOKEN_BUDGET if token_budget is None else int(token_budget)
     attempt_count = int(augmentation_attempts) if use_aug else 1
     work_items = _build_inference_attempts(
         dataset, split, task_ids, pair_index, attempt_count, use_aug
@@ -1172,21 +1641,13 @@ def run_split_inference(
         batch_size=batch_size,
         max_seq_len=model.config.max_seq_len,
         max_new_tokens=max_new_tokens,
-        token_budget=prefill_token_budget,
+        token_budget=token_budget,
     )
 
     for batch_index, inference_batch in enumerate(batches):
         batch = inference_batch.items
+
         def generate(current):
-            forced = None
-            if oracle_intermediates:
-                forced = []
-                for item in current:
-                    example = next(ex for ex in dataset.iter_examples(split="train")
-                                   if ex.task_id == item.task_id and ex.pair_index == item.pair_index)
-                    raw = [token for grid in dataset.target_intermediates(example, 0)
-                           for token in grid_to_tokens(apply_dihedral_transform(grid, item.dihedral_index), IO_SEPARATOR_TOKEN_ID)]
-                    forced.append([item.color_mapping[token] for token in raw])
             return batched_greedy_generate(
                 model=model,
                 prompts=[item.prompt for item in current],
@@ -1200,22 +1661,12 @@ def run_split_inference(
                 top_k=top_k,
                 padded_prompt_length=inference_batch.padded_prompt_length,
                 speculative=speculative,
-                **({"forced_prefixes": forced} if forced is not None else {}),
             )
         sequences = _generate_with_oom_splitting(batch, generate)
         for sequence, item in zip(sequences, batch):
             generated = list(sequence[len(item.prompt) :])
             if END_PAIR_TOKEN_ID in generated:
                 generated = generated[: generated.index(END_PAIR_TOKEN_ID)]
-            trace = generated
-            grids = [[]]
-            if chain:
-                for token in generated:
-                    if token == IO_SEPARATOR_TOKEN_ID:
-                        grids.append([])
-                    else:
-                        grids[-1].append(token)
-                generated = grids[-1]
             results.append(
                 {
                     "task_id": item.task_id,
@@ -1224,13 +1675,11 @@ def run_split_inference(
                     "sequence": list(sequence),
                     "output_tokens": generated,
                     "output_grid": tokens_to_grid(generated),
-                    **({"intermediate_grids": [tokens_to_grid(g) for g in grids[:-1]],
-                        "target_trace_tokens": trace,
-                        "oracle_intermediates": oracle_intermediates} if chain else {}),
                     "dihedral_index": item.dihedral_index,
                     "color_mapping": item.color_mapping,
                     "source_colors": item.source_colors,
                     "original_input": item.original_input,
+                    **({} if is_identity_scale(item.scale_factor) else {"scale_factor": list(item.scale_factor)}),
                 }
             )
         print(
@@ -1238,6 +1687,10 @@ def run_split_inference(
             f"(size={len(batch)}, prompt_bucket={inference_batch.padded_prompt_length})"
         )
 
+    if torch.device(device).type == "cuda":
+        print(f"[{split}] Decode peak allocated memory: {torch.cuda.max_memory_allocated(device) / 2**30:.1f} GiB "
+              f"({len(batches)} batches, batch cap {batch_size}, prefill token budget {token_budget})",
+              flush=True)
     return results
 
 
@@ -1283,8 +1736,9 @@ def _build_accuracy_attempts(
             )
         if not is_rectangular_grid(output):
             raise ValueError(f"Invalid output grid for {split} {item.task_id}:{item.pair_index}.")
+        scaled_output = output if is_identity_scale(item.scale_factor) else upscale_grid(output, item.scale_factor)
         output_tokens = grid_to_tokens(
-            apply_dihedral_transform(output, item.dihedral_index), END_PAIR_TOKEN_ID
+            apply_dihedral_transform(scaled_output, item.dihedral_index), END_PAIR_TOKEN_ID
         )
         tokens = torch.tensor(
             item.prompt + [item.color_mapping[token] for token in output_tokens],
@@ -1325,7 +1779,7 @@ def run_split_accuracy(
     solutions: Dict[str, object], batch_size: int = DEFAULT_EVAL_BATCH_SIZE,
     task_ids: Optional[Sequence[str]] = None, pair_index: Optional[int] = None,
     augmentation_attempts: int = 0,
-    prefill_token_budget: int = PREFILL_TOKEN_BUDGET,
+    token_budget: Optional[int] = None,
 ) -> Dict[str, object]:
     """Measure exact-output argmax accuracy with one forward per packed batch."""
     use_aug = int(augmentation_attempts) > 0
@@ -1338,7 +1792,8 @@ def run_split_accuracy(
     attempts = _build_accuracy_attempts(
         dataset, split, work_items, solutions, model.config.max_seq_len
     )
-    batches = _build_accuracy_batches(attempts, batch_size, token_budget=prefill_token_budget)
+    batches = _build_accuracy_batches(
+        attempts, batch_size, token_budget=PREFILL_TOKEN_BUDGET if token_budget is None else int(token_budget))
     model = _prepare_model_for_inference(model)
     metric_counts = torch.zeros(6, dtype=torch.long, device=device)
     for batch_index, batch in enumerate(batches):
@@ -1394,6 +1849,346 @@ def run_split_accuracy(
 
 
 # =============================================================================
+# Candidate re-scoring
+# =============================================================================
+
+# Top-2 selection rules over a decode's candidates: the vote count alone (as AAIVR
+# ranks them), the summed teacher-forced log-likelihood over every augmentation,
+# and votes with likelihood breaking ties.
+RESCORE_RULES = ("votes", "likelihood", "votes_then_likelihood")
+DEFAULT_RESCORE_TOP_K = 20
+
+
+@dataclass
+class RescoreAttempt:
+    inference: InferenceAttempt
+    candidate_index: int
+    tokens: torch.Tensor
+    positions: torch.Tensor
+
+
+def _load_rescore_candidates(path, top_k: int) -> Dict[Tuple[str, int], List[dict]]:
+    """Each test output's most-voted candidates from a decode's candidates.json.gz.
+
+    Input copies are dropped, as the voting filter drops them; ties keep dump order."""
+    with gzip.open(path, "rt") as handle:
+        data = json.load(handle)
+    candidates = {}
+    for pair in data["pairs"]:
+        kept = [entry for entry in pair["candidates"]
+                if not entry.get("input_copy") and is_rectangular_grid(entry["grid"])]
+        kept.sort(key=lambda entry: -int(entry["count"]))
+        candidates[(str(pair["task_id"]), int(pair["pair_index"]))] = kept[:max(1, int(top_k))]
+    return candidates
+
+
+def _candidate_output_tokens(item: InferenceAttempt, grid) -> List[int]:
+    """A canonical candidate grid as that attempt's output tokens (ending in the end token).
+
+    A scale view's candidate is block-upscaled before the dihedral, as its prompt grids are."""
+    if not is_identity_scale(item.scale_factor):
+        grid = upscale_grid(grid, item.scale_factor)
+    output_tokens = grid_to_tokens(apply_dihedral_transform(grid, item.dihedral_index), END_PAIR_TOKEN_ID)
+    return [item.color_mapping[token] for token in output_tokens]
+
+
+@torch.inference_mode()
+def _score_continuations_cached(
+    model, items: Sequence[InferenceAttempt], continuations: Sequence[Sequence[Sequence[int]]],
+    device: torch.device, padded_prompt_length: Optional[int] = None,
+) -> List[List[Optional[float]]]:
+    """Summed log-likelihood of every continuation after its row's prompt, prefilling each prompt once.
+
+    Each prompt goes through the decode's own prefill into a KV cache; every candidate is then
+    teacher-forced as one block over that cache (as speculative verification does), so the shared
+    prompt is computed once per view instead of once per candidate. None = does not fit."""
+    max_block = max(len(cont) - 1 for conts in continuations for cont in conts)
+    prefill = _prefill_prompts(
+        model, [item.prompt for item in items], [item.task_embedding_ids for item in items], device,
+        max_new_tokens=max(1, max_block), cached_positions=[item.positions for item in items],
+        padded_prompt_length=padded_prompt_length, dihedral_ids=[item.dihedral_index for item in items],
+        pair_identity_ids=[item.pair_identity_ids for item in items],
+    )
+    start, capacity = prefill.current_len, prefill.max_model_len
+    first = torch.log_softmax(prefill.outputs["logits"][:, -1].float(), dim=-1)
+    shared = dict(example_ids=prefill.example_ids, dihedral_ids=prefill.dihedral_ids,
+                  conditioning_embeds=prefill.conditioning_embeds, value_embeds=prefill.value_embeds,
+                  **prefill.split_kwargs)
+    batch_size = len(items)
+    scores: List[List[Optional[float]]] = [[None] * len(conts) for conts in continuations]
+    for index in range(max(len(conts) for conts in continuations)):
+        rows = [row for row in range(batch_size) if index < len(continuations[row])
+                and start + len(continuations[row][index]) - 1 <= capacity
+                and len(items[row].prompt) + len(continuations[row][index]) <= model.config.max_seq_len]
+        if not rows:
+            continue
+        width = max(1, max(len(continuations[row][index]) - 1 for row in rows))
+        tokens = torch.full((batch_size, width), END_PAIR_TOKEN_ID, dtype=torch.long)
+        targets = torch.zeros((batch_size, width + 1), dtype=torch.long)
+        lengths = torch.zeros(batch_size, dtype=torch.long)
+        positions = torch.zeros((batch_size, width, 3), dtype=torch.int32)
+        for row in rows:
+            cont, prompt = continuations[row][index], items[row].prompt
+            count = len(cont)
+            tokens[row, :count - 1] = torch.tensor(cont[:-1], dtype=torch.long)
+            targets[row, :count] = torch.tensor(cont, dtype=torch.long)
+            lengths[row] = count
+            # The same 3D positions the full prompt + candidate sequence gets.
+            full_positions = compute_positions_3d(torch.tensor(prompt + cont, dtype=torch.long)[None]).squeeze(0)
+            positions[row, :count - 1] = full_positions[len(prompt):len(prompt) + count - 1]
+        block_valid = (torch.arange(width)[None, :] < (lengths - 1).clamp(min=0)[:, None]).to(device)
+        attention_mask = prefill.attention_mask.clone()
+        attention_mask[:, start:] = False
+        attention_mask[:, start:start + width] = block_valid
+        slots = (start + torch.arange(width, device=device))[None, :].expand(batch_size, -1).contiguous()
+        block_mask = (model.build_decode_block_mask_for_step(attention_mask, slots, capacity, device)
+                      if device.type == "cuda" else None)
+        outputs = model.forward_generate(
+            input_ids=tokens.to(device), positions_3d=positions.to(device),
+            past_key_values=tuple(prefill.past_key_values), attention_mask=attention_mask,
+            cache_position=slots, decode_block_mask=block_mask, **shared,
+        )
+        targets = targets.to(device)
+        block = torch.log_softmax(outputs["logits"].float(), dim=-1).gather(
+            2, targets[:, 1:width + 1, None]).squeeze(2)
+        sums = first.gather(1, targets[:, :1]).squeeze(1) + (block * block_valid).sum(dim=1)
+        values = sums.tolist()
+        for row in rows:
+            scores[row][index] = values[row]
+        del outputs
+    return scores
+
+
+def _build_rescore_attempts(
+    work_items: Sequence[InferenceAttempt],
+    candidates: Dict[Tuple[str, int], List[dict]],
+    max_seq_len: int,
+) -> Tuple[List[RescoreAttempt], int]:
+    """Append each candidate, transformed like that attempt's prompt, to the prompt."""
+    attempts, too_long = [], 0
+    for item in work_items:
+        for index, entry in enumerate(candidates.get((str(item.task_id), int(item.pair_index)), ())):
+            tokens = torch.tensor(item.prompt + _candidate_output_tokens(item, entry["grid"]), dtype=torch.long)
+            if tokens.numel() > max_seq_len:
+                too_long += 1
+                continue
+            positions = compute_positions_3d(tokens.unsqueeze(0)).squeeze(0)
+            attempts.append(RescoreAttempt(item, index, tokens, positions))
+    return attempts, too_long
+
+
+def _rank_candidates(entries: Sequence[dict], rule: str) -> List[dict]:
+    if rule == "votes":
+        key = lambda entry: -entry["count"]
+    elif rule == "likelihood":
+        key = lambda entry: -entry["log_likelihood"]
+    elif rule == "votes_then_likelihood":
+        key = lambda entry: (-entry["count"], -entry["log_likelihood"])
+    else:
+        raise ValueError(f"Unknown rescore rule: {rule}")
+    return sorted(entries, key=key)
+
+
+@torch.inference_mode()
+def run_split_rescore(
+    model: TinyTransformer, dataset, split: str, device: torch.device,
+    candidates: Dict[Tuple[str, int], List[dict]], batch_size: int = DEFAULT_EVAL_BATCH_SIZE,
+    augmentation_attempts: int = 0, prefix_cache: bool = True,
+    task_ids: Optional[Sequence[str]] = None,
+) -> Dict[Tuple[str, int], List[dict]]:
+    """Sum each candidate's teacher-forced output log-likelihood over the inference schedule.
+
+    Every augmentation scores every candidate with the same prompt the decode used.
+    A candidate missing from some attempt (too long) gets -inf for that test output.
+    ``prefix_cache`` prefills each view's prompt once and scores all its candidates against the
+    cache; otherwise each prompt + candidate is a full packed sequence (the reference path).
+    """
+    use_aug = int(augmentation_attempts) > 0
+    work_items = _build_inference_attempts(
+        dataset, split, task_ids, None, int(augmentation_attempts) if use_aug else 1, use_aug,
+    )
+    model = _prepare_model_for_inference(model)
+    if prefix_cache:
+        totals, counts, sequences, too_long = _rescore_totals_cached(
+            model, work_items, candidates, device, batch_size, split)
+    else:
+        totals, counts, sequences, too_long = _rescore_totals_packed(
+            model, work_items, candidates, device, batch_size, split)
+    expected = {}
+    for item in work_items:
+        pair_key = (str(item.task_id), int(item.pair_index))
+        expected[pair_key] = expected.get(pair_key, 0) + 1
+    scored = {}
+    for pair_key, entries in candidates.items():
+        rows = []
+        for index, entry in enumerate(entries):
+            key = (*pair_key, index)
+            complete = counts.get(key, 0) == expected.get(pair_key, 0) and pair_key in expected
+            rows.append({"grid": entry["grid"], "count": int(entry["count"]),
+                         "log_likelihood": totals[key] if complete else float("-inf"),
+                         "scored_attempts": counts.get(key, 0)})
+        scored[pair_key] = rows
+    print(f"Rescored {sequences} sequences ({too_long} candidate attempts exceeded the model length; "
+          f"{'prefix-cached' if prefix_cache else 'full sequences'}).")
+    return scored
+
+
+def _rescore_totals_cached(model, work_items, candidates, device, batch_size, split):
+    totals: Dict[Tuple[str, int, int], float] = {}
+    counts: Dict[Tuple[str, int, int], int] = {}
+    sequences = too_long = 0
+    batches = _build_inference_batches(work_items, batch_size=batch_size, max_seq_len=model.config.max_seq_len,
+                                       max_new_tokens=DEFAULT_MAX_NEW_TOKENS)
+    for batch_index, inference_batch in enumerate(batches):
+        items = [item for item in inference_batch.items
+                 if candidates.get((str(item.task_id), int(item.pair_index)))]
+        if items:
+            continuations = [[_candidate_output_tokens(item, entry["grid"])
+                              for entry in candidates[(str(item.task_id), int(item.pair_index))]] for item in items]
+            scores = _score_continuations_cached(model, items, continuations, device,
+                                                 padded_prompt_length=inference_batch.padded_prompt_length)
+            for item, row in zip(items, scores):
+                for index, value in enumerate(row):
+                    if value is None:
+                        too_long += 1
+                        continue
+                    key = (str(item.task_id), int(item.pair_index), index)
+                    totals[key] = totals.get(key, 0.0) + value
+                    counts[key] = counts.get(key, 0) + 1
+                    sequences += 1
+        print(f"[{split}] Rescore batch {batch_index + 1} / {len(batches)} "
+              f"(prompts={len(items)}, prompt_bucket={inference_batch.padded_prompt_length})")
+    return totals, counts, sequences, too_long
+
+
+def _rescore_totals_packed(model, work_items, candidates, device, batch_size, split):
+    attempts, too_long = _build_rescore_attempts(work_items, candidates, model.config.max_seq_len)
+    batches = _build_accuracy_batches(attempts, batch_size)
+    totals: Dict[Tuple[str, int, int], float] = {}
+    counts: Dict[Tuple[str, int, int], int] = {}
+    for batch_index, batch in enumerate(batches):
+        lengths = torch.tensor([item.tokens.numel() for item in batch], dtype=torch.int32)
+        cu_seqlens = torch.zeros(len(batch) + 1, dtype=torch.int32)
+        cu_seqlens[1:] = lengths.cumsum(0)
+        input_ids = torch.cat([item.tokens for item in batch]).to(device)
+        sep_indices = torch.tensor(
+            [len(item.inference.prompt) - 1 for item in batch], dtype=torch.int32, device=device,
+        )
+        identity_kwargs = {}
+        if getattr(model.config, "pair_identity_vertices", 0):
+            identity_kwargs["pair_identity_ids"] = torch.cat([
+                F.pad(torch.tensor(item.inference.pair_identity_ids, dtype=torch.long),
+                      (0, item.tokens.numel() - len(item.inference.prompt))) for item in batch
+            ]).to(device)
+        outputs = model(
+            input_ids=input_ids,
+            example_ids=torch.tensor(
+                [item.inference.task_embedding_ids for item in batch], dtype=torch.int32, device=device,
+            ),
+            sep_indices=sep_indices,
+            dihedral_ids=torch.tensor(
+                [item.inference.dihedral_index for item in batch], dtype=torch.int32, device=device,
+            ),
+            positions_3d=torch.cat([item.positions for item in batch]).to(device),
+            cu_seqlens=cu_seqlens.to(device),
+            max_seqlen=int(lengths.max()),
+            compute_training_metrics=False,
+            compute_mtp_loss=False,
+            compute_next_latent_loss=False,
+            **identity_kwargs,
+        )
+        targets, valid = build_output_targets_and_mask(
+            input_ids, sep_indices, cu_seqlens=cu_seqlens.to(device),
+        )
+        token_log_probs = torch.log_softmax(outputs["logits"].float(), dim=-1).gather(
+            1, targets.clamp_min(0).unsqueeze(1)).squeeze(1) * valid
+        sequence_ids = torch.arange(len(batch), device=device).repeat_interleave(lengths.to(device))
+        sums = torch.zeros(len(batch), device=device).index_add_(0, sequence_ids, token_log_probs)
+        for item, value in zip(batch, sums.tolist()):
+            key = (str(item.inference.task_id), int(item.inference.pair_index), item.candidate_index)
+            totals[key] = totals.get(key, 0.0) + value
+            counts[key] = counts.get(key, 0) + 1
+        del outputs
+        print(f"[{split}] Rescore batch {batch_index + 1} / {len(batches)} (size={len(batch)})")
+    return totals, counts, len(attempts), too_long
+
+
+def rescore_selections(
+    model, dataset, selections: Sequence["AAIVRSelection"], device: torch.device, *,
+    batch_size: int = DEFAULT_EVAL_BATCH_SIZE, augmentation_attempts: int = 0,
+    top_k: int = DEFAULT_RESCORE_TOP_K, task_ids: Optional[Sequence[str]] = None, split: str = "test",
+) -> List["AAIVRSelection"]:
+    """Re-rank each output's ``top_k`` voted candidates by summed log-likelihood over the decode's views.
+
+    The rescored candidates come first (highest likelihood first, vote order on ties), then the
+    rest in vote order; the submitted top-2 are the two most likely."""
+    candidates = {(str(s.task_id), int(s.original_pair_index)): list(s.ranked_candidates[:max(1, int(top_k))])
+                  for s in selections if s.ranked_candidates}
+    scored = run_split_rescore(model, dataset, split, device, candidates, batch_size=batch_size,
+                               augmentation_attempts=augmentation_attempts, prefix_cache=True, task_ids=task_ids)
+    rescored = []
+    for selection in selections:
+        rows = scored.get((str(selection.task_id), int(selection.original_pair_index)))
+        if not rows:
+            rescored.append(selection)
+            continue
+        order = sorted(range(len(rows)), key=lambda j: -rows[j]["log_likelihood"])
+        ranked = [selection.ranked_candidates[j] for j in order] + list(selection.ranked_candidates[len(rows):])
+        rescored.append(replace(selection, ranked_candidates=ranked,
+                                selected_outputs=[entry["grid"] for entry in ranked[:2]],
+                                log_likelihoods=[rows[j]["log_likelihood"] for j in order]))
+    return rescored
+
+
+def write_rescore_report(directory, scored, solutions_path, *, metadata: dict) -> Path:
+    """One submission per selection rule, each scored like a decode, plus per-pair details."""
+    directory = Path(directory)
+    task_pairs: Dict[str, int] = {}
+    for task_id, pair_index in scored:
+        task_pairs[task_id] = max(task_pairs.get(task_id, 0), pair_index + 1)
+    solutions = {}
+    if solutions_path is not None and Path(solutions_path).is_file():
+        with Path(solutions_path).open() as handle:
+            solutions = json.load(handle)
+    rules = {}
+    for rule in RESCORE_RULES:
+        submission = {}
+        for task_id, num_pairs in task_pairs.items():
+            attempts = []
+            for pair_index in range(num_pairs):
+                ranked = _rank_candidates(scored.get((task_id, pair_index), []), rule)
+                grids = [entry["grid"] for entry in ranked[:2]] + [[[0]]] * 2
+                attempts.append({"attempt_1": grids[0], "attempt_2": grids[1]})
+            submission[task_id] = attempts
+        path = directory / f"rescore_{rule}_submission.json"
+        path.write_text(json.dumps(submission))
+        rules[rule] = {"submission": path.name}
+        if solutions:
+            from utils import score_arc_submission
+            result = score_arc_submission(Path(solutions_path), path)
+            rules[rule].update(score=result["score"], percentage=result["percentage"])
+    pairs = []
+    oracle_hits = 0
+    for (task_id, pair_index), entries in sorted(scored.items()):
+        truth = solutions.get(task_id, [None] * (pair_index + 1))
+        truth = truth[pair_index] if pair_index < len(truth) else None
+        hit = any(entry["grid"] == truth for entry in entries)
+        oracle_hits += hit
+        pairs.append({"task_id": task_id, "pair_index": pair_index, "correct_in_candidates": hit,
+                      "candidates": [{"count": entry["count"], "log_likelihood": entry["log_likelihood"],
+                                      "scored_attempts": entry["scored_attempts"],
+                                      "correct": entry["grid"] == truth} for entry in entries]})
+    report = {**metadata, "rules": rules, "num_test_outputs": len(pairs),
+              "test_outputs_with_correct_candidate": oracle_hits if solutions else None, "pairs": pairs}
+    path = directory / "rescore.json"
+    path.write_text(json.dumps(report, indent=1, allow_nan=True))
+    for rule, values in rules.items():
+        if "percentage" in values:
+            print(f"Rescore {rule}: {values['score']:g} ({values['percentage']:.2f}%)", flush=True)
+    return path
+
+
+# =============================================================================
 # AAIVR - Automated Augmentation Inverse Voting and Ranking
 # =============================================================================
 
@@ -1415,6 +2210,70 @@ class AAIVRSelection:
     num_valid: int
     discarded_non_rectangular: int
     discarded_input_copies: int
+    # Scale views whose output is not an exact block upscale (wrong size or mixed blocks).
+    discarded_scale_mismatch: int = 0
+    # Votes on candidates a demo-derived symbolic guard rejected, by rule.
+    guard_rejections: Dict[str, int] = field(default_factory=dict)
+    # Summed teacher-forced log-likelihood per rescored candidate grid (likelihood rescoring).
+    log_likelihoods: Optional[List[float]] = None
+
+
+def _candidate_annotations(raw_selections: Sequence[AAIVRSelection], final_selections: Sequence[AAIVRSelection],
+                           dataset, guards_on: bool) -> Dict[Tuple[str, int], Dict[tuple, Dict[str, object]]]:
+    """Per candidate grid: the symbolic guard that rejects it and its rescored log-likelihood."""
+    annotations: Dict[Tuple[str, int], Dict[tuple, Dict[str, object]]] = {}
+    guards_by_task: Dict[str, Dict[str, object]] = {}
+    for selection in raw_selections:
+        key = (str(selection.task_id), int(selection.original_pair_index))
+        entry = annotations.setdefault(key, {})
+        if not guards_on:
+            continue
+        task_id, index = key
+        if task_id not in guards_by_task:
+            guards_by_task[task_id] = symbolic_guards(
+                [pair for pair in dataset.pairs_by_task.get(task_id, []) if pair.get("output") is not None])
+        test_pairs = dataset.test_pairs_by_task.get(task_id, [])
+        test_input = test_pairs[index]["input"] if index < len(test_pairs) else None
+        for candidate in selection.ranked_candidates:
+            rule = symbolic_guard_rejection(guards_by_task[task_id], candidate["grid"], test_input)
+            if rule is not None:
+                entry.setdefault(_grid_to_tuple(candidate["grid"]), {})["guard"] = rule
+    for selection in final_selections:
+        if selection.log_likelihoods is None:
+            continue
+        entry = annotations.setdefault((str(selection.task_id), int(selection.original_pair_index)), {})
+        for candidate, value in zip(selection.ranked_candidates, selection.log_likelihoods):
+            entry.setdefault(_grid_to_tuple(candidate["grid"]), {})["log_likelihood"] = value
+    return annotations
+
+
+def apply_symbolic_guards(selections: Sequence[AAIVRSelection], dataset, top_k: int = 2) -> List[AAIVRSelection]:
+    """Drop candidates that break an invariant every demonstration shares; keep vote order.
+
+    A test output whose every candidate is rejected keeps its unfiltered ranking (a guess beats none)."""
+    guards_by_task: Dict[str, Dict[str, object]] = {}
+    guarded = []
+    for selection in selections:
+        task_id = str(selection.task_id)
+        if task_id not in guards_by_task:
+            demos = [pair for pair in dataset.pairs_by_task.get(task_id, []) if pair.get("output") is not None]
+            guards_by_task[task_id] = symbolic_guards(demos)
+        test_pairs = dataset.test_pairs_by_task.get(task_id, [])
+        index = int(selection.original_pair_index)
+        test_input = test_pairs[index]["input"] if index < len(test_pairs) else None
+        kept, rejections = [], {}
+        for entry in selection.ranked_candidates:
+            rule = symbolic_guard_rejection(guards_by_task[task_id], entry["grid"], test_input)
+            if rule is None:
+                kept.append(entry)
+            else:
+                rejections[rule] = rejections.get(rule, 0) + int(entry["count"])
+        if not kept:
+            kept = list(selection.ranked_candidates)
+        guarded.append(replace(selection, ranked_candidates=kept,
+                               selected_outputs=[entry["grid"] for entry in kept[:top_k]],
+                               guard_rejections=rejections))
+    return guarded
 
 
 def run_aaivr_on_results(
@@ -1435,7 +2294,7 @@ def run_aaivr_on_results(
         key = (str(task_id), int(pair_index))
         stats = case_map.setdefault(
             key,
-            {"counts": {}, "generated": 0, "valid": 0, "dropped_rect": 0, "dropped_input": 0},
+            {"counts": {}, "generated": 0, "valid": 0, "dropped_rect": 0, "dropped_input": 0, "dropped_scale": 0},
         )
         stats["generated"] += 1
         predicted_grid = res.get("output_grid", [])
@@ -1454,6 +2313,14 @@ def run_aaivr_on_results(
             else:
                 inverse = invert_color_mapping(mapping, source_colors)
             normalized_grid = apply_color_permutation_to_grid(predicted_grid, inverse)
+            scale = res.get("scale_factor")
+            if scale is not None and not is_identity_scale(scale):
+                # The output was generated in the scaled, dihedral-transformed frame.
+                normalized_grid = downscale_grid_exact(
+                    normalized_grid, oriented_scale_factor(scale, int(res.get("dihedral_index", 0))))
+                if normalized_grid is None:
+                    stats["dropped_scale"] += 1
+                    continue
             normalized_grid = apply_inverse_dihedral_transform(
                 normalized_grid, int(res.get("dihedral_index", 0))
             )
@@ -1489,6 +2356,7 @@ def run_aaivr_on_results(
                 num_valid=stats["valid"],
                 discarded_non_rectangular=stats["dropped_rect"],
                 discarded_input_copies=stats["dropped_input"],
+                discarded_scale_mismatch=stats["dropped_scale"],
             )
         )
     return selections
@@ -1559,13 +2427,8 @@ def run_evaluation(
     """
     cfg = argparse.Namespace(**vars(cfg))
     mode = getattr(cfg, "mode", "full-decode")
-    if mode not in ("full-decode", "accuracy-only", "intermediate-diagnostic"):
-        raise ValueError('Unknown evaluation mode.')
-    if mode == "intermediate-diagnostic":
-        splits = ("train",)
-    prefill_token_budget = getattr(cfg, "prefill_token_budget", PREFILL_TOKEN_BUDGET)
-    if type(prefill_token_budget) is not int or prefill_token_budget <= 0:
-        raise ValueError("prefill_token_budget must be a positive integer.")
+    if mode not in ("full-decode", "accuracy-only", "rescore"):
+        raise ValueError('Evaluation mode must be "full-decode", "accuracy-only" or "rescore".')
     timing_path = Path(timing_path)
     timing_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1576,7 +2439,6 @@ def run_evaluation(
     print(f"\n{'=' * 60}")
     mode_label = "Augmented" if getattr(cfg, "enable_aug", False) else "No-aug"
     print(f"STARTING EVALUATION: {run_name} ({mode}; {mode_label} augs: {max_augments})")
-    print(f"Evaluation batch cap: {batch_size}; prefill token budget: {prefill_token_budget}")
     print(f"{'=' * 60}\n")
 
     base_run_dir = Path("runs") / run_name
@@ -1601,44 +2463,29 @@ def run_evaluation(
         eval_task_ids=task_ids,
     )
     evaluation: Dict[str, Dict[str, object]] = {}
-    chain = getattr(getattr(model, "config", None), "predict_intermediate_grids", False)
-    if mode == "intermediate-diagnostic":
-        if not chain or use_aug:
-            raise ValueError("Intermediate diagnostics require a target-chain checkpoint and enable_aug=false")
-        manifest = json.loads(data_path.with_name("dataset_manifest.json").read_text())
-        holds = manifest.get("diagnostic_holdouts", [])
-        if not holds or any(h["pair_index"] != 0 for h in holds):
-            raise ValueError("Intermediate diagnostics require a prepared, withheld labeled-demo split")
-        import hashlib
-        for hold in holds:
-            pair = dataset.pairs_by_task[hold["task"]][0]
-            raw = json.dumps([pair["input"], pair["output"]], separators=(",", ":"), sort_keys=True).encode()
-            if hashlib.sha256(raw).hexdigest() != hold["io_sha256"]:
-                raise ValueError("Diagnostic pair differs from its withheld I/O identity")
-        selected = sorted(h["task"] for h in holds)[:int(getattr(cfg, "diagnostic_cases", 64))]
-        if not selected:
-            raise ValueError("No eligible labeled demo targets for the intermediate diagnostic")
-        diagnostic = {"protocol": "labeled evaluation demo targets withheld globally from pretraining and excluded from their own contexts",
-                      "held_out_from_pretraining": True,
-                      "official_arc_score": False, "cases": len(selected), "results": {}}
-        for oracle in (False, True):
-            results = run_split_inference(model, dataset, "train", device, batch_size=batch_size,
-                max_new_tokens=3 * DEFAULT_MAX_NEW_TOKENS, task_ids=selected, pair_index=0,
-                augmentation_attempts=0, speculative=getattr(cfg, "inference_speculative", "auto"),
-                prefill_token_budget=prefill_token_budget, oracle_intermediates=oracle)
-            correct = sum(item["output_grid"] == dataset.pairs_by_task[item["task_id"]][0]["output"] for item in results)
-            diagnostic["results"]["gold_intermediates" if oracle else "generated_intermediates"] = {
-                "final_grid_correct": correct, "total": len(results),
-                "final_grid_accuracy": correct / max(1, len(results)), "candidates": results}
-        diagnostic["gold_intermediate_accuracy_gain"] = (diagnostic["results"]["gold_intermediates"]["final_grid_accuracy"]
-            - diagnostic["results"]["generated_intermediates"]["final_grid_accuracy"])
-        path = base_run_dir / "intermediate_diagnostic.json"
-        path.write_text(json.dumps(diagnostic, indent=2) + chr(10))
-        print(f"Intermediate diagnostic: {diagnostic['cases']} demo targets; gold-intermediate gain={diagnostic['gold_intermediate_accuracy_gain']:.4f}")
-        return run_name, diagnostic, path
+    if mode == "rescore":
+        candidates_path = Path(cfg.candidates_path)
+        top_k = int(getattr(cfg, "rescore_top_k", None) or DEFAULT_RESCORE_TOP_K)
+        solutions_path = Path(getattr(cfg, "solutions_path", None) or data_path.with_name("solutions.json"))
+        scored = run_split_rescore(
+            model=model, dataset=dataset, split="test", device=device,
+            candidates=_load_rescore_candidates(candidates_path, top_k), batch_size=batch_size,
+            augmentation_attempts=max_augments if use_aug else 0,
+            prefix_cache=bool(getattr(cfg, "rescore_prefix_cache", True)),
+        )
+        t_duration = perf_counter() - t_start
+        rescore_path = write_rescore_report(
+            base_run_dir, scored, solutions_path if solutions_path.is_file() else None,
+            metadata={"mode": mode, "run_name": run_name, "checkpoint_path": str(checkpoint_path),
+                      "candidates_path": str(candidates_path), "top_k": top_k, "seed": int(cfg.seed),
+                      "max_augments": int(max_augments) if use_aug else 0, "duration_seconds": t_duration},
+        )
+        evaluation["test"] = {"summary": json.loads(rescore_path.read_text())["rules"]}
+        print(f"Finished {run_name}. Rescore report saved to {rescore_path}")
+        with timing_path.open("a") as handle:
+            handle.write(f"Evaluation {run_name} (rescore): {t_duration:.4f} s\n")
+        return (run_name, evaluation, rescore_path)
     if mode == "accuracy-only":
-        if chain:
-            raise ValueError("Target-chain checkpoints require generated evaluation or the intermediate diagnostic")
         solutions_path = Path(getattr(cfg, "solutions_path", None) or data_path.with_name("solutions.json"))
         solutions = {}
         if solutions_path.is_file():
@@ -1652,7 +2499,7 @@ def run_evaluation(
                 model=model, dataset=dataset, split=split, device=device,
                 solutions=solutions, batch_size=batch_size, task_ids=task_ids,
                 augmentation_attempts=max_augments if use_aug else 0,
-                prefill_token_budget=prefill_token_budget,
+                token_budget=getattr(cfg, "prefill_token_budget", None),
             )
             evaluation[split] = {"summary": summary}
             print(
@@ -1671,7 +2518,6 @@ def run_evaluation(
                 "seed": int(cfg.seed),
                 "enable_aug": use_aug,
                 "max_augments": int(max_augments) if use_aug else 0,
-                "prefill_token_budget": prefill_token_budget,
                 "duration_seconds": t_duration,
                 "splits": evaluation,
             }, handle, indent=2)
@@ -1690,12 +2536,12 @@ def run_evaluation(
             device=device,
             augmentation_attempts=max_augments if use_aug else 0,
             batch_size=batch_size,
-            max_new_tokens=(3 if chain else 1) * DEFAULT_MAX_NEW_TOKENS,
+            max_new_tokens=DEFAULT_MAX_NEW_TOKENS,
             task_ids=task_ids,
             temperature=getattr(cfg, "inference_temperature", None),
             top_k=getattr(cfg, "inference_top_k", None),
-            speculative=getattr(cfg, "inference_speculative", "auto"),
-            prefill_token_budget=prefill_token_budget,
+            speculative=getattr(cfg, "inference_speculative", False),
+            token_budget=getattr(cfg, "prefill_token_budget", None),
         )
         evaluation[split] = {
             "results": split_results,
@@ -1716,6 +2562,27 @@ def run_evaluation(
     else:
         print("No test results for AAIVR.")
 
+    # Selection after voting: symbolic guards drop candidates that break an invariant every demo
+    # shares; likelihood rescoring then re-ranks the surviving top candidates. The plain-vote
+    # top-2 (and votes + guards) stay reported beside the submitted top-2.
+    voted_results = aaivr_results
+    extra_top2: Dict[str, List[AAIVRSelection]] = {}
+    if aaivr_results and getattr(cfg, "inference_symbolic_guards", False):
+        aaivr_results = apply_symbolic_guards(aaivr_results, dataset)
+        extra_top2["top2_votes"] = voted_results
+        rejected = Counter()
+        for selection in aaivr_results:
+            rejected.update(selection.guard_rejections)
+        print(f"Symbolic guards rejected {sum(rejected.values())} votes: {dict(rejected.most_common())}")
+    if aaivr_results and getattr(cfg, "inference_rescore", False):
+        before_rescore = aaivr_results
+        aaivr_results = rescore_selections(
+            model, dataset, aaivr_results, device, batch_size=batch_size,
+            augmentation_attempts=max_augments if use_aug else 0,
+            top_k=int(getattr(cfg, "rescore_top_k", None) or DEFAULT_RESCORE_TOP_K), task_ids=task_ids,
+        )
+        extra_top2["top2_votes_guards" if "top2_votes" in extra_top2 else "top2_votes"] = before_rescore
+
     # Unfiltered candidate dump, plus oracle and top-2 scores whenever reference outputs exist. The
     # extra aggregation uses its own RNG, so the submission's voting and tie-breaks are unchanged.
     solutions_path = Path(getattr(cfg, "solutions_path", None) or data_path.with_name("solutions.json"))
@@ -1725,10 +2592,12 @@ def run_evaluation(
             raw_selections = run_aaivr_on_results(test_results, discard_input_copies=False, rng=random.Random(0))
             test_inputs = {(str(r["task_id"]), int(r["pair_index"])): r.get("original_input")
                            for r in test_results if r.get("task_id") is not None and r.get("pair_index") is not None}
-            write_candidate_dump(base_run_dir, raw_selections, test_inputs, max_augments if use_aug else 1)
+            write_candidate_dump(base_run_dir, raw_selections, test_inputs, max_augments if use_aug else 1,
+                                 annotations=_candidate_annotations(raw_selections, aaivr_results, dataset,
+                                                                    getattr(cfg, "inference_symbolic_guards", False)))
             if solutions_path.is_file():
                 write_oracle_report(base_run_dir, raw_selections, aaivr_results, solutions_path,
-                                    max_augments if use_aug else 1)
+                                    max_augments if use_aug else 1, extra_top2=extra_top2)
         except Exception as exc:
             print(f"Candidate dump or oracle scoring failed: {exc!r}")
 
@@ -1740,7 +2609,12 @@ def run_evaluation(
     t_duration = perf_counter() - t_start
     print(f"Finished {run_name}. Submission saved to {submission_path}")
     print(f"Evaluation took {t_duration:.2f}s")
+    acceptance = speculative_summary(model)
+    if acceptance:
+        print(acceptance)
     with timing_path.open("a") as handle:
         handle.write(f"Evaluation {run_name}: {t_duration:.4f} s\n")
+        if acceptance:
+            handle.write(f"Evaluation {run_name} {acceptance}\n")
 
     return (run_name, evaluation, submission_path)

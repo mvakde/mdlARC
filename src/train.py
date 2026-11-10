@@ -9,6 +9,7 @@ import json
 import math
 import numbers
 import os
+import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
@@ -18,7 +19,6 @@ import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 import distributed_training as distributed
-import parameter_efficient
 
 from checkpoint_io import save_checkpoint_atomically, save_rolling_checkpoint, validate_checkpoint_keep_last
 from build import should_reset_training_state
@@ -26,8 +26,6 @@ from common import (
     ARCExampleDataset,
     capture_rng_state,
     sequence_format_for_attention,
-    GRID_CHAIN_SEQUENCE_FORMAT,
-    SUPERVISED_GRID_CHAIN_SEQUENCE_FORMAT,
 )
 from tinytransformer import (
     RMSNorm,
@@ -41,6 +39,10 @@ _BATCH_DEVICE_DTYPES: Dict[str, torch.dtype] = {
     # any non-packed path that carries an attention mask.
     "attention_mask": torch.bool,
 }
+
+
+COMPILE_SCOPES = ("model", "blocks", "none")
+DEFAULT_COMPILE_SCOPE = "blocks"
 
 
 def _enable_compile_scalar_capture() -> None:
@@ -62,6 +64,110 @@ def _enable_compile_scalar_capture() -> None:
         dynamo_config.capture_dynamic_output_shape_ops = True
 
 
+COMPILE_MODES = ("default", "max-autotune-no-cudagraphs", "max-autotune", "reduce-overhead")
+
+
+def configure_compile(args: Any) -> Dict[str, Any]:
+    """Apply the spec's torch.compile options process-wide before compiling.
+
+    compiled_autograd replaces the autograd engine's per-kernel dispatch of the
+    backward pass with one compiled backward graph (the host side of the step on
+    a launch-bound GPU). compile_regions compiles the repeated transformer block
+    once and reuses it per application instead of compiling the unrolled schedule.
+    compile_mode is passed to torch.compile: the max-autotune modes let inductor
+    try Triton GEMM templates with fused epilogues (bias, SiLU, dropout) in
+    place of cuBLAS plus separate elementwise kernels, at a much longer compile;
+    reduce-overhead adds CUDA graphs, which only pay once input shapes are
+    bucketed. coordinate_descent_tuning searches pointwise/reduction kernel
+    launch configs more thoroughly at compile time.
+    """
+    _enable_compile_scalar_capture()
+    enabled: Dict[str, Any] = {"compiled_autograd": False, "compile_regions": False,
+                               "compile_mode": "default", "coordinate_descent_tuning": False}
+    mode = getattr(args, "compile_mode", None) or "default"
+    if mode not in COMPILE_MODES:
+        raise ValueError(f"compile_mode must be one of {COMPILE_MODES}, got {mode!r}.")
+    enabled["compile_mode"] = mode
+    if getattr(args, "coordinate_descent_tuning", False):
+        inductor_config = getattr(getattr(torch, "_inductor", None), "config", None)
+        if inductor_config is None or not hasattr(inductor_config, "coordinate_descent_tuning"):
+            raise RuntimeError("coordinate_descent_tuning requires torch._inductor.config.coordinate_descent_tuning.")
+        inductor_config.coordinate_descent_tuning = True
+        enabled["coordinate_descent_tuning"] = True
+    if getattr(args, "compiled_autograd", False):
+        dynamo_config = getattr(getattr(torch, "_dynamo", None), "config", None)
+        if dynamo_config is None or not hasattr(dynamo_config, "compiled_autograd"):
+            raise RuntimeError("compiled_autograd requires torch._dynamo.config.compiled_autograd.")
+        dynamo_config.compiled_autograd = True
+        enabled["compiled_autograd"] = True
+    if getattr(args, "compile_regions", False):
+        from tinytransformer import mark_block_compile_region
+        if not mark_block_compile_region():
+            raise RuntimeError("compile_regions requires torch.compiler.nested_compile_region (PyTorch >= 2.8).")
+        enabled["compile_regions"] = True
+    return enabled
+
+
+def compile_training_model(model: nn.Module, args: Any = None, *,
+                           backend: Optional[str] = None) -> Tuple[Any, Dict[str, Any]]:
+    """Apply the spec's compile options and compile ``model`` the way training does.
+
+    The trainer and the speed probe both go through here so a spec's
+    ``compile_mode`` reaches torch.compile in both; the probe once recorded the
+    mode while compiling with the default and measured the wrong thing.
+
+    ``compile_scope`` picks what is compiled. ``model`` compiles the whole forward as one
+    graph, so a looped stack is traced once per logical layer (8 blocks looped to 28
+    applications = 28 blocks in the graph); the first step took about ten minutes on the
+    NGC torch 2.14 image (``compile_regions`` marks the block as a nested compile region
+    for this scope). ``blocks`` (default) compiles each TransformerBlock's forward once and
+    keeps the outer loop eager: the looped blocks reuse their compiled graph on every
+    iteration, the module tree and state_dict are unchanged, and only the small glue
+    between blocks (loop input/output, norms, heads, losses) runs eager. ``none`` skips
+    compilation.
+    """
+    options = configure_compile(args)
+    scope = getattr(args, "compile_scope", None)
+    scope = DEFAULT_COMPILE_SCOPE if scope is None else str(scope)
+    if scope not in COMPILE_SCOPES:
+        raise ValueError(f"compile_scope must be one of {COMPILE_SCOPES}, got {scope!r}.")
+    options["compile_scope"] = scope
+    kwargs: Dict[str, Any] = {}
+    if backend is not None:
+        kwargs["backend"] = backend
+    if backend is None or options["compile_mode"] != "default":
+        kwargs["mode"] = options["compile_mode"]
+    if scope == "none":
+        return model, options
+    if scope == "model":
+        return torch.compile(model, **kwargs), options
+    blocks = list(model.blocks)
+    for block in blocks:
+        if not getattr(block, "_compiled_forward", False):
+            block.forward = torch.compile(block.forward, **kwargs)
+            block._compiled_forward = True
+    print(f"Compiling {len(blocks)} transformer blocks for training speedup "
+          f"(looped blocks reuse their compiled graph; glue between blocks runs eager)...")
+    return model, options
+
+
+def _move_value_to_device(value: Any, device: torch.device, non_blocking: bool) -> Any:
+    """Move tensors inside nested dicts (the collated attention layout) too."""
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device, non_blocking=non_blocking)
+    if isinstance(value, dict):
+        return {key: _move_value_to_device(item, device, non_blocking) for key, item in value.items()}
+    return value
+
+
+def _record_streams(value: Any, stream: torch.cuda.Stream) -> None:
+    if isinstance(value, torch.Tensor):
+        value.record_stream(stream)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _record_streams(item, stream)
+
+
 def _move_batch_to_device(
     batch: Dict[str, Any],
     device: torch.device,
@@ -70,19 +176,14 @@ def _move_batch_to_device(
     non_blocking = device.type == "cuda"
     for key, value in batch.items():
         target_dtype = _BATCH_DEVICE_DTYPES.get(key)
-        if key == "target_demo_layout":
-            moved[key] = value.to(device, non_blocking=non_blocking)
-        elif isinstance(value, torch.Tensor):
-            if target_dtype is None:
-                moved[key] = value.to(device=device, non_blocking=non_blocking)
-            else:
-                moved[key] = value.to(
-                    device=device,
-                    dtype=target_dtype,
-                    non_blocking=non_blocking,
-                )
+        if isinstance(value, torch.Tensor) and target_dtype is not None:
+            moved[key] = value.to(
+                device=device,
+                dtype=target_dtype,
+                non_blocking=non_blocking,
+            )
         else:
-            moved[key] = value
+            moved[key] = _move_value_to_device(value, device, non_blocking)
     return moved
 
 
@@ -128,16 +229,8 @@ class _DeviceBatchIterator:
         if self._stream is not None:
             current_stream = torch.cuda.current_stream(device=self._device)
             current_stream.wait_stream(self._stream)
-            def record(value):
-                if isinstance(value, torch.Tensor):
-                    value.record_stream(current_stream)
-                elif isinstance(value, dict):
-                    for child in value.values():
-                        record(child)
-                elif isinstance(value, (list, tuple)):
-                    for child in value:
-                        record(child)
-            record(self._next_batch)
+            for value in self._next_batch.values():
+                _record_streams(value, current_stream)
         batch = self._next_batch
         self._preload()
         return batch
@@ -367,6 +460,30 @@ def get_muon_momentum(
     return float(momentum_min + (momentum_max - momentum_min) * factor)
 
 
+def _apply_weight_decay(
+    params: List[torch.Tensor],
+    updates: List[torch.Tensor],
+    decay: float,
+    cautious: bool,
+) -> None:
+    """Decoupled weight decay before the step ``p -= lr * update``.
+
+    Cautious weight decay (Chen et al., 2025) decays a coordinate only where the
+    update and the weight share a sign, i.e. where the step already moves that
+    weight toward zero: ``p -= lr * wd * 1[update * p >= 0] * p``.
+    """
+    if not cautious:
+        torch._foreach_mul_(params, 1 - decay)
+        return
+    for p, update in zip(params, updates):
+        mask = (p * update >= 0).to(p.dtype)
+        p.addcmul_(p, mask, value=-decay)
+
+
+# Present only when enabled, so existing checkpoints keep identical optimizer hparams.
+_OPTIONAL_GROUP_KEYS = frozenset({"cautious_weight_decay"})
+
+
 class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
     """NorMuon optimizer: Muon for matrix weights, AdamW for everything else."""
 
@@ -385,7 +502,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 group["weight_decay"] = group.get("weight_decay", 0.1)
                 group["qkv_split"] = bool(group.get("qkv_split", False))
                 group["group_name"] = str(group.get("group_name", "muon"))
-                assert set(group.keys()) == {
+                assert set(group.keys()) - _OPTIONAL_GROUP_KEYS == {
                     "params",
                     "lr",
                     "momentum",
@@ -404,7 +521,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 group["eps"] = group.get("eps", 1e-10)
                 group["weight_decay"] = group.get("weight_decay", 0.1)
                 group["group_name"] = str(group.get("group_name", "adamw"))
-                assert set(group.keys()) == {
+                assert set(group.keys()) - _OPTIONAL_GROUP_KEYS == {
                     "params",
                     "lr",
                     "betas",
@@ -547,6 +664,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 )
                 beta2 = float(group["beta2"])
                 weight_decay = float(group["weight_decay"])
+                cautious = bool(group.get("cautious_weight_decay", False))
                 qkv_split = bool(group["qkv_split"])
                 normuon_bucket_size = self._normuon_bucket_size
 
@@ -578,9 +696,12 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                     params_to_update: List[torch.Tensor],
                     updates: List[torch.Tensor],
                     params_with_grad: List[torch.Tensor],
+                    updates_with_grad: List[torch.Tensor],
                 ) -> None:
                     if weight_decay and params_with_grad:
-                        torch._foreach_mul_(params_with_grad, 1 - lr * weight_decay)
+                        _apply_weight_decay(
+                            params_with_grad, updates_with_grad, lr * weight_decay, cautious
+                        )
                     if params_to_update:
                         torch._foreach_add_(params_to_update, updates, alpha=-lr)
 
@@ -608,10 +729,13 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                             beta2,
                             shape_scale,
                         )
+                        update = update.reshape_as(p)
+                        decays = bool(weight_decay and had_grad)
                         apply_muon_updates(
                             [p],
-                            [update.reshape_as(p)],
-                            [p] if weight_decay and had_grad else [],
+                            [update],
+                            [p] if decays else [],
+                            [update] if decays else [],
                         )
                         return
 
@@ -641,6 +765,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                     params_to_update: List[torch.Tensor] = []
                     updates: List[torch.Tensor] = []
                     params_with_grad: List[torch.Tensor] = []
+                    updates_with_grad: List[torch.Tensor] = []
                     for idx, (
                         p,
                         _grad,
@@ -660,8 +785,11 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                         updates.append(update_batch[idx].reshape_as(p))
                         if weight_decay and had_grad:
                             params_with_grad.append(p)
+                            updates_with_grad.append(updates[-1])
 
-                    apply_muon_updates(params_to_update, updates, params_with_grad)
+                    apply_muon_updates(
+                        params_to_update, updates, params_with_grad, updates_with_grad
+                    )
 
                 for bucket in buckets.values():
                     bucket_size = (
@@ -676,6 +804,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 beta2 = float(betas[1])
                 eps = float(group["eps"])
                 weight_decay = float(group["weight_decay"])
+                cautious = bool(group.get("cautious_weight_decay", False))
 
                 params: List[torch.Tensor] = []
                 grads: List[torch.Tensor] = []
@@ -683,6 +812,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                 exp_avg_sqs: List[torch.Tensor] = []
                 steps: List[int] = []
                 params_with_grad: List[torch.Tensor] = []
+                decay_indices: List[int] = []
 
                 for p in group["params"]:
                     grad = p.grad
@@ -704,6 +834,7 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                     steps.append(step)
                     if weight_decay and had_grad:
                         params_with_grad.append(p)
+                        decay_indices.append(len(params) - 1)
 
                 if not params:
                     continue
@@ -745,7 +876,12 @@ class SingleDeviceNorMuonWithAuxAdam(torch.optim.Optimizer):
                         )
 
                 if weight_decay and params_with_grad:
-                    torch._foreach_mul_(params_with_grad, 1 - lr * weight_decay)
+                    _apply_weight_decay(
+                        params_with_grad,
+                        [updates[index] for index in decay_indices],
+                        lr * weight_decay,
+                        cautious,
+                    )
                 torch._foreach_add_(params, updates, alpha=-lr)
         return loss
 
@@ -907,6 +1043,9 @@ def train_one_epoch(
     epoch_metric_counts = torch.zeros(6, device=device, dtype=torch.long)
 
     def loss_summary(output_sum, mtp_sum, total_sum, count, latent_sums=None) -> str:
+        if not track_aux:
+            average = distributed.summed(output_sum.reshape(1)) / (count * distributed.world_size())
+            return f"loss={average.item():.4f}"
         names, sums = ["loss"], [output_sum]
         if track_mtp:
             names.append("mtp_loss")
@@ -914,12 +1053,11 @@ def train_one_epoch(
         if track_next_latent:
             names.extend(("next_latent_loss", "next_latent_regression_loss", "next_latent_kl_loss"))
             sums.extend(latent_sums.unbind())
-        if track_aux:
-            names.append("total_loss")
-            sums.append(total_sum)
+        names.append("total_loss")
+        sums.append(total_sum)
         # Synchronize only when logging, with one read for every loss.
-        averages = distributed.summed(torch.stack(sums)) / (count * distributed.world_size())
-        return " ".join(f"{name}={value:.4f}" for name, value in zip(names, averages.tolist()))
+        values = (distributed.summed(torch.stack(sums)) / (count * distributed.world_size())).tolist()
+        return " ".join(f"{name}={value:.4f}" for name, value in zip(names, values))
 
     def maybe_log_window(force: bool = False) -> None:
         nonlocal window_count
@@ -999,24 +1137,24 @@ def train_one_epoch(
         with sync_context:
             with torch.autocast(
                 device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
-            ):
+            ), torch.profiler.record_function("forward"):
                 outputs = model(
                     input_ids,
                     example_ids,
                     dihedral_ids=batch.get("dihedral_ids"),
                     pair_identity_ids=batch.get("pair_identity_ids"),
-                    **({"target_demo_layout": batch["target_demo_layout"]}
-                       if "target_demo_layout" in batch else {}),
                     attention_mask=attention_mask,
                     sep_indices=sep_indices,
                     positions_3d=positions_3d,
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
                     compute_training_metrics=report_epoch_metrics,
+                    prefix_layout=batch.get("prefix_layout") if cu_seqlens is not None else None,
                 )
                 outputs = distributed.normalize_losses(outputs)
                 loss = outputs["loss"]
                 if distributed.active():
+                    # normalize_losses rescaled the parts; rebuild the total from them.
                     loss = outputs["output_loss"]
                     if use_mtp:
                         loss = loss + config.mtp_weight * outputs["mtp_loss"]
@@ -1066,7 +1204,8 @@ def train_one_epoch(
                 epoch_metric_counts.add_(metric_counts.detach())
 
             loss = loss / accum_target
-            loss.backward()
+            with torch.profiler.record_function("backward"):
+                loss.backward()
         accum_index += 1
 
         if accum_index >= accum_target:
@@ -1090,9 +1229,8 @@ def train_one_epoch(
                         steps_per_epoch
                     )
                     scheduler.step(epoch_progress)
-            optimizer.step()
-            if os.environ.pop("MDLARC_REPORT_FIRST_UPDATE", None) == "1" and distributed.rank() == 0:
-                print("MDLARC_STARTUP_EVENT first_optimizer_step", flush=True)
+            with torch.profiler.record_function("optimizer_step"):
+                optimizer.step()
             if before is not None:
                 _log_depth_diagnostics(model, before, grad_norm, step,
                                        log_location, log_handle, log_prefix)
@@ -1111,8 +1249,6 @@ def train_one_epoch(
                 )
                 scheduler.step(epoch_progress)
         optimizer.step()
-        if os.environ.pop("MDLARC_REPORT_FIRST_UPDATE", None) == "1" and distributed.rank() == 0:
-            print("MDLARC_STARTUP_EVENT first_optimizer_step", flush=True)
         optimizer_step += 1
         maybe_log_window()
 
@@ -1747,11 +1883,6 @@ def _build_optimizer(
     token_embedding_weight_decay: float,
     task_embedding_weight_decay: float,
 ) -> torch.optim.Optimizer:
-    if getattr(args, "finetune_method", None) == "lora":
-        # Adapters only, with the 600M LoRA sweeps' optimizer (src/checkpoint_adaptation.py).
-        adapters = [p for p in model.parameters() if p.requires_grad]
-        return torch.optim.AdamW([{"params": adapters, "group_name": "adamw_decay"}], lr=float(args.lora_lr),
-                                 weight_decay=float(args.lora_weight_decay), betas=(0.9, 0.999))
     optimizer_name = str(getattr(args, "optimizer", "normuon")).lower()
     adamw_lr = getattr(args, "adamw_lr", None)
     adamw_lr = 3e-4 if adamw_lr is None else float(adamw_lr)
@@ -1816,6 +1947,9 @@ def _build_optimizer(
         adam_group["group_name"] = group_name
         adam_group["lr"] = _adamw_group_lr(args, group_name, adamw_lr)
         normuon_param_groups.append(adam_group)
+    if bool(getattr(args, "cautious_weight_decay", False)):
+        for group in normuon_param_groups:
+            group["cautious_weight_decay"] = True
     return SingleDeviceNorMuonWithAuxAdam(
         normuon_param_groups,
         normuon_bucket_size=normuon_bucket_size,
@@ -1851,15 +1985,10 @@ def maybe_save_model(
         return
     save_path.parent.mkdir(parents=True, exist_ok=True)
     state_model = _unwrap_state_model(model)
-    if parameter_efficient.has_lora(state_model):
-        # Merged weights only: an ordinary inference checkpoint, not an adapter-training resume point.
-        optimizer = scheduler = None
     checkpoint = {
-        "sequence_format": (SUPERVISED_GRID_CHAIN_SEQUENCE_FORMAT if state_model.config.predict_intermediate_grids else
-                            GRID_CHAIN_SEQUENCE_FORMAT if getattr(dataset, "has_intermediate_grids", False)
-                            else sequence_format_for_attention(state_model.config.attention_pattern)),
+        "sequence_format": sequence_format_for_attention(state_model.config.attention_pattern),
         "augmentation_sampling_mode": getattr(dataset, "augmentation_sampling_mode", "full_task_prefix"),
-        "model_state": parameter_efficient.merged_model_state(state_model),
+        "model_state": state_model.state_dict(),
         "config": asdict(state_model.config),
         "task_ids": list(dataset.task_ids),
         "embedding_task_ids": list(dataset.embedding_task_ids),
@@ -1873,6 +2002,13 @@ def maybe_save_model(
         source_checkpoint = getattr(state_model, "_loaded_checkpoint", None)
         if isinstance(source_checkpoint, dict) and "task_variations" in source_checkpoint:
             checkpoint["task_variations"] = source_checkpoint["task_variations"]
+    if getattr(dataset, "capped_training_demos", False):
+        # Decoding defaults to capped contexts for these checkpoints (build._resolve_inference_max_demos).
+        checkpoint["demo_selection"] = {"training": "balanced_capped",
+                                        "max_training_demos": getattr(dataset, "max_training_demos", None)}
+    if getattr(dataset, "scale_augmentation", False):
+        checkpoint["scale_augmentation"] = {
+            "max_specs": int(dataset.scale_max_specs), "anisotropic": bool(dataset.scale_anisotropic)}
     if hasattr(dataset, "training_data_metadata"):
         checkpoint["task_data"] = dataset.training_data_metadata
     else:
@@ -2015,7 +2151,7 @@ def _save_checkpoint(
 # =============================================================================
 
 def _base_lr_schedule(args, optimizer):
-    """Fresh-run LR policy shared with bounded full-epoch benchmarks."""
+    """Fresh-run LR policy (warmup, stable, linear decay to each group's floor)."""
     total_epochs = max(0.0, float(args.epochs))
     warmup_pct = float(getattr(args, "warmup_pct", 0.02))
     warmup_pct = max(0.0, min(1.0, warmup_pct))
@@ -2102,6 +2238,7 @@ def _train_single_model(
 
     batch_sampler = getattr(dataloader, "batch_sampler", None)
     if batch_sampler is not None and hasattr(batch_sampler, "drop_last"):
+        # Family sampling keeps every selected pair (a short final batch included).
         batch_sampler.drop_last = not getattr(batch_sampler, "preserve_all_pairs", False)
     # The training loop finalizes drop_last after DataLoader construction.
     # Context color plans must follow these actual, potentially sparse visits
@@ -2151,14 +2288,14 @@ def _train_single_model(
     else:
         steps_per_epoch = default_steps_per_epoch
 
-    total_muon_steps = sum(
-        (math.ceil(epoch_steps / gradient_accumulation_steps) if preserve_all_pairs else epoch_steps // gradient_accumulation_steps)
-        for epoch_steps in epoch_lengths
-    )
-    completed_muon_steps = sum(
-        (math.ceil(epoch_steps / gradient_accumulation_steps) if preserve_all_pairs else epoch_steps // gradient_accumulation_steps)
-        for epoch_steps in epoch_lengths[:start_epoch]
-    )
+    def optimizer_updates(epoch_steps: int) -> int:
+        # A short final accumulation window still updates when every pair is kept.
+        if preserve_all_pairs:
+            return math.ceil(epoch_steps / gradient_accumulation_steps)
+        return epoch_steps // gradient_accumulation_steps
+
+    total_muon_steps = sum(optimizer_updates(epoch_steps) for epoch_steps in epoch_lengths)
+    completed_muon_steps = sum(optimizer_updates(epoch_steps) for epoch_steps in epoch_lengths[:start_epoch])
     completed_muon_steps = min(completed_muon_steps, total_muon_steps)
     if isinstance(optimizer, SingleDeviceNorMuonWithAuxAdam):
         optimizer.configure_muon_schedule(
@@ -2186,6 +2323,7 @@ def _train_single_model(
         _load_optimizer_state(optimizer, checkpoint["optimizer_state"], device)
         print("Restored optimizer state from checkpoint.")
         if resume_lr_changed:
+            # A continuation may set new base LRs; optimizer buffers are preserved.
             for group, base_lr in zip(optimizer.param_groups, configured_base_lrs):
                 group["lr"] = base_lr
                 group["initial_lr"] = base_lr
@@ -2267,9 +2405,10 @@ def _train_single_model(
             scheduler.step(float(start_epoch))
 
     if hasattr(torch, "compile") and device.type == "cuda":
-        _enable_compile_scalar_capture()
-        print("Compiling model for training speedup...")
-        training_model = torch.compile(model)
+        training_model, compile_options = compile_training_model(model, args)
+        active = [name if on is True else f"{name}={on}" for name, on in compile_options.items()
+                  if on not in (False, "default")]
+        print("Compiling model for training speedup" + (" with " + ", ".join(active) if active else "") + "...")
     else:
         training_model = model
 
@@ -2300,6 +2439,7 @@ def _train_single_model(
                 else default_steps_per_epoch
             )
 
+            epoch_started = time.perf_counter()
             step = train_one_epoch(
                 model=training_model,
                 dataloader=dataloader,
@@ -2318,6 +2458,12 @@ def _train_single_model(
                 log_location=log_location,
                 log_handle=log_handle,
             )
+            if device.type == "cuda":
+                # Wall time and running peak memory of the run so far (diagnostic only).
+                torch.cuda.synchronize(device)
+                print(f"epoch_stats epoch={epoch + 1} seconds={time.perf_counter() - epoch_started:.1f} "
+                      f"peak_allocated_gib={torch.cuda.max_memory_allocated(device) / 2**30:.2f} "
+                      f"peak_reserved_gib={torch.cuda.max_memory_reserved(device) / 2**30:.2f}", flush=True)
 
             if checkpoint_schedule and save_path is not None:
                 epoch_num = epoch + 1

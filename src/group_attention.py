@@ -10,14 +10,8 @@ import torch
 from common import END_PAIR_TOKEN_ID, START_TOKEN_ID
 
 
-def role_positions(positions: torch.Tensor, target_input_z: torch.Tensor,
-                   input_ids: torch.Tensor | None = None, *, ordered: bool = False,
-                   target_chain: bool = False) -> torch.Tensor:
-    """Map counters to fixed grid positions for the saved model.
-
-    Ordered chains use demo input/mid1/mid2/output 1/2/3/4 and target 5/6.
-    A lone intermediate occupies 3; missing stages consume no tokens.
-    The default preserves checkpoints with the older role mapping.
+def role_positions(positions: torch.Tensor, target_input_z: torch.Tensor) -> torch.Tensor:
+    """Map grid counters to demo roles 1/2 and target roles 3/4.
 
     target_input_z is the serialized grid number at the target separator,
     broadcastable to positions[..., 2]. Keep the counters in the caller's
@@ -25,36 +19,7 @@ def role_positions(positions: torch.Tensor, target_input_z: torch.Tensor,
     """
     z = positions[..., 2]
     roles = (z - 1).remainder(2) + 1
-    if input_ids is not None:
-        # END_PAIR closes the entire chain. Repeated IO separators delimit
-        # intermediate grids without splitting the demo's attention group.
-        length = input_ids.shape[-1]
-        index = torch.arange(length, device=input_ids.device).expand_as(input_ids)
-        boundary = (input_ids == END_PAIR_TOKEN_ID) | (input_ids == START_TOKEN_ID)
-        previous = torch.where(boundary, index, 0)
-        previous = torch.cat((torch.zeros_like(previous[..., :1]), previous[..., :-1]), dim=-1)
-        previous = previous.cummax(-1).values
-        first_z = z.gather(-1, previous) + 1
-        closing = torch.where(input_ids == END_PAIR_TOKEN_ID, index, length - 1)
-        closing = closing.flip(-1).cummin(-1).values.flip(-1)
-        last_z = z.gather(-1, closing)
-        stage = z - first_z
-        if ordered:
-            roles = stage + 1
-            lone_intermediate = (last_z - first_z == 2) & (stage == 1)
-            roles = torch.where(lone_intermediate, 3, roles)
-            roles = torch.where(z == last_z, 4, roles)
-        else:
-            roles = torch.where(stage == 0, 1, stage + 4)
-            roles = torch.where(z == last_z, 2, roles)
-    elif ordered:
-        roles = torch.where(roles == 1, 1, 4)
-    roles = torch.where(z == target_input_z, 5 if ordered else 3, roles)
-    roles = torch.where(z > target_input_z, 6 if ordered else 4, roles)
-    if target_chain:
-        # Causal stage IDs depend only on separators already consumed, never
-        # on the eventual number of target grids (which would leak the future).
-        roles = torch.where(z > target_input_z, 5 + (z - target_input_z).clamp(max=3), roles)
+    roles = torch.where(z >= target_input_z, roles + 2, roles)
     roles = torch.where(z > 0, roles, 0)
     return torch.cat((positions[..., :2], roles.unsqueeze(-1)), dim=-1)
 

@@ -1,3 +1,4 @@
+import dataclasses
 from dataclasses import dataclass, field
 import math
 from typing import Any, Dict, List, Optional, Tuple
@@ -5,9 +6,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from stable_losses import hard_target_cross_entropy
-from grid_chain import balanced_grid_weights, final_grid_mask, grid_stages
 
 try:
     from flash_attn import flash_attn_varlen_qkvpacked_func
@@ -23,11 +21,6 @@ try:
     from flash_attn import flash_attn_varlen_func
 except ImportError:  # pragma: no cover - flash-attn optional at import time
     flash_attn_varlen_func = None
-
-try:
-    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
-except (ImportError, AttributeError):  # optional CuTeDSL may have incompatible dependencies
-    flash_attn4_varlen_func = None
 
 try:
     import flash_attn_interface as flash_attn3_interface
@@ -47,6 +40,8 @@ except ImportError:  # pragma: no cover - flex-attention optional at import time
     flex_attention = None
     BlockMask = None
 
+from attention_runtime import load_fa4_varlen_func
+from stable_losses import hard_target_cross_entropy
 from common import (
     END_PAIR_TOKEN_ID,
     IGNORE_INDEX,
@@ -56,11 +51,11 @@ from common import (
     compute_positions_3d,
     normalize_attention_pattern,
 )
-from group_attention import packed_prefix_layout, padded_prefix_structure, role_positions
+from group_attention import padded_prefix_structure, role_positions
 from pair_identity import simplex_table
 from target_demo_attention import (
-    PreparedLayout, build_split_layout, packed_attention, padded_attention,
-    cached_attention, prepared_cached_attention,
+    cached_attention, packed_attention, packed_prefix_lm_layout_fields, padded_attention,
+    split_cache_attention,
 )
 from next_latent import NextLatentDynamics, next_latent_losses
 from research_options import loop_dense_pairs, loop_extension_shapes, validate_research_options
@@ -91,6 +86,13 @@ def _is_torch_compiling() -> bool:
 
 
 def _compile_safe_assert(condition: Any, message: str) -> None:
+    if torch.is_tensor(condition) and condition.device.type == "cuda":
+        # Device-side check. Reading the condition on the host (``torch._assert``
+        # or ``.item()``) stalls the CPU until the GPU drains its queue, three
+        # times per training step; the async form costs one tiny kernel and
+        # surfaces a failure as a CUDA assertion instead of a ValueError.
+        torch._assert_async(condition, message)
+        return
     if _is_torch_compiling() and hasattr(torch, "_assert"):
         torch._assert(condition, message)
         return
@@ -105,7 +107,7 @@ def _compile_safe_assert(condition: Any, message: str) -> None:
 
 def normalize_flash_attention_version(value: Any) -> int:
     if isinstance(value, bool):
-        raise TypeError("FA must be 2, 3 or 4, not a boolean.")
+        raise TypeError("FA must be 2 or 3, not a boolean.")
     try:
         version = int(value)
     except (TypeError, ValueError) as exc:
@@ -134,8 +136,6 @@ class TinyTransformerConfig:
     # Legacy checkpoints without these fields remain next-token models.
     n_predict: int = 1
     mtp_weight: float = 0.3
-    residual_init: str = "xavier"
-    branch_norm: str = "none"
     # Physical layers stay unique; only this [start, end) span is repeated.
     loop_iterations: int = 1
     loop_start_layer: Optional[int] = None
@@ -150,6 +150,7 @@ class TinyTransformerConfig:
     loop_streams: int = 0
     loop_stream_gate: str = "dynamic"
     loop_exit_weight: float = 0.0
+    loop_exit_iterations: Optional[Tuple[int, ...]] = None
     next_latent_prediction: bool = False
     next_latent_horizon: int = 1
     next_latent_hidden_dim: Optional[int] = None
@@ -159,8 +160,6 @@ class TinyTransformerConfig:
     rope_spatial_base: float = 1000.0
     attention_pattern: str = "dense"
     split_target_demo_attention: bool = False
-    ordered_grid_positions: bool = False
-    predict_intermediate_grids: bool = False
     pair_identity_vertices: int = 0
     pair_identity_strength: float = 0.25
     # Checkpoint identity, not a configurable architecture switch. Old unmarked
@@ -175,21 +174,11 @@ class TinyTransformerConfig:
         if self.pair_identity_vertices and (self.attention_pattern != "pair_group" or self.d_model < self.pair_identity_vertices - 1):
             raise ValueError("Simplex requires pair_group and width >= vertices-1")
         self.FA = normalize_flash_attention_version(self.FA)
-        if self.FA == 4 and self.attention_dropout != 0:
-            raise ValueError("FA=4 requires attention_dropout=0.0.")
         self.attention_pattern = normalize_attention_pattern(self.attention_pattern)
         if not isinstance(self.split_target_demo_attention, bool):
             raise ValueError("split_target_demo_attention must be boolean.")
         if self.split_target_demo_attention and self.attention_pattern != "pair_group":
             raise ValueError("Split target/demo attention requires attention_pattern='pair_group'.")
-        if not isinstance(self.ordered_grid_positions, bool):
-            raise ValueError("ordered_grid_positions must be a boolean")
-        if self.ordered_grid_positions and self.attention_pattern != "pair_group":
-            raise ValueError("Ordered grid positions require pair_group attention")
-        if not isinstance(self.predict_intermediate_grids, bool):
-            raise ValueError("predict_intermediate_grids must be boolean")
-        if self.predict_intermediate_grids and (not self.ordered_grid_positions or self.pair_identity_vertices):
-            raise ValueError("Supervised target grids require ordered pair-group positions and no pair identities")
         if not isinstance(self.task_embeddings, bool):
             raise ValueError("task_embeddings must be a boolean.")
         if not isinstance(self.dihedral_embeddings, bool):
@@ -198,11 +187,9 @@ class TinyTransformerConfig:
             raise ValueError("d_model must be divisible by n_heads.")
         if self.n_layers < 1:
             raise ValueError("n_layers must be >= 1.")
-        if self.residual_init not in ("xavier", "depth_scaled"):
-            raise ValueError("residual_init must be xavier or depth_scaled.")
-        if self.branch_norm not in ("none", "hidden_rms"):
-            raise ValueError("branch_norm must be none or hidden_rms.")
         validate_research_options(vars(self), n_layers=self.n_layers, require_complete=True)
+        if self.loop_exit_iterations is not None:
+            self.loop_exit_iterations = tuple(sorted(int(item) for item in self.loop_exit_iterations))
         if self.loop_iterations > 1 and (self.loop_start_layer is None or self.loop_end_layer is None):
             raise ValueError("Looping requires explicit loop_start_layer and loop_end_layer.")
         if self.input_shortcuts not in ("learned", "fixed"):
@@ -273,6 +260,9 @@ class PackedPrefixLMLayout:
     output_uses_full_kv: bool = False
 
 
+_LAYOUT_FIELDS = tuple(field.name for field in dataclasses.fields(PackedPrefixLMLayout))
+
+
 def _build_padded_output_targets_and_mask(
     input_ids: torch.Tensor,
     sep_indices: torch.Tensor,
@@ -333,11 +323,13 @@ def _build_varlen_output_targets_and_mask(
     seq_ids = torch.repeat_interleave(
         torch.arange(batch_size, device=device, dtype=torch.long),
         seq_lengths,
+        output_size=total_tokens,
     )
     local_positions = torch.arange(total_tokens, device=device, dtype=torch.long)
     local_positions = local_positions - torch.repeat_interleave(
         cu_seqlens[:-1].to(dtype=torch.long),
         seq_lengths,
+        output_size=total_tokens,
     )
     is_output_phase = local_positions >= sep_indices[seq_ids]
     valid_output = valid_mask & is_output_phase
@@ -394,15 +386,11 @@ class MultiHeadSelfAttention(nn.Module):
         )
         self._has_flash_attn_varlen_func = flash_attn_varlen_func is not None
         self._has_flash_attn3_varlen_func = flash_attn3_varlen_func is not None
-        self._has_flash_attn4_varlen_func = flash_attn4_varlen_func is not None
         self._has_flex_attention = flex_attention is not None
         self.flash_attention_version = config.FA
 
         self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-        # Native RMSNorm keeps the activation dtype and is compiler friendly;
-        # no explicit FP32 round trip or extra layout conversion is needed.
-        self.output_norm = nn.RMSNorm(config.d_model, eps=1e-6) if config.branch_norm == "hidden_rms" else None
         self.value_embed_gate_channels = min(32, config.d_model)
         self.value_embed_gate = (
             nn.Linear(self.value_embed_gate_channels, self.n_heads, bias=False)
@@ -412,7 +400,6 @@ class MultiHeadSelfAttention(nn.Module):
         # Attention dropout is intentionally separate from hidden dropout.
         self.dropout_p = float(config.attention_dropout)
         self.split_target_demo_attention = config.split_target_demo_attention
-        self.ordered_grid_positions = config.ordered_grid_positions
         # Construct the gate after shared model initialization, preserving the
         # exact baseline initial weights and RNG stream for a matched seed.
         self.target_demo_gate = None
@@ -586,6 +573,11 @@ class MultiHeadSelfAttention(nn.Module):
             scale=self.scale,
         )
 
+    @property
+    def _has_flash_attn4_varlen_func(self) -> bool:
+        # FA4 (CuTe DSL) is imported only when a model selects FA=4.
+        return self.flash_attention_version == 4 and load_fa4_varlen_func() is not None
+
     def _has_selected_varlen_flash_attention(self) -> bool:
         if self.flash_attention_version == 4:
             return self._has_flash_attn4_varlen_func
@@ -623,17 +615,29 @@ class MultiHeadSelfAttention(nn.Module):
 
         if self.flash_attention_version == 4:
             if not self._has_flash_attn4_varlen_func:
-                raise RuntimeError("FA=4 requires flash-attn-4; install requirements-fa4.txt on the CUDA host.")
+                raise RuntimeError(
+                    "FA=4 requires flash_attn.cute.interface.flash_attn_varlen_func "
+                    "(flash-attn-4 with nvidia-cutlass-dsl) or use FA=2."
+                )
             if float(dropout_p) != 0.0:
-                raise RuntimeError("FA=4 requires attention_dropout=0.0; attention dropout is unsupported.")
-            # CuTeDSL's fourth positional argument is qv, not cu_seqlens_q.
-            # Use explicit keywords and unwrap its (output, optional LSE) result.
-            output, _ = flash_attn4_varlen_func(
-                queries.contiguous(), keys.contiguous(), values.contiguous(),
-                cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
-                causal=is_causal, return_lse=False)
-            return output
+                raise RuntimeError(
+                    "FA=4 varlen attention does not expose attention dropout. "
+                    "Set attention_dropout=0.0 or use FA=2 to preserve dropout behavior."
+                )
+            result = load_fa4_varlen_func()(
+                queries.contiguous(),
+                keys.contiguous(),
+                values.contiguous(),
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=int(max_seqlen_q),
+                max_seqlen_k=int(max_seqlen_k),
+                softmax_scale=None,
+                causal=is_causal,
+            )
+            # The CuTe interface returns (output, lse) even without return_lse.
+            return result[0] if isinstance(result, tuple) else result
+
         if self.flash_attention_version == 3:
             if not self._has_flash_attn3_varlen_func:
                 raise RuntimeError(
@@ -645,7 +649,7 @@ class MultiHeadSelfAttention(nn.Module):
                     "FA=3 varlen attention does not expose attention dropout. "
                     "Set attention_dropout=0.0 or use FA=2 to preserve dropout behavior."
                 )
-            return flash_attn3_varlen_func(
+            result = flash_attn3_varlen_func(
                 queries.contiguous(),
                 keys.contiguous(),
                 values.contiguous(),
@@ -656,6 +660,8 @@ class MultiHeadSelfAttention(nn.Module):
                 softmax_scale=None,
                 causal=is_causal,
             )
+            # Current hopper builds return the output alone; older ones (out, lse).
+            return result[0] if isinstance(result, tuple) else result
 
         if self._has_flash_attn_varlen_func:
             return flash_attn_varlen_func(
@@ -712,12 +718,10 @@ class MultiHeadSelfAttention(nn.Module):
         prefix_lm_layout: PackedPrefixLMLayout,
         dropout_p: float,
         gate_logits: Optional[torch.Tensor] = None,
-        gate_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if prefix_lm_layout.split_target_demo_layout is not None:
             return packed_attention(self, queries, keys, values,
-                prefix_lm_layout.split_target_demo_layout, gate_logits, dropout_p,
-                hidden_states=gate_hidden_states)
+                prefix_lm_layout.split_target_demo_layout, gate_logits, dropout_p)
         attn_output = torch.empty_like(queries)
         prefix_keys = prefix_lm_layout.prefix_kv_indices
         if prefix_keys is None:
@@ -779,6 +783,7 @@ class MultiHeadSelfAttention(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         prefix_lm_layout: Optional[PackedPrefixLMLayout] = None,
+        rope_tables: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 2:
             if cu_seqlens is None:
@@ -800,16 +805,26 @@ class MultiHeadSelfAttention(nn.Module):
             queries, keys, values = qkv.unbind(1)
             qkv_dtype = queries.dtype
 
-            if pos_xyz is not None:
-                if pos_xyz.dim() != 2 or pos_xyz.size(0) != total_tokens:
+            if pos_xyz is not None or rope_tables is not None:
+                if rope_tables is None:
+                    if pos_xyz.dim() != 2 or pos_xyz.size(0) != total_tokens:
+                        raise ValueError(
+                            "Packed pos_xyz must have shape [total_tokens, 3]."
+                        )
+                    rope_tables = self.rope.tables(pos_xyz)
+                cos, sin = rope_tables
+                if cos.dim() != 2 or cos.size(0) != total_tokens:
                     raise ValueError(
-                        "Packed pos_xyz must have shape [total_tokens, 3]."
+                        "Packed rope tables must have shape [total_tokens, head_dim]."
                     )
-                q_f32 = queries.transpose(0, 1).unsqueeze(0).float()
-                k_f32 = keys.transpose(0, 1).unsqueeze(0).float()
-                q_f32, k_f32 = self.rope.apply_rotary(q_f32, k_f32, pos_xyz.unsqueeze(0))
-                queries = q_f32.squeeze(0).transpose(0, 1).to(dtype=qkv_dtype)
-                keys = k_f32.squeeze(0).transpose(0, 1).to(dtype=qkv_dtype)
+                # Rotate in fp32 directly in the [T, H, D] layout; the shared
+                # tables broadcast over heads, so no transposes are needed.
+                q_f32, k_f32 = self.rope.apply_rotary(
+                    queries.float(), keys.float(),
+                    tables=(cos.unsqueeze(1), sin.unsqueeze(1)),
+                )
+                queries = q_f32.to(dtype=qkv_dtype)
+                keys = k_f32.to(dtype=qkv_dtype)
 
             values = self._apply_value_embedding(
                 values,
@@ -824,7 +839,7 @@ class MultiHeadSelfAttention(nn.Module):
                     values=values,
                     prefix_lm_layout=prefix_lm_layout,
                     dropout_p=self.dropout_p if self.training else 0.0,
-                    gate_hidden_states=hidden_states if self.split_target_demo_attention else None,
+                    gate_logits=self.target_demo_gate(hidden_states) if self.split_target_demo_attention else None,
                 )
             else:
                 attn_output = self._apply_varlen_flash_attention(
@@ -839,8 +854,6 @@ class MultiHeadSelfAttention(nn.Module):
                     is_causal=is_causal,
                 )
             attn_output = attn_output.contiguous().view(total_tokens, dim)
-            if self.output_norm is not None:
-                attn_output = self.output_norm(attn_output)
             return self.out_proj(attn_output)
 
         if hidden_states.dim() != 3:
@@ -871,8 +884,7 @@ class MultiHeadSelfAttention(nn.Module):
         if self.split_target_demo_attention:
             attn_output = padded_attention(queries, keys, values, sdpa_mask,
                 pos_xyz[..., 2], self.target_demo_gate(hidden_states),
-                self.dropout_p if self.training else 0.0,
-                demo_role_max=4 if self.ordered_grid_positions else 2)
+                self.dropout_p if self.training else 0.0)
         else:
             attn_output = self._apply_attention(
                 queries, keys, values, attention_mask=attention_mask,
@@ -882,8 +894,6 @@ class MultiHeadSelfAttention(nn.Module):
         attn_output = (
             attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, dim)
         )
-        if self.output_norm is not None:
-            attn_output = self.output_norm(attn_output)
         return self.out_proj(attn_output)
 
     def forward_with_cache(
@@ -899,7 +909,7 @@ class MultiHeadSelfAttention(nn.Module):
         sdpa_mask: Optional[torch.Tensor] = None,
         prefix_lm_layout: Optional[PackedPrefixLMLayout] = None,
         demo_attention_mask: Optional[torch.Tensor] = None,
-        target_decode_cache: Optional[dict] = None,
+        split_cache: Optional[tuple] = None,
     ) -> Tuple[
         torch.Tensor,
         Optional[Tuple[torch.Tensor, torch.Tensor]],
@@ -928,6 +938,19 @@ class MultiHeadSelfAttention(nn.Module):
         )
 
         # ------------------------------------------------------------------
+        # PATH S: DECODE over a split demo/target cache (split attention only)
+        # ------------------------------------------------------------------
+        if split_cache is not None:
+            if not self.split_target_demo_attention:
+                raise ValueError("A split decode cache requires split target/demo attention.")
+            demo_keys, demo_values, target_keys, target_values, demo_lengths, target_lengths, kernel = split_cache
+            attn_output = split_cache_attention(
+                queries.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2),
+                (demo_keys, demo_values, target_keys, target_values), demo_lengths, target_lengths,
+                self.target_demo_gate(hidden_states), kernel)
+            return self.out_proj(attn_output.reshape(batch_size, seq_len, dim)), None
+
+        # ------------------------------------------------------------------
         # PATH A: DECODE (We have a cache buffer)
         # ------------------------------------------------------------------
         if past_key_value is not None:
@@ -937,9 +960,13 @@ class MultiHeadSelfAttention(nn.Module):
             if cache_position is not None:
                 positions = _cache_query_positions(cache_position, batch_size, seq_len)
                 if cache_position.dim() == 2:
-                    indices = positions[:, None, :, None].expand_as(keys)
-                    past_keys.scatter_(2, indices, keys)
-                    past_values.scatter_(2, indices, values)
+                    # index_put_ stays in place under torch.compile (a scatter_
+                    # into the input cache became a full copy per layer and call).
+                    rows = torch.arange(batch_size, device=keys.device)[:, None, None]
+                    heads = torch.arange(keys.size(1), device=keys.device)[None, :, None]
+                    slots = positions[:, None, :]
+                    past_keys.index_put_((rows, heads, slots), keys)
+                    past_values.index_put_((rows, heads, slots), values)
                 else:
                     past_keys.index_copy_(2, positions[0], keys)
                     past_values.index_copy_(2, positions[0], values)
@@ -961,12 +988,7 @@ class MultiHeadSelfAttention(nn.Module):
                 and queries.device.type == "cuda"
                 and attention_mask is not None
             )
-            if target_decode_cache is not None:
-                if attention_mask is None:
-                    raise ValueError("Prepared cached decoding requires attention_mask.")
-                attn_output = prepared_cached_attention(self, queries, key_layer, value_layer,
-                    hidden_states, attention_mask, query_positions, target_decode_cache['demo'])
-            elif self.split_target_demo_attention:
+            if self.split_target_demo_attention:
                 if demo_attention_mask is None or attention_mask is None:
                     raise ValueError("Split cached decoding requires demo_attention_mask and attention_mask.")
                 attn_output = cached_attention(queries, key_layer, value_layer,
@@ -1004,8 +1026,6 @@ class MultiHeadSelfAttention(nn.Module):
             )
 
             # --- Return ONLY the output. Cache is already updated. ---
-            if self.output_norm is not None:
-                attn_output = self.output_norm(attn_output)
             return self.out_proj(attn_output), None
 
         # ------------------------------------------------------------------
@@ -1017,7 +1037,7 @@ class MultiHeadSelfAttention(nn.Module):
                 return tensor.transpose(1, 2).reshape(-1, self.n_heads, self.head_dim).index_select(0, valid)
             packed_output = self._apply_varlen_prefix_lm_attention(
                 pack(queries), pack(keys), pack(values), prefix_lm_layout, dropout_p=0.0,
-                gate_hidden_states=hidden_states.reshape(-1, dim).index_select(0, valid)
+                gate_logits=self.target_demo_gate(hidden_states).reshape(-1, self.n_heads).index_select(0, valid)
                     if self.split_target_demo_attention else None,
             )
             flat_output = torch.zeros((batch_size * seq_len, self.n_heads, self.head_dim),
@@ -1026,8 +1046,7 @@ class MultiHeadSelfAttention(nn.Module):
             attn_output = flat_output.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         elif self.split_target_demo_attention:
             attn_output = padded_attention(queries, keys, values, sdpa_mask,
-                pos_xyz[..., 2], self.target_demo_gate(hidden_states), 0.0,
-                demo_role_max=4 if self.ordered_grid_positions else 2)
+                pos_xyz[..., 2], self.target_demo_gate(hidden_states), 0.0)
         else:
             attn_output = self._apply_attention(
                 queries,
@@ -1044,8 +1063,6 @@ class MultiHeadSelfAttention(nn.Module):
         )
 
         # --- Return output AND the new KVs so we can build the buffer ---
-        if self.output_norm is not None:
-            attn_output = self.output_norm(attn_output)
         return self.out_proj(attn_output), (keys, values)
 
 
@@ -1054,17 +1071,41 @@ class FeedForward(nn.Module):
         super().__init__()
         self.fc_in = nn.Linear(config.d_model, config.d_ff * 2)
         self.fc_out = nn.Linear(config.d_ff, config.d_model)
-        self.hidden_norm = nn.RMSNorm(config.d_ff, eps=1e-6) if config.branch_norm == "hidden_rms" else None
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states, gate = self.fc_in(hidden_states).chunk(2, dim=-1)
         hidden_states = hidden_states * F.silu(gate)
-        if self.hidden_norm is not None:
-            hidden_states = self.hidden_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.fc_out(hidden_states)
         return self.dropout(hidden_states)
+
+
+def mark_block_compile_region() -> bool:
+    """Compile the repeated transformer block once and stamp it out per application.
+
+    With 38 block applications per forward, tracing and compiling the unrolled
+    schedule took 5-9 minutes per run. torch.compiler.nested_compile_region
+    compiles the marked region on first encounter and reuses the compiled code
+    for every later call with matching inputs, while the loop glue, exits and
+    loss stay in the outer graph. Idempotent and process-wide: it wraps the
+    class method, so every block instance shares the region. Returns whether
+    this PyTorch supports it.
+    """
+    region = getattr(torch.compiler, "nested_compile_region", None)
+    if region is None:
+        return False
+    if not getattr(TransformerBlock, "_compile_region_marked", False):
+        TransformerBlock._eager_forward = TransformerBlock.forward
+        TransformerBlock.forward = region(TransformerBlock.forward)
+        TransformerBlock._compile_region_marked = True
+    return True
+
+
+def unmark_block_compile_region() -> None:
+    if getattr(TransformerBlock, "_compile_region_marked", False):
+        TransformerBlock.forward = TransformerBlock._eager_forward
+        TransformerBlock._compile_region_marked = False
 
 
 class TransformerBlock(nn.Module):
@@ -1133,6 +1174,7 @@ class TransformerBlock(nn.Module):
         dihedral_input_residual: Optional[torch.Tensor] = None,
         skip_ff: bool = False,
         norm_gains: Optional[torch.Tensor] = None,
+        rope_tables: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         hidden_states = self._apply_input_shortcut(
             hidden_states,
@@ -1154,6 +1196,7 @@ class TransformerBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             prefix_lm_layout=prefix_lm_layout,
+            rope_tables=rope_tables,
         )
         hidden_states = hidden_states + attn_output
 
@@ -1180,9 +1223,9 @@ class TransformerBlock(nn.Module):
         sdpa_mask: Optional[torch.Tensor] = None,
         prefix_lm_layout: Optional[PackedPrefixLMLayout] = None,
         demo_attention_mask: Optional[torch.Tensor] = None,
-        target_decode_cache: Optional[dict] = None,
         skip_ff: bool = False,
         norm_gains: Optional[torch.Tensor] = None,
+        split_cache: Optional[tuple] = None,
     ) -> Tuple[
         torch.Tensor,
         Optional[Tuple[torch.Tensor, torch.Tensor]],
@@ -1209,7 +1252,7 @@ class TransformerBlock(nn.Module):
                 sdpa_mask=sdpa_mask,
                 prefix_lm_layout=prefix_lm_layout,
                 demo_attention_mask=demo_attention_mask,
-                target_decode_cache=target_decode_cache,
+                split_cache=split_cache,
             )
         )
         hidden_states = hidden_states + attn_output
@@ -1243,6 +1286,9 @@ class TinyTransformer(nn.Module):
     def __init__(self, config: TinyTransformerConfig) -> None:
         super().__init__()
         self.config = config
+        # Training-loss option (not architecture, not saved in the config): the
+        # saturation-safe hard-target CE of stable_losses.py instead of F.cross_entropy.
+        self.stable_cross_entropy = False
         if config.pair_identity_vertices:
             self.register_buffer("pair_identity_table", simplex_table(config.pair_identity_vertices, config.d_model), persistent=False)
 
@@ -1307,14 +1353,6 @@ class TinyTransformer(nn.Module):
         )
         self.lm_head_mtp.apply(self._init_weights)
 
-        # Initialization only: preserve every other seeded weight and the RNG
-        # stream. Loaded checkpoint weights replace these values unchanged.
-        if config.residual_init == "depth_scaled":
-            with torch.no_grad():
-                scale = (2 * config.n_layers) ** -0.5
-                for block in self.blocks:
-                    block.attention.out_proj.weight.mul_(scale)
-                    block.ff.fc_out.weight.mul_(scale)
         # Optional modules must not perturb shared initialization or dropout RNG
         # in the matched baseline. Old checkpoints have neither of these keys.
         with torch.random.fork_rng(devices=[]):
@@ -1383,6 +1421,10 @@ class TinyTransformer(nn.Module):
             self._loop_dense_pairs = {pair: i for i, pair in enumerate(loop_dense_pairs(config.loop_iterations))}
         self._loop_iteration_of = tuple(iteration_of)
         self._loop_application = tuple(application)
+        # Deep supervision exits: every iteration but the last unless restricted.
+        self._loop_exit_iterations = frozenset(
+            config.loop_exit_iterations if config.loop_exit_iterations is not None
+            else range(1, config.loop_iterations))
         for name, shape in loop_extension_shapes(config).items():
             if name == "loop_gate_bias":
                 half = config.loop_gate_init / 2.0
@@ -1497,10 +1539,10 @@ class TinyTransformer(nn.Module):
         return hidden_states, state
 
     def _loop_exit_due(self, logical_idx) -> bool:
-        """Deep supervision: an early exit after every loop iteration but the last."""
+        """Deep supervision: an early exit after each selected loop iteration (never the last)."""
         iteration = self._loop_iteration_end.get(logical_idx)
         return (self.training and self.config.loop_exit_weight > 0 and self.config.loop_iterations > 1
-                and iteration is not None and iteration < self.config.loop_iterations)
+                and iteration is not None and iteration in self._loop_exit_iterations)
 
     def _loop_exit_states(self, exit_states, run_block):
         """Run the coda (blocks after the loop span) and the final norm on each early exit."""
@@ -1512,13 +1554,18 @@ class TinyTransformer(nn.Module):
             finished.append(self.norm(states))
         return finished
 
+    def _cross_entropy(self, logits, targets, *, ignore_index, reduction):
+        if self.stable_cross_entropy:
+            return hard_target_cross_entropy(logits, targets, ignore_index=ignore_index, reduction=reduction)
+        return F.cross_entropy(logits, targets, ignore_index=ignore_index, reduction=reduction)
+
     def _loop_exit_loss(self, exit_states, logits_fn, targets, valid_output, num_output_tokens):
         if not exit_states:
             return None
         losses = []
         for states in exit_states:
-            # Same saturation-safe CE as the final head, so exits match its numerics.
-            raw = hard_target_cross_entropy(logits_fn(states), targets, ignore_index=IGNORE_INDEX, reduction="none")
+            # Same CE as the final head, so exits match its numerics.
+            raw = self._cross_entropy(logits_fn(states), targets, ignore_index=IGNORE_INDEX, reduction="none")
             losses.append((raw * valid_output).sum() / num_output_tokens.clamp(min=1))
         return torch.stack(losses).mean()
 
@@ -1641,6 +1688,7 @@ class TinyTransformer(nn.Module):
         example_ids: torch.Tensor,
         *,
         seq_lengths: Optional[torch.Tensor] = None,
+        total_tokens: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         if not self.config.task_embeddings or not self.value_embedding_layers[layer_idx]:
             return None
@@ -1649,7 +1697,9 @@ class TinyTransformer(nn.Module):
             example_ids,
         )
         if seq_lengths is not None:
-            value_embed = torch.repeat_interleave(value_embed, seq_lengths, dim=0)
+            # A known output size keeps repeat_interleave from reading the
+            # lengths back to the host inside the compiled forward.
+            value_embed = torch.repeat_interleave(value_embed, seq_lengths, dim=0, output_size=total_tokens)
         return value_embed
 
     def compute_value_embeds(
@@ -1825,98 +1875,44 @@ class TinyTransformer(nn.Module):
         total_tokens: int,
         prefix_lengths: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
+        precomputed: Optional[dict] = None,
     ) -> PackedPrefixLMLayout:
-        """Build batch metadata eagerly, then resume compilation in the layers.
+        """Assemble the batch layout eagerly, then resume compilation in the layers.
 
-        Pair counts, ragged indices, active output sequences, and FlashAttention
-        maximum lengths depend on token values. Scalar/dynamic-shape capture
-        cannot safely trace their Python branches. Keep the entire layout here
-        (including causal output metadata) outside Dynamo rather than breaking
-        at individual data-dependent operations. No learned computation lives
-        here; the layout is built once and shared by all transformer layers.
+        Scalar/dynamic-shape capture cannot safely trace the layout's Python
+        branches, so the whole layout stays outside Dynamo. A layout collated on
+        the CPU is adopted when it matches this model's attention pattern;
+        otherwise it is rebuilt on the device.
         """
-        device = cu_seqlens.device
-        batch_size = int(cu_seqlens.numel()) - 1
-        seq_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
-            device=device, dtype=torch.long
-        )
-        prefix_lengths = prefix_lengths.to(device=device)
-        prefix_lengths = prefix_lengths.clamp(min=1)
-        prefix_lengths = torch.minimum(prefix_lengths, seq_lengths)
-        output_lengths = seq_lengths - prefix_lengths
+        with torch.profiler.record_function("packed_layout"):
+            if precomputed is not None:
+                layout = self._adopt_precomputed_layout(precomputed, cu_seqlens.device)
+                if layout is not None:
+                    return layout
+            return PackedPrefixLMLayout(**packed_prefix_lm_layout_fields(
+                cu_seqlens, total_tokens, prefix_lengths, input_ids,
+                attention_pattern=self.config.attention_pattern,
+                split_target_demo=self.config.split_target_demo_attention,
+            ))
 
-        seq_ids = torch.repeat_interleave(
-            torch.arange(batch_size, device=device, dtype=torch.long),
-            seq_lengths,
-        )
-        token_offsets = torch.repeat_interleave(
-            cu_seqlens[:-1].to(device=device, dtype=torch.long),
-            seq_lengths,
-        )
-        local_positions = torch.arange(total_tokens, device=device, dtype=torch.long)
-        local_positions = local_positions - token_offsets
-        prefix_mask = local_positions < prefix_lengths[seq_ids]
+    def _adopt_precomputed_layout(self, precomputed: dict, device) -> Optional[PackedPrefixLMLayout]:
+        if precomputed.get("attention_pattern") != self.config.attention_pattern:
+            return None
+        split_layout = precomputed.get("split_target_demo_layout")
+        if self.config.split_target_demo_attention and split_layout is None:
+            return None
 
-        prefix_token_indices = prefix_mask.nonzero(as_tuple=False).squeeze(-1)
-        prefix_cu_seqlens = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=device
-        )
-        prefix_cu_seqlens[1:] = torch.cumsum(
-            prefix_lengths.to(dtype=torch.int32), dim=0
-        )
+        def on_device(value):
+            if isinstance(value, torch.Tensor):
+                return value.to(device=device)
+            if isinstance(value, dict):
+                return {key: on_device(item) for key, item in value.items()}
+            return value
 
-        prefix_fields = dict(prefix_token_indices=prefix_token_indices,
-                             prefix_cu_seqlens=prefix_cu_seqlens,
-                             max_prefix_len=int(prefix_lengths.max().item()))
-        if self.config.attention_pattern == "pair_group":
-            if input_ids is None:
-                raise ValueError("Pair-group attention requires input_ids to identify pairs.")
-            prefix_fields = packed_prefix_layout(input_ids, cu_seqlens, prefix_lengths)
-            if self.config.split_target_demo_attention:
-                prefix_fields['split_target_demo_layout'] = build_split_layout(
-                    input_ids, cu_seqlens, prefix_lengths)
-
-        active_output = output_lengths > 0
-        if not torch.any(active_output):
-            return PackedPrefixLMLayout(
-                **prefix_fields,
-            )
-
-        output_token_indices = (~prefix_mask).nonzero(as_tuple=False).squeeze(-1)
-        active_output_lengths = output_lengths[active_output]
-        active_seq_lengths = seq_lengths[active_output]
-        active_batch_size = int(active_output.sum().item())
-        uses_full_kv = bool(torch.all(active_output).item())
-
-        output_cu_seqlens = torch.zeros(
-            active_batch_size + 1, dtype=torch.int32, device=device
-        )
-        output_cu_seqlens[1:] = torch.cumsum(
-            active_output_lengths.to(dtype=torch.int32), dim=0
-        )
-        if uses_full_kv:
-            output_kv_indices = None
-            output_kv_cu_seqlens = cu_seqlens
-        else:
-            output_kv_mask = active_output[seq_ids]
-            output_kv_indices = output_kv_mask.nonzero(as_tuple=False).squeeze(-1)
-            output_kv_cu_seqlens = torch.zeros(
-                active_batch_size + 1, dtype=torch.int32, device=device
-            )
-            output_kv_cu_seqlens[1:] = torch.cumsum(
-                active_seq_lengths.to(dtype=torch.int32), dim=0
-            )
-
-        return PackedPrefixLMLayout(
-            **prefix_fields,
-            output_token_indices=output_token_indices,
-            output_cu_seqlens=output_cu_seqlens,
-            output_kv_indices=output_kv_indices,
-            output_kv_cu_seqlens=output_kv_cu_seqlens,
-            max_output_len=int(active_output_lengths.max().item()),
-            max_output_kv_len=int(active_seq_lengths.max().item()),
-            output_uses_full_kv=uses_full_kv,
-        )
+        fields = {name: on_device(precomputed[name]) for name in _LAYOUT_FIELDS if name in precomputed}
+        # A model without split attention must not route through the split path.
+        fields["split_target_demo_layout"] = on_device(split_layout) if self.config.split_target_demo_attention else None
+        return PackedPrefixLMLayout(**fields)
 
     def _get_decode_block_mask(
         self, cache_position: int, kv_len: int, device: torch.device
@@ -2185,6 +2181,8 @@ class TinyTransformer(nn.Module):
 
         No extra transformer passes or host reads; auxiliary logits are not returned.
         Labels reuse the next-token alignment, including caller ignore masks.
+        With ``return_token_counts`` each head's valid-label count is returned too
+        (DDP renormalizes the per-head means over the global batch).
         """
         if not self.lm_head_mtp or self.config.mtp_weight == 0:
             return (None, None, None) if return_token_counts else (None, None)
@@ -2206,7 +2204,6 @@ class TinyTransformer(nn.Module):
 
         losses = []
         token_counts = []
-        chain_stages = grid_stages(next_targets, valid_output, cu_seqlens)[0] if self.config.predict_intermediate_grids else None
         for offset, head in enumerate(self.lm_head_mtp, start=2):
             if remaining is None:
                 length = max(next_targets.size(1) - offset + 1, 0)
@@ -2221,23 +2218,15 @@ class TinyTransformer(nn.Module):
                 head_logits = head(hidden_states)
             head_targets = head_targets.masked_fill(~valid, IGNORE_INDEX)
             # Sum + a clamped count remains finite for short/empty outputs.
-            # Stable CE accumulates in float32 under training autocast.
-            raw = hard_target_cross_entropy(
+            # Under training autocast, cross_entropy accumulates in float32.
+            raw = self._cross_entropy(
                 head_logits.reshape(-1, self.config.vocab_size),
                 head_targets.reshape(-1),
                 ignore_index=IGNORE_INDEX,
-                reduction="none" if self.config.predict_intermediate_grids else "sum",
+                reduction="sum",
             )
             count = valid.sum()
-            if self.config.predict_intermediate_grids:
-                raw = raw.reshape_as(head_targets)
-                stages = (chain_stages[:, offset - 1:offset - 1 + length] if remaining is None
-                          else torch.roll(chain_stages, shifts=1 - offset))
-                weights, count = balanced_grid_weights(head_targets, valid, cu_seqlens, stages=stages)
-                loss = (raw * weights).sum()
-            else:
-                loss = raw / count.clamp(min=1)
-            losses.append(loss)
+            losses.append(raw / count.clamp(min=1))
             token_counts.append(count)
         head_losses = torch.stack(losses)
         if return_token_counts:
@@ -2259,7 +2248,7 @@ class TinyTransformer(nn.Module):
         compute_next_latent_loss: bool = True,
         dihedral_ids: Optional[torch.Tensor] = None,
         pair_identity_ids: Optional[torch.Tensor] = None,
-        target_demo_layout: Optional[dict] = None,
+        prefix_layout: Optional[dict] = None,
     ) -> dict:
         if input_ids.dim() == 1:
             return self._forward_varlen(
@@ -2275,7 +2264,7 @@ class TinyTransformer(nn.Module):
                 compute_mtp_loss=compute_mtp_loss,
                 compute_next_latent_loss=compute_next_latent_loss,
                 pair_identity_ids=pair_identity_ids,
-                target_demo_layout=target_demo_layout,
+                prefix_layout=prefix_layout,
             )
         if input_ids.dim() == 2:
             return self._forward_padded(
@@ -2344,8 +2333,7 @@ class TinyTransformer(nn.Module):
         )
         if self.config.attention_pattern == "pair_group":
             target_z = pos_xyz[..., 2].gather(1, sep_indices.long()[:, None])
-            pos_xyz = role_positions(pos_xyz, target_z, input_ids, ordered=self.config.ordered_grid_positions,
-                                     target_chain=self.config.predict_intermediate_grids)
+            pos_xyz = role_positions(pos_xyz, target_z)
         token_embeds = self.token_embedding(input_ids)
         token_embeds = self._add_pair_identities(token_embeds, pair_identity_ids)
         (
@@ -2423,7 +2411,7 @@ class TinyTransformer(nn.Module):
             )
 
             # 1. Calculate per-token loss (reduction='none')
-            raw_losses = hard_target_cross_entropy(
+            raw_losses = self._cross_entropy(
                 shift_logits.view(-1, self.config.vocab_size),
                 shift_targets.view(-1),
                 ignore_index=IGNORE_INDEX,
@@ -2434,17 +2422,13 @@ class TinyTransformer(nn.Module):
             output_loss = (raw_losses * valid_output).sum() / num_output_tokens.clamp(
                 min=1
             )
-            if self.config.predict_intermediate_grids:
-                weights, _ = balanced_grid_weights(shift_targets, valid_output)
-                output_loss = (raw_losses * weights).sum()
             loop_exit_loss = self._loop_exit_loss(
                 exit_states, lambda states: self.lm_head(states)[:, :-1, :].reshape(-1, self.config.vocab_size),
                 shift_targets.view(-1), valid_output.reshape(-1), num_output_tokens,
             )
             if compute_training_metrics:
-                metric_mask = final_grid_mask(shift_targets, valid_output) if self.config.predict_intermediate_grids else valid_output
                 training_metric_counts = self._compute_training_metric_counts(
-                    shift_logits, shift_targets, metric_mask
+                    shift_logits, shift_targets, valid_output
                 )
 
             if compute_mtp_loss:
@@ -2474,7 +2458,6 @@ class TinyTransformer(nn.Module):
             "mtp_losses": mtp_losses,
             "mtp_token_counts": mtp_token_counts,
             "num_output_tokens": num_output_tokens if targets is not None else None,
-            "grid_loss_units": ((valid_output.any(-1)).sum() if self.config.predict_intermediate_grids and targets is not None else None),
             "training_metric_counts": training_metric_counts,
             "loop_exit_loss": loop_exit_loss,
         }
@@ -2493,7 +2476,7 @@ class TinyTransformer(nn.Module):
         compute_mtp_loss: bool = True,
         compute_next_latent_loss: bool = True,
         pair_identity_ids: Optional[torch.Tensor] = None,
-        target_demo_layout: Optional[dict] = None,
+        prefix_layout: Optional[dict] = None,
     ) -> dict:
         if cu_seqlens is None:
             raise ValueError("cu_seqlens is required for packed varlen inputs.")
@@ -2514,17 +2497,21 @@ class TinyTransformer(nn.Module):
         cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32)
         if cu_seqlens.dim() != 1 or cu_seqlens.size(0) != batch_size + 1:
             raise ValueError("cu_seqlens must have shape [batch_size + 1].")
-        _compile_safe_assert(cu_seqlens[0] == 0, "cu_seqlens must start at 0.")
-        _compile_safe_assert(
-            cu_seqlens[-1] == total_tokens,
-            "cu_seqlens[-1] must equal the packed token count in input_ids.",
-        )
+        # Each check forces a GPU->CPU sync; training batches come from the collate function that builds
+        # cu_seqlens, so validate only outside training.
+        if not self.training:
+            _compile_safe_assert(cu_seqlens[0] == 0, "cu_seqlens must start at 0.")
+            _compile_safe_assert(
+                cu_seqlens[-1] == total_tokens,
+                "cu_seqlens[-1] must equal the packed token count in input_ids.",
+            )
 
         seq_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(dtype=torch.long)
-        _compile_safe_assert(
-            torch.all(seq_lengths > 0),
-            "All sequences must have positive length in cu_seqlens.",
-        )
+        if not self.training:
+            _compile_safe_assert(
+                torch.all(seq_lengths > 0),
+                "All sequences must have positive length in cu_seqlens.",
+            )
 
         if max_seqlen is None:
             max_seqlen_value = seq_lengths.max()
@@ -2559,7 +2546,10 @@ class TinyTransformer(nn.Module):
 
         if not self._has_varlen_flash_attention():
             if self.config.FA == 4 and device.type == "cuda":
-                raise RuntimeError("FA=4 requires flash-attn-4; refusing a padded fallback on CUDA.")
+                raise RuntimeError(
+                    "FA=4 requires flash_attn.cute.interface.flash_attn_varlen_func "
+                    "(flash-attn-4 with nvidia-cutlass-dsl) or use FA=2."
+                )
             if self.config.FA == 3 and device.type == "cuda":
                 raise RuntimeError(
                     "FA=3 requires flash_attn_interface.flash_attn_varlen_func. "
@@ -2583,22 +2573,24 @@ class TinyTransformer(nn.Module):
         pos_xyz = positions_3d.to(device=device, dtype=torch.int32)
         if self.config.attention_pattern == "pair_group":
             target_indices = cu_seqlens[:-1].long() + sep_indices.long()
-            target_z = torch.repeat_interleave(pos_xyz[target_indices, 2], seq_lengths)
-            pos_xyz = role_positions(pos_xyz, target_z, input_ids, ordered=self.config.ordered_grid_positions,
-                                     target_chain=self.config.predict_intermediate_grids)
+            target_z = torch.repeat_interleave(pos_xyz[target_indices, 2], seq_lengths, output_size=total_tokens)
+            pos_xyz = role_positions(pos_xyz, target_z)
+        # One gather of the fp32 cos/sin tables serves every block application.
+        rope_tables = self.blocks[0].attention.rope.tables(pos_xyz)
         token_embeds = self.token_embedding(input_ids)
         token_embeds = self._add_pair_identities(token_embeds, pair_identity_ids)
         example_sequence_embeds = torch.repeat_interleave(
             self._lookup_example_embeds(example_ids),
             seq_lengths,
             dim=0,
+            output_size=total_tokens,
         )
         dihedral_sequence_embeds = self._lookup_dihedral_embeds(
             dihedral_ids, batch_size=batch_size, device=device,
         )
         if dihedral_sequence_embeds is not None:
             dihedral_sequence_embeds = torch.repeat_interleave(
-                dihedral_sequence_embeds, seq_lengths, dim=0,
+                dihedral_sequence_embeds, seq_lengths, dim=0, output_size=total_tokens,
             )
         (
             hidden_states,
@@ -2613,15 +2605,13 @@ class TinyTransformer(nn.Module):
         hidden_states = self.embedding_dropout(hidden_states)
 
         prefix_lengths = sep_indices.clamp(min=0) + 1
-        if self.config.split_target_demo_attention and target_demo_layout is not None:
-            if isinstance(target_demo_layout, PreparedLayout):
-                target_demo_layout = target_demo_layout.data
-            prefix_lm_layout = PackedPrefixLMLayout(None, None, 0,
-                split_target_demo_layout=target_demo_layout)
-        else:
-            prefix_lm_layout = self._build_packed_prefix_lm_layout(
-                cu_seqlens=cu_seqlens, total_tokens=total_tokens,
-                prefix_lengths=prefix_lengths, input_ids=input_ids)
+        prefix_lm_layout = self._build_packed_prefix_lm_layout(
+            cu_seqlens=cu_seqlens,
+            total_tokens=total_tokens,
+            prefix_lengths=prefix_lengths,
+            input_ids=input_ids,
+            precomputed=prefix_layout,
+        )
 
         prelude_states = None
         exit_states = []
@@ -2642,10 +2632,12 @@ class TinyTransformer(nn.Module):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen_resolved,
                 prefix_lm_layout=prefix_lm_layout,
+                rope_tables=rope_tables,
                 value_embed=self._lookup_value_embedding(
                     layer_idx,
                     example_ids,
                     seq_lengths=seq_lengths,
+                    total_tokens=total_tokens,
                 ),
                 **self._loop_block_options(logical_idx),
             )
@@ -2658,8 +2650,9 @@ class TinyTransformer(nn.Module):
             states, token_input_residual=token_input_residual, example_input_residual=example_input_residual,
             dihedral_input_residual=dihedral_input_residual, attention_mask=None, causal_mask=None,
             pos_xyz=pos_xyz, sdpa_mask=None, is_causal=False, cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen_resolved, prefix_lm_layout=prefix_lm_layout,
-            value_embed=self._lookup_value_embedding(layer_idx, example_ids, seq_lengths=seq_lengths),
+            max_seqlen=max_seqlen_resolved, prefix_lm_layout=prefix_lm_layout, rope_tables=rope_tables,
+            value_embed=self._lookup_value_embedding(layer_idx, example_ids, seq_lengths=seq_lengths,
+                                                     total_tokens=total_tokens),
         ))
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
@@ -2670,7 +2663,7 @@ class TinyTransformer(nn.Module):
             targets=targets,
             cu_seqlens=cu_seqlens,
         )
-        raw_losses = hard_target_cross_entropy(
+        raw_losses = self._cross_entropy(
             logits,
             targets,
             ignore_index=IGNORE_INDEX,
@@ -2679,10 +2672,6 @@ class TinyTransformer(nn.Module):
         num_output_tokens = valid_output.sum()
 
         output_loss = (raw_losses * valid_output).sum() / num_output_tokens.clamp(min=1)
-        grid_units = None
-        if self.config.predict_intermediate_grids:
-            weights, grid_units = balanced_grid_weights(targets, valid_output, cu_seqlens)
-            output_loss = (raw_losses * weights).sum()
         mtp_loss = None
         mtp_losses = None
         mtp_token_counts = None
@@ -2716,9 +2705,7 @@ class TinyTransformer(nn.Module):
                 output_size=total_tokens,
             )
             training_metric_counts = self._compute_training_metric_counts(
-                logits, targets,
-                final_grid_mask(targets, valid_output, cu_seqlens) if self.config.predict_intermediate_grids else valid_output,
-                sequence_ids, batch_size
+                logits, targets, valid_output, sequence_ids, batch_size
             )
 
         return {
@@ -2730,7 +2717,6 @@ class TinyTransformer(nn.Module):
             "mtp_losses": mtp_losses,
             "mtp_token_counts": mtp_token_counts,
             "num_output_tokens": num_output_tokens,
-            "grid_loss_units": grid_units,
             "training_metric_counts": training_metric_counts,
             "loop_exit_loss": loop_exit_loss,
         }
@@ -2776,8 +2762,7 @@ class TinyTransformer(nn.Module):
         return_hidden_states: bool = False,
         demo_attention_mask: Optional[torch.Tensor] = None,
         pair_identity_ids: Optional[torch.Tensor] = None,
-        target_decode_cache: Optional[Tuple[dict, ...]] = None,
-        target_input_z: Optional[torch.Tensor] = None,
+        split_cache: Optional[tuple] = None,
     ) -> dict:
         """Forward used for autoregressive generation with a KV cache.
 
@@ -2790,11 +2775,19 @@ class TinyTransformer(nn.Module):
         and to mask cached keys during incremental decoding.
         `value_embeds` can be provided to reuse per-layer value embeddings
         across prompt and decode calls for the same generation batch.
+
+        Split target/demo models can instead decode over `split_cache` =
+        (layers, demo_lengths, target_lengths, kernel) from
+        `target_demo_attention.split_prompt_cache`: per-layer (demo_k, demo_v,
+        target_k, target_v) buffers and int32 [B] filled lengths. Each call
+        writes its tokens at target_lengths[b] + i; the caller then advances
+        target_lengths. No attention mask or cache position is used.
         """
         batch_size, seq_len = input_ids.size()
+        decoding = past_key_values is not None or split_cache is not None
         # Cached decode/verification contains target tokens only. Its zero ID
         # is fixed; the demo identities are already stored in the KV cache.
-        if self.config.pair_identity_vertices and pair_identity_ids is None and past_key_values is not None:
+        if self.config.pair_identity_vertices and pair_identity_ids is None and decoding:
             pair_identity_ids = torch.zeros_like(input_ids)
         if seq_len > self.config.max_seq_len:
             raise ValueError(
@@ -2805,8 +2798,6 @@ class TinyTransformer(nn.Module):
             raise ValueError("positions_3d must match [batch, seq_len] of input_ids.")
 
         device = input_ids.device
-        if self.config.FA == 4 and device.type == "cuda" and not self._has_varlen_flash_attention():
-            raise RuntimeError("FA=4 requires flash-attn-4; refusing a padded fallback on CUDA.")
         example_ids = self._normalize_example_ids(
             example_ids,
             batch_size=batch_size,
@@ -2824,31 +2815,22 @@ class TinyTransformer(nn.Module):
         if conditioning_embeds is not None and not self.config.task_embeddings:
             conditioning_embeds = self.compute_conditioning_embeds(example_ids, dihedral_ids)
 
-        if past_key_values is None and attention_mask is None:
+        if not decoding and attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=device)
         if positions_3d is None:
-            if past_key_values is not None:
+            if decoding:
                 raise ValueError("positions_3d must be provided when using past_key_values.")
             pos_xyz = self._compute_positions_3d(input_ids, attention_mask)
         else:
             pos_xyz = positions_3d.to(device=device, dtype=torch.int32)
         if self.config.attention_pattern == "pair_group":
-            if past_key_values is None:
+            if not decoding:
                 # Left-padded prompts end at the target input's separator.
-                pos_xyz = role_positions(pos_xyz, pos_xyz[:, -1, 2:3], input_ids,
-                                         ordered=self.config.ordered_grid_positions,
-                                         target_chain=self.config.predict_intermediate_grids)
+                pos_xyz = role_positions(pos_xyz, pos_xyz[:, -1, 2:3])
             else:
                 # Cached calls contain only target-output tokens, including
                 # speculative verification blocks. Preserve spatial state.
-                output_z = 6 if self.config.ordered_grid_positions else 4
-                pos_xyz = torch.cat((pos_xyz[..., :2], torch.full_like(pos_xyz[..., 2:], output_z)), dim=-1)
-                if self.config.predict_intermediate_grids:
-                    if target_input_z is None:
-                        raise ValueError("Target-chain decoding requires its original target_input_z")
-                    raw_z = positions_3d[..., 2]
-                    stage_z = 5 + (raw_z - target_input_z).clamp(1, 3)
-                    pos_xyz = torch.cat((pos_xyz[..., :2], stage_z.unsqueeze(-1)), dim=-1)
+                pos_xyz = torch.cat((pos_xyz[..., :2], torch.full_like(pos_xyz[..., 2:], 4)), dim=-1)
         token_embeds = self.token_embedding(input_ids)
         token_embeds = self._add_pair_identities(token_embeds, pair_identity_ids)
         dihedral_embeds = self._lookup_dihedral_embeds(
@@ -2905,7 +2887,7 @@ class TinyTransformer(nn.Module):
 
         # Initial prompt: no cache yet, compute 3D positions and use the
         # input-side prompt as a bidirectional prefill.
-        if past_key_values is None:
+        if not decoding:
             prefill_mask = None if bool(attention_mask.all()) else attention_mask
             prefill_layout = None
             prefill_bias = None
@@ -2963,7 +2945,13 @@ class TinyTransformer(nn.Module):
                 result["hidden_states"] = hidden_states[:, -1:, :]
             return result
 
-        if len(past_key_values) != self.cache_layer_count:
+        if split_cache is not None:
+            split_layers, demo_lengths, target_lengths, kernel = split_cache
+            if len(split_layers) != self.cache_layer_count:
+                raise ValueError("split_cache must have one cache per logical layer invocation.")
+            if attention_mask is not None:
+                raise ValueError("Split-cache decoding takes no attention_mask.")
+        elif len(past_key_values) != self.cache_layer_count:
             raise ValueError("past_key_values must have one cache per logical layer invocation.")
         prelude_states = None
         for logical_idx, i in enumerate(self.layer_schedule):
@@ -2978,11 +2966,12 @@ class TinyTransformer(nn.Module):
                     dihedral_input_residual=dihedral_input_residual,
                     pos_xyz=pos_xyz,
                     attention_mask=attention_mask,
-                    past_key_value=past_key_values[logical_idx],
+                    past_key_value=None if split_cache is not None else past_key_values[logical_idx],
                     cache_position=cache_position,
                     decode_block_mask=decode_block_mask,
                     demo_attention_mask=demo_attention_mask,
-                    target_decode_cache=target_decode_cache[logical_idx] if target_decode_cache is not None else None,
+                    split_cache=None if split_cache is None else (
+                        *split_layers[logical_idx], demo_lengths, target_lengths, kernel),
                     value_embed=self._value_embedding_for_layer(
                         i,
                         example_ids,
@@ -3037,7 +3026,7 @@ class RotaryEmbedding3D(nn.Module):
         self.d_y = py * 2
         self.d_z = pz * 2
 
-        # Ordered grid chains use demo z=1..4 and target z=5/6.
+        # Dense contexts use z=1..6; pair-group uses fixed roles z=1..4.
         self.max_x = 32
         self.max_y = 32
         self.max_z = 7
@@ -3082,17 +3071,12 @@ class RotaryEmbedding3D(nn.Module):
         out = torch.stack((-x2, x1), dim=-1)
         return out.flatten(-2)
 
-    def apply_rotary(
-        self, q: torch.Tensor, k: torch.Tensor, pos_xyz: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply 3D RoPE to the first d_x, d_y, d_z channels respectively.
+    def tables(self, pos_xyz: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gather fp32 cos/sin tables for integer positions [..., 3] -> two [..., D] tensors.
 
-        q, k: [B, H, S, D]
-        pos_xyz: [B, S, 3] with integer coordinates (x, y, z)
+        The tables depend only on positions, so a forward pass gathers them once
+        and every block application (including repeated loop blocks) reuses them.
         """
-        # B, H, S, D = q.shape
-        # assert D == self.head_dim
-
         # Ensure indices are within bounds (clamping protects against out-of-bounds crash)
         # pos_xyz is expected to be an integer tensor suitable for indexing.
         pos_x = pos_xyz[..., 0].clamp(0, self.max_x - 1)
@@ -3116,10 +3100,31 @@ class RotaryEmbedding3D(nn.Module):
             parts_cos.append(self.cos_z_cache[pos_z])
             parts_sin.append(self.sin_z_cache[pos_z])
 
-        # Concatenate tables to form the full [B, S, D] embedding mask.
+        # Concatenate tables to form the full [..., D] embedding mask.
         # This 'cat' is on non-gradient tensors, which is cheap in the backward pass.
-        cos = torch.cat(parts_cos, dim=-1).unsqueeze(1)  # [B, 1, S, D]
-        sin = torch.cat(parts_sin, dim=-1).unsqueeze(1)  # [B, 1, S, D]
+        return torch.cat(parts_cos, dim=-1), torch.cat(parts_sin, dim=-1)
+
+    def apply_rotary(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        pos_xyz: Optional[torch.Tensor] = None,
+        tables: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply 3D RoPE to the first d_x, d_y, d_z channels respectively.
+
+        Default layout: q, k [B, H, S, D] with pos_xyz [B, S, 3] integer (x, y, z).
+        With ``tables`` (cos, sin already broadcastable to q and k) no gather runs
+        and any layout works; packed training passes [T, 1, D] tables for
+        [T, H, D] queries and keys. Both routes compute identical values.
+        """
+        if tables is None:
+            if pos_xyz is None:
+                raise ValueError("apply_rotary needs pos_xyz or precomputed tables.")
+            cos, sin = self.tables(pos_xyz)
+            cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)  # [B, 1, S, D]
+        else:
+            cos, sin = tables
 
         # Apply standard RoPE arithmetic on the full tensors.
         # This keeps q and k contiguous and avoids slicing activations.

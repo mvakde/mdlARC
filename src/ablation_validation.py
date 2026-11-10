@@ -13,7 +13,6 @@ from common import encode_context, compute_positions_3d
 from evaluate import batched_greedy_generate
 from tinytransformer import TinyTransformer, TinyTransformerConfig
 from train import _enable_compile_scalar_capture
-from target_demo_attention import PreparedLayout, build_split_layout
 
 
 def validate(output, version=2):
@@ -29,20 +28,18 @@ def validate(output, version=2):
     packed = dict(padded,input_ids=tokens.cuda(),positions_3d=pos[0],
         cu_seqlens=torch.tensor([0,len(tokens)],device='cuda',dtype=torch.int32),max_seqlen=len(tokens))
     report=[]
+    # FA4 is validated on the split two-lookup recipe it trains (head dim 64).
     variants = [(True, False)] if version == 4 else [(False,False),(True,False),(True,True)]
     for split, simplex in variants:
         torch.manual_seed(42)
         m=TinyTransformer(TinyTransformerConfig(d_model=128 if version == 4 else 96,
-            n_heads=2 if version == 4 else 4,d_ff=256,n_layers=2,
+            n_heads=2 if version == 4 else 4,d_ff=256 if version == 4 else 192,n_layers=2,
             num_examples=2,num_task_embedding_latents=3,task_embeddings=False,FA=version,
             dropout=0,embedding_dropout=0,attention_dropout=0,n_predict=4,
             attention_pattern='pair_group',split_target_demo_attention=split,
             pair_identity_vertices=11 if simplex else 0)).cuda().bfloat16().eval()
         assert m._has_varlen_flash_attention(), 'Native FlashAttention is required'
         a,b=dict(padded),dict(packed)
-        if split:
-            b['target_demo_layout'] = PreparedLayout(build_split_layout(
-                tokens, packed['cu_seqlens'].cpu(), torch.tensor([sep+1], dtype=torch.int32))).to('cuda')
         if simplex:
             z=pos[...,2]
             ids=torch.where((z>0)&(z<=4),(z+1)//2,0).long()
@@ -55,7 +52,6 @@ def validate(output, version=2):
         assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in m.parameters() if p.requires_grad)
         prompt=tokens[:sep+1].tolist()
         generated=batched_greedy_generate(m,[prompt],[0],torch.device('cuda'),max_new_tokens=4,
-            speculative='auto',
             pair_identity_ids=[ids[0,:sep+1].tolist()] if simplex else None)
         assert len(generated)==1 and len(generated[0])>len(prompt)
         report.append(dict(FA=version,split_target_demo_attention=split,simplex=simplex,

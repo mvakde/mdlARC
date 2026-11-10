@@ -33,17 +33,6 @@ def test_invalid_probe_configuration_fails_before_remote_allocation(config):
         validate_config(config)
 
 
-def test_full_epoch_benchmark_requires_fixed_batch_and_preserves_recipe():
-    with pytest.raises(ValueError, match='fixed batch'):
-        validate_config({'modes': ['epoch']})
-    config = validate_config({'modes': ['epoch'], 'search': False,
-                             'start_batch_size': 64, 'max_batch_size': 64})
-    assert config['warmup_epochs'] == 1 and config['measure_epochs'] == 2
-    plan = launch_run.build_plan(spec(training_benchmark=config,
-        defaults={'dihedral_embeddings': False}), Path('test.json'))
-    assert plan['pretrain']['dihedral_embeddings'] is False
-
-
 def test_search_closes_an_aligned_bracket_without_repeating_a_candidate():
     low, high = 0, 512
     visited = set()
@@ -158,7 +147,7 @@ def test_group_longest_probe_uses_complete_context_not_largest_target(tmp_path):
     assert batch["input_ids"].numel() == 2 * 4201
 
 
-def test_group_synthetic_probe_respects_six_demo_cap(tmp_path):
+def test_group_synthetic_probe_preserves_all_demo_count_and_wide_separator(tmp_path):
     import json
     import torch
     from common import ARCExampleDataset, IO_SEPARATOR_TOKEN_ID
@@ -169,14 +158,15 @@ def test_group_synthetic_probe_respects_six_demo_cap(tmp_path):
     path.write_text(json.dumps({"many_demos": {"train": [pair] * 20}}))
     dataset = ARCExampleDataset(path, splits=("train",), attention_pattern="pair_group")
     batch = make_batch(dataset, "grid_30", 2, 42)
-    assert batch["max_seqlen"] == 1 + 7 * 1860
-    assert batch["positions_3d"][:, 2].max() == 14  # Six demos plus the target.
+    assert batch["max_seqlen"] == 1 + 20 * 1860
+    assert batch["positions_3d"][:, 2].max() == 40  # 19 demos plus the target.
     assert batch["sep_indices"].dtype == torch.int32
+    assert batch["sep_indices"].min() > 32767
     tokens = batch["input_ids"].reshape(2, batch["max_seqlen"])
     assert (tokens[torch.arange(2), batch["sep_indices"].long()] == IO_SEPARATOR_TOKEN_ID).all()
 
 
-def test_group_variation_profile_selects_capped_context_beyond_dense_capacity(tmp_path, monkeypatch):
+def test_group_variation_profile_selects_full_context_beyond_dense_capacity(tmp_path, monkeypatch):
     import json
     import variations
     from variations import VariationTrainingDataset
@@ -197,13 +187,13 @@ def test_group_variation_profile_selects_capped_context_beyond_dense_capacity(tm
     index_path = tmp_path / "index.json"
     index_path.write_text(json.dumps(index))
     profile = benchmark.variation_profile(index_path, "pair_group")
-    assert profile["sequence_length_percentiles"]["max"] == 5881
+    assert profile["sequence_length_percentiles"]["max"] == 6721
     assert all(item["variant_index"] == 1 for item in profile["longest_refs"])
     dataset = VariationTrainingDataset(json_path=tmp_path / "parents.json", index_path=index_path,
                                       seed=42, max_augments=1, attention_pattern="pair_group")
     dataset.benchmark_variation_profile = profile
-    assert benchmark.make_batch(dataset, "variation_longest", 2, 42)["max_seqlen"] == 5881
-    assert benchmark.make_batch(dataset, "grid_30", 1, 42)["max_seqlen"] == 1 + 7 * 1860
+    assert benchmark.make_batch(dataset, "variation_longest", 2, 42)["max_seqlen"] == 6721
+    assert benchmark.make_batch(dataset, "grid_30", 1, 42)["max_seqlen"] == 1 + 8 * 1860
     dataset.benchmark_variation_profile = dict(profile, attention_pattern="dense")
     with pytest.raises(ValueError, match="attention_pattern"):
         benchmark.make_batch(dataset, "variation_longest", 1, 42)
@@ -295,3 +285,107 @@ def test_unstable_boundary_backs_off_and_keeps_other_modes(tmp_path, monkeypatch
     results = json.loads((tmp_path / "training_benchmark/results.json").read_text())
     assert all(s["largest_confirmed_batch"] == 24 for s in results["summary"].values())
     assert all(s["first_rejected_batch"] == 32 for s in results["summary"].values())
+
+
+@pytest.mark.parametrize("config", [
+    {"distinct_batches": 0}, {"distinct_batches": True}, {"profile_steps": -1}, {"profile_steps": 1.5},
+    {"distinct_batches": 4, "warmup_steps": 7}, {"confirm": "no"}, {"search": True, "confirm": False},
+])
+def test_speed_probe_options_are_validated(config):
+    with pytest.raises(ValueError):
+        validate_config(config)
+
+
+def test_training_batches_prepare_the_loader_like_the_trainer():
+    from types import SimpleNamespace
+    from src.training_benchmark import training_batches
+
+    calls = []
+    sampler = SimpleNamespace(drop_last=False, set_epoch=lambda epoch: calls.append(("sampler_epoch", epoch)))
+    augmentor = SimpleNamespace(prepare_training_schedule=lambda s: calls.append(("prepare", s is sampler)),
+                                set_epoch=lambda epoch: calls.append(("augment_epoch", epoch)))
+    loader = SimpleNamespace(batch_sampler=sampler, augmentor=augmentor, __iter__=lambda self: iter(["b0", "b1", "b2"]))
+    loader = type("Loader", (), {"batch_sampler": sampler, "augmentor": augmentor,
+                                 "__iter__": lambda self: iter(["b0", "b1", "b2"])})()
+    assert training_batches(loader, 2) == ["b0", "b1"]
+    assert sampler.drop_last is True
+    assert calls == [("prepare", True), ("augment_epoch", 0), ("sampler_epoch", 0)]
+
+
+def test_cycled_batches_repeat_in_order_and_default_to_the_fixed_probe():
+    from src.training_benchmark import CycledBatches
+
+    assert list(CycledBatches(["a", "b", "c"], 7)) == ["a", "b", "c", "a", "b", "c", "a"]
+    assert len(CycledBatches(["a"], 3)) == 3 and list(CycledBatches(["a"], 3)) == ["a"] * 3
+
+
+def test_profile_summary_categorizes_kernels_and_measures_gpu_idle_time():
+    from src.training_benchmark import categorize_kernel, summarize_records
+
+    assert categorize_kernel("void flash_fwd_kernel<...>") == "attention"
+    assert categorize_kernel("void cutlass::device_kernel<flash::enable_sm90<flash::FlashAttnBwdSm90<...>>>") == "attention"
+    assert categorize_kernel("sm80_xmma_gemm_bf16bf16_bf16f32_f32_tn_n_tilesize128x128x32") == "gemm"
+    assert categorize_kernel("triton_poi_fused_index_select_mul_3") == "fused"
+    assert categorize_kernel("void at::native::index_select_out_cuda_impl") == "index"
+    assert categorize_kernel("Memcpy DtoH (Device -> Pageable)") == "memory"
+    assert categorize_kernel("mystery_kernel") == "other"
+    # Two kernels overlap on different streams; a copy runs later on the copy engine.
+    # The busy union counts kernels only: 30 us of a 100 us window.
+    records = [
+        ("flash_fwd_kernel", True, 0, 20), ("triton_poi_fused_add_0", True, 10, 30),
+        ("Memcpy DtoH (Device -> Pageable)", True, 50, 60),
+        ("cudaLaunchKernel", False, 0, 2), ("cuLaunchKernelEx", False, 5, 7), ("cudaMemcpyAsync", False, 45, 46),
+        ("aten::item", False, 40, 60), ("packed_layout", False, 40, 70), ("forward", False, 0, 80),
+    ]
+    summary = summarize_records(records, wall_seconds=100e-6, steps=2)
+    assert summary["gpu_busy_seconds"] == pytest.approx(30e-6)
+    assert summary["gpu_busy_fraction"] == pytest.approx(0.3)
+    # Occupied adds the copy: 40 us of the window had something on the device, 60 us nothing.
+    assert summary["gpu_occupied_seconds"] == pytest.approx(40e-6)
+    assert summary["gpu_occupied_fraction"] == pytest.approx(0.4)
+    assert summary["gpu_idle_fraction"] == pytest.approx(0.6)
+    assert summary["kernel_seconds_by_category"] == {
+        "attention": pytest.approx(20e-6), "fused": pytest.approx(20e-6), "memory": pytest.approx(10e-6)}
+    assert summary["kernels_per_step"] == 1 and summary["launch_api_calls_per_step"] == 1
+    assert summary["host_events"]["aten::item"] == {"count": 1, "seconds": pytest.approx(20e-6)}
+    assert summary["host_events"]["packed_layout"]["seconds"] == pytest.approx(30e-6)
+    assert "backward" not in summary["host_events"]
+    assert summary["top_kernels"][0]["name"] in ("flash_fwd_kernel", "triton_poi_fused_add_0")
+
+
+def test_gpu_side_annotations_are_not_counted_as_kernels():
+    from types import SimpleNamespace
+    import torch
+    from src.training_benchmark import profile_records
+
+    cuda = torch.autograd.DeviceType.CUDA
+    events = [SimpleNamespace(name="forward", device_type=cuda, time_range=SimpleNamespace(start=0, end=900)),
+              SimpleNamespace(name="Optimizer.step#SGD.step", device_type=cuda, time_range=SimpleNamespace(start=0, end=50)),
+              SimpleNamespace(name="flash_fwd_kernel", device_type=cuda, time_range=SimpleNamespace(start=0, end=20)),
+              SimpleNamespace(name="forward", device_type=torch.autograd.DeviceType.CPU, time_range=SimpleNamespace(start=0, end=950))]
+    records = profile_records(SimpleNamespace(events=lambda: events))
+    assert records == [("flash_fwd_kernel", True, 0, 20), ("forward", False, 0, 950)]
+
+
+def test_unconfirmed_fixed_probe_runs_once_and_reports_no_confirmation(tmp_path, monkeypatch):
+    import json
+    from src.training_benchmark import run_benchmark
+
+    plan = launch_run.build_plan(spec(training_benchmark={
+        "search": False, "confirm": False, "start_batch_size": 64, "max_batch_size": 64, "modes": ["training"],
+    }), Path("test.json"))
+    plan["run_dir"] = tmp_path
+    calls = []
+
+    def trial(command, **kwargs):
+        request = json.loads(Path(command[-1]).read_text())
+        calls.append(request)
+        Path(request["output"]).write_text(json.dumps({"mode": request["mode"], "batch_size": 64, "status": "fits",
+                                                       "examples_per_second": 1.0}))
+
+    monkeypatch.setattr("src.training_benchmark.subprocess.run", trial)
+    run_benchmark(plan)
+    summary = json.loads((tmp_path / "training_benchmark/results.json").read_text())["summary"]["training"]
+    assert len(calls) == 1
+    assert summary["status"] == "fits" and summary["confirmation"] is None
+    assert summary["largest_confirmed_batch"] is None and summary["first_rejected_batch"] is None

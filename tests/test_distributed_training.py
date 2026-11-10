@@ -195,23 +195,6 @@ def test_ddp_cuda_rng_restores_on_another_local_device_for_single_gpu_eval(monke
     assert restored[0][0] is saved and restored[0][1] == torch.device("cuda:0")
 
 
-def test_ddp_recipe_preserves_two_demo_data_model_and_global_batch():
-    source = json.loads((ROOT / "specs/arc2_family_development_two_demo.json").read_text())
-    ddp = json.loads((ROOT / "specs/arc2_family_development_two_demo_ddp.json").read_text())
-    assert ddp["distributed"] == {"nproc_per_node": 2}
-    assert ddp["defaults"]["batch_size"] * 2 == source["defaults"]["batch_size"]
-    source.pop("run_name")
-    ddp.pop("run_name")
-    ddp.pop("distributed")
-    ddp["defaults"]["batch_size"] *= 2
-    assert ddp == source
-    plan = launch_run.build_plan(ddp | {"distributed": {"nproc_per_node": 2}}, ROOT / "specs/ddp.json")
-    assert plan["pretrain"]["training_demo_schedule"] == "two"
-    assert plan["evals"]["final"]["inference_demo_policy"] == "two"
-    with pytest.raises(ValueError, match="requires 2 GPUs"):
-        launch_run.validate_distributed_gpu_count(launch_run.preview_plan(plan), 1)
-
-
 def test_ddp_training_uses_torchrun_but_evaluation_stays_single_process(monkeypatch):
     calls = []
     monkeypatch.setattr(launch_run.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd))
@@ -222,12 +205,6 @@ def test_ddp_training_uses_torchrun_but_evaluation_stays_single_process(monkeypa
     assert "--nproc-per-node=2" in calls[0] and "--max-restarts=0" in calls[0]
     assert calls[0][-2:] == ["--train-stage", "pretrain"]
     assert "torch.distributed.run" not in calls[1]
-
-
-def test_ddp_recipe_can_be_reused_for_single_gpu_evaluation_only():
-    plan = launch_run.build_plan({"distributed": {"nproc_per_node": 2}, "eval_only": True,
-                                  "checkpoint": "tiny.pt", "enable_finetune": False}, Path("eval.json"))
-    launch_run.validate_distributed_gpu_count(launch_run.preview_plan(plan), 1)
 
 
 def _model(dataset):

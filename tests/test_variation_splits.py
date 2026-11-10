@@ -200,7 +200,6 @@ def test_eval_group_routes_decoding_and_scoring_but_finetunes_the_union(split_co
     def evaluate(cfg, **kwargs):
         assert cfg.data_path == kwargs["data_path"]
         decoded.append((cfg.group, cfg.data_path, kwargs["checkpoint_path"]))
-        (data.root / cfg.group).mkdir(parents=True, exist_ok=True)
         return ("final", {}, data.root / cfg.group / "submission.json")
     monkeypatch.setattr(launch_run, "load_runtime_modules", lambda: None)
     monkeypatch.setattr(launch_run, "evaluate", SimpleNamespace(run_evaluation=evaluate))
@@ -219,7 +218,7 @@ def test_eval_group_routes_decoding_and_scoring_but_finetunes_the_union(split_co
 
 
 def test_conceptarc_variation_spec_selects_topbottom3d_and_separate_final_evals():
-    path = ROOT / "specs/conceptarc_variations_finetune.json"
+    path = ROOT / "tests/fixtures/specs/conceptarc_variations_finetune.json"
     plan = launch_run.build_plan(launch_run.load_spec(path), path)
     assert plan["dataset"]["pretrain_data"]["sources"] == ["conceptarc"]
     assert plan["pretrain"]["epochs"] == 84
@@ -376,16 +375,14 @@ def test_original_resume_rejects_changed_manifest_or_data(split_corpus, monkeypa
 
 def test_original_conceptarc_spec_matches_variation_finetune_and_eval():
     import copy
-    from scripts.run_on_colab import spec_requires_task_variations
-    path = ROOT / "specs/conceptarc_originals_finetune.json"
+    path = ROOT / "tests/fixtures/specs/conceptarc_originals_finetune.json"
     spec = launch_run.load_spec(path)
     plan = launch_run.build_plan(spec, path)
-    variation = launch_run.load_spec(ROOT / "specs/conceptarc_variations_finetune.json")
+    variation = launch_run.load_spec(ROOT / "tests/fixtures/specs/conceptarc_variations_finetune.json")
     assert spec["dataset"]["evaluation"] == variation["dataset"]["evaluation"]
     assert plan["pretrain"]["epochs"] == 330
     assert plan["pretrain"]["batch_size"] == 64
     assert plan["pretrain"]["enable_aug"] and plan["pretrain"]["max_augments"] == 80
-    assert not spec_requires_task_variations(spec)
     for key in ("finetune_defaults", "finetunes", "eval_defaults", "evals"):
         assert spec[key] == variation[key]
     # Pretrain-only overrides must never spill into finetuning or evaluation.

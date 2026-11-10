@@ -1,4 +1,8 @@
-"""Selected attention dependencies and a bounded native FA4 readiness check."""
+"""Optional FlashAttention-4 (CuTe DSL) runtime: lazy import and a native readiness check.
+
+FA4 is only imported when a model selects FA=4, so hosts without the CUDA 13
+CuTe DSL stack (or with an incompatible one) still run FA2/FA3/SDPA.
+"""
 import importlib.metadata
 
 FA4_VERSION = "4.0.0b36"
@@ -20,6 +24,25 @@ def selected_versions(spec):
         for stage in (spec.get("evals") or {"final": {}}).values():
             versions.add(int({**defaults, **stage}["FA"]))
     return versions
+
+
+_UNSET = object()
+_fa4_varlen_func = _UNSET
+
+
+def load_fa4_varlen_func():
+    """flash_attn.cute's varlen function, or None when FA4 is not importable here."""
+    global _fa4_varlen_func
+    if _fa4_varlen_func is _UNSET:
+        try:
+            from flash_attn.cute import flash_attn_varlen_func as function
+        except (ImportError, AttributeError):  # missing, or an incompatible CuTe DSL
+            try:
+                from flash_attn.cute.interface import flash_attn_varlen_func as function
+            except (ImportError, AttributeError):
+                function = None
+        _fa4_varlen_func = function
+    return _fa4_varlen_func
 
 
 def fa4_installed():
