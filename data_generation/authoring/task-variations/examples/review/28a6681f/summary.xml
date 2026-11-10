@@ -1,0 +1,42 @@
+<rules_summary>
+Treat one distinguished color as movable liquid and every other non-background color as rigid, impermeable terrain. Preserve the liquid’s total cell count but discard its initial shape. Under downward gravity, let it spread laterally around obstacles, fill reachable pockets from their lowest cells upward, and overflow ledges into subsequent pockets when necessary. Place the liquid in its unique stable configuration while leaving all terrain cells unchanged.
+</rules_summary>
+
+<input_generation>
+Each input contains a uniform background, one movable liquid color, and a stationary multicolored arrangement of walls, ledges, ramps, funnels, and catch basins. All stationary colors have the same blocking behavior despite identifying different structures. The liquid begins above or partly within this terrain and has a fixed volume equal to its number of cells. The terrain and canvas boundaries create an unambiguous downward route to one or more receiving pockets. Basin capacities, spill heights, and the liquid volume must determine a unique final allocation, without an ambiguously partially filled level. No unrelated noise is present.
+</input_generation>
+
+<variation_guidance>
+The liquid quantity and initial arrangement may vary from a compact reservoir to scattered or irregular droplets. The number, colors, widths, heights, spacing, and geometry of stationary structures may change, as may the number, depth, and connectivity of catch basins. Basins may be enclosed entirely by terrain or use a canvas edge as part of their boundary, and liquid may divide among several pockets or remain partly in its original reservoir. Literal terrain colors are interchangeable semantic roles. Gravity remains directed toward the bottom of the grid; terrain is never moved or recolored.
+</variation_guidance>
+
+<train_test_shift>
+All training and test instances retain a 10-by-10 canvas and downward gravity. Training demonstrates a tall boundary reservoir feeding a narrow inner well, a larger volume settling throughout a broad divided basin, and a three-cell supply descending past a diagonal funnel into two small cups. The test most closely extends the final case: it raises the source to the top-left, increases its volume to five cells, reassigns the lower terrain colors, replaces the two small cups with a two-cell pocket between differently colored supports and a three-cell boundary-backed well, and uses a simpler descending deflector. This is a new combination of familiar terrain and basin factors rather than a new orientation or scale; the required generalization is to preserve liquid volume, downward routing, lowest-first basin filling, overflow behavior, and the immobility of every terrain cell.
+</train_test_shift>
+
+<solution_steps>
+1. Identify the background, the movable liquid role, and all stationary non-background terrain cells.
+2. Count the liquid cells to obtain the conserved volume.
+3. Conceptually erase the liquid from its initial positions, restoring those locations to background.
+4. Trace the downward routes available from the source region, allowing lateral spreading or sliding around terrain but never passage through it.
+5. Identify the reachable catch basins and their spill heights, including basins completed by a grid boundary.
+6. Allocate liquid to the lowest reachable cells first, filling each level across its available width and sending excess over a rim into the next reachable basin.
+7. Continue until the entire conserved volume reaches its unique stable placement, then copy all terrain and remaining background cells unchanged.
+</solution_steps>
+
+<key_insight>
+The movable cells encode a conserved volume, not a shape to copy: the stationary terrain determines where that volume settles under gravity.
+</key_insight>
+
+<puzzle_concepts>
+- gravity simulation
+- liquid redistribution
+- volume conservation
+- basin detection
+- lowest-first filling
+- lateral flow
+- overflow routing
+- obstacle preservation
+- boundary-supported containers
+- semantic color roles
+</puzzle_concepts>

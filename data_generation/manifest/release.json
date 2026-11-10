@@ -1,0 +1,272 @@
+{
+ "schema": "mdlarc-data-generation-release-v1",
+ "name": "mdlARC v3.1 synthetic ARC-AGI-2 task families",
+ "release": "counts-v1-20261024",
+ "package": {
+  "name": "arc2-family-full-counts-v1-20261024-r1.zip",
+  "bytes": 181720007,
+  "sha256": "51d8450883db3467d738b5dbebcd60a763e55fac91335b0afcf0d91f79a3a809",
+  "members": 161799,
+  "instances": 161798,
+  "catalog_member": "family_catalog.json",
+  "catalog_schema": "arc-family-catalog-v1",
+  "instances_by_kind": {
+   "composition": 113638,
+   "original": 1120,
+   "variation": 47040
+  }
+ },
+ "runtime": {
+  "python": "3.13.16",
+  "implementation": "CPython",
+  "numpy": "2.5.4",
+  "pythonhashseed": "0",
+  "rng": "generator-owned; explicit recorded seed"
+ },
+ "families": {
+  "total": 4013,
+  "in_package": 3826,
+  "variation": {
+   "arc2_train": {
+    "in_package": 1000,
+    "not_in_package": 0
+   },
+   "arc2_eval": {
+    "in_package": 120,
+    "not_in_package": 0
+   },
+   "arc1_filtered": {
+    "in_package": 0,
+    "not_in_package": 27
+   },
+   "conceptarc": {
+    "in_package": 0,
+    "not_in_package": 160
+   }
+  },
+  "composition": {
+   "eval-eval": 1988,
+   "train-train": 300,
+   "mixed": 418
+  },
+  "composition_authors": {
+   "claude-opus-5-5 (author)": 74,
+   "claude-opus-5-5 (review-improve)": 10,
+   "gpt-6.1-sol (author)": 2622
+  }
+ },
+ "composition_counts": {
+  "policy": "composition-counts-v1",
+  "schedule_seed": 20261024,
+  "weights_percent": {
+   "demos": {
+    "2": 15,
+    "3": 24,
+    "4": 24,
+    "5": 16,
+    "6": 12,
+    "7": 5,
+    "8": 3,
+    "9": 1,
+    "10": 0
+   },
+   "queries": {
+    "1": 60,
+    "2": 35,
+    "3": 5
+   }
+  },
+  "legal": {
+   "demos": [
+    2,
+    10
+   ],
+   "queries": [
+    1,
+    3
+   ],
+   "rule": "demos > queries"
+  },
+  "schedule_rng": "Python random.Random seeded from SHA-256 of \"<schedule_seed>:<label>\"",
+  "cohorts": "dataset:stage (arc2/evaluation, arc2/training, arc2/mixed; author or review-improve)",
+  "requested": {
+   "families": 2706,
+   "samples": 113652,
+   "datasets": {
+    "arc2/evaluation": 1988,
+    "arc2/training": 300,
+    "arc2/mixed": 418
+   },
+   "stages": {
+    "author": 2696,
+    "review-improve": 10
+   },
+   "distribution": {
+    "demos": {
+     "2": 17048,
+     "3": 27276,
+     "4": 27276,
+     "5": 18184,
+     "6": 13638,
+     "7": 5683,
+     "8": 3410,
+     "9": 1137
+    },
+    "queries": {
+     "1": 68191,
+     "2": 39778,
+     "3": 5683
+    }
+   }
+  },
+  "retained": {
+   "families": 2706,
+   "samples": 113638,
+   "datasets": {
+    "arc2/evaluation": 1988,
+    "arc2/training": 300,
+    "arc2/mixed": 418
+   },
+   "stages": {
+    "author": 2696,
+    "review-improve": 10
+   },
+   "distribution": {
+    "demos": {
+     "2": 17041,
+     "3": 27273,
+     "4": 27276,
+     "5": 18181,
+     "6": 13637,
+     "7": 5683,
+     "8": 3410,
+     "9": 1137
+    },
+    "queries": {
+     "1": 68181,
+     "2": 39775,
+     "3": 5682
+    }
+   }
+  },
+  "omitted_samples": 14,
+  "omission_rule": "A recorded (seed, counts) row whose generator call failed on every replay was dropped; at most two per family. No generator, seed or other count was changed.",
+  "checks": [
+   "exact_counts",
+   "schema_grid_bounds_colors",
+   "unique_inputs",
+   "no_exact_parent_copy",
+   "generator_validator",
+   "input_only_generator_solver",
+   "unique_puzzles",
+   "not_all_identity"
+  ],
+  "replay": {
+   "full_replay_families": 753,
+   "representative_replay_families": 1953,
+   "representatives_per_family": 5,
+   "replayed_samples": 41389,
+   "retained_samples": 113638,
+   "mismatches": 0
+  },
+  "semantic_limitation": "No independent semantic approval or proof of sufficient teaching examples."
+ },
+ "variation_sampling": {
+  "seeds": "integers 0..41",
+  "counts": "chosen by each generator from its seed (num_train=None, num_test=None)",
+  "self_test_first": true,
+  "serialisation": "json.dumps(puzzle, sort_keys=True, ensure_ascii=False, separators=(\",\", \":\")) + \"\\n\"",
+  "checks": [
+   "self_test",
+   "generator_validator",
+   "schema_grid_bounds_colors"
+  ],
+  "authoring_checks": "At authoring time each generator also passed host checks: determinism, legal and illegal counts, grid bounds and colours, duplicate inputs and pairs, no exact copy of a source pair, at least 40 distinct puzzles from 42 seeds."
+ },
+ "composition_serialisation": "json.dumps(encode(task, demos, queries), separators=(\",\", \":\"), ensure_ascii=True) + \"\\n\"",
+ "original_serialisation": "json.dumps(task, sort_keys=True, separators=(\",\", \":\")) with no trailing newline",
+ "catalog": {
+  "aliases_excluded": [],
+  "corrupt": [],
+  "corrupt_lineage_payloads": [],
+  "discovery": {
+   "accepted_states": [
+    "author_completed",
+    "completed"
+   ],
+   "composition_pipelines": [
+    "v2",
+    "v3"
+   ],
+   "composition_release": {
+    "path": "data/compositions/releases/counts-v1-20261024/release.json",
+    "sha256": "e9bc8d3fe4047e8a8c804c3c5d4d4a0c146cb63b65d369c2daf13421aa0cc054"
+   }
+  },
+  "excluded": {},
+  "heldout": [],
+  "issues": {},
+  "missing": [],
+  "missing_lineage_payloads": [],
+  "mode": "full",
+  "parent_split": null,
+  "sampling": {
+   "deduplicate_variation_inputs": false,
+   "embedding_scope": "parent",
+   "seed_schedule": "shuffled_cycle",
+   "target_pairs": "all_solved",
+   "unit": "family",
+   "variations_per_parent_per_epoch": 1
+  },
+  "schema": "arc-family-catalog-v1",
+  "source_sha256": {
+   "arc1_filtered": "9c1d9b2846352a772e2307f815412a3f896e61cead726ec5062e0c6372ef7618",
+   "arc2_eval": "2858a6ca7691d38a4011405234feb2286b144881e50706e10cfcb20f6a2f1d02",
+   "arc2_train": "ded3d8eb1f19bc85e624bdc79ddb23178cf90726748b2e501d4c02cbcf277ac0",
+   "conceptarc": "75296eb2f2ef252c0a1e8c5e4e365ce85cb7e0148bd40fba0bf97e61f3377b03"
+  },
+  "sources": [
+   "arc2_train",
+   "arc2_eval"
+  ],
+  "summary": {
+   "blocking_composition_metadata_issues": {},
+   "blocking_metadata_issues": {},
+   "candidate_instances": 161798,
+   "corrupt_lineage_payloads": 0,
+   "corrupt_payloads": 0,
+   "discovered_composition_states": {
+    "author_completed": 2696,
+    "completed": 10,
+    "failed": 13
+   },
+   "discovered_original_families": {
+    "arc1_filtered": 27,
+    "arc2_eval": 120,
+    "arc2_train": 1000,
+    "conceptarc": 160
+   },
+   "eligible_composition_families": 2706,
+   "eligible_composition_sources": {
+    "arc2_eval": 1988,
+    "arc2_mixed": 418,
+    "arc2_train": 300
+   },
+   "eligible_composition_stages": {
+    "author": 2696,
+    "review-improve": 10
+   },
+   "eligible_original_families": {
+    "arc2_eval": 120,
+    "arc2_train": 1000
+   },
+   "excluded_composition_families": 0,
+   "excluded_reasons": {},
+   "instances_per_epoch": 3826,
+   "missing_lineage_payloads": 0,
+   "missing_payloads": {},
+   "ready": true,
+   "saved_composition_instances": 113638
+  }
+ }
+}

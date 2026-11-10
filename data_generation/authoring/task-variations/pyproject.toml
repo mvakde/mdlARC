@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arc-task-variations"
+version = "1.0.0"
+description = "Task summaries, generators, reviews and improvements"
+requires-python = ">=3.10"
+# The SDK supplies the same-version CLI (openai-codex-cli-bin). This is the
+# single Codex version pin for all active pipelines; use tools/codex.py update.
+dependencies = ["numpy>=2,<3", "openai-codex==0.163.0"]
+
+[project.optional-dependencies]
+# Keep the Drive clients on the patched CA bundle.
+sync = ["certifi>=2026.10.19", "google-api-python-client>=2,<3", "google-auth>=2,<3"]
+
+[project.scripts]
+arc-task-variations = "task_variations.cli:main"
+
+[tool.setuptools]
+packages = [
+    "task_variations",
+    "task_variations.common",
+    "task_variations.summary",
+    "task_variations.generate",
+    "task_variations.review",
+    "task_variations.improve",
+    "task_variations.programs",
+    "task_variations.shared",
+]
+
+[tool.setuptools.package-dir]
+task_variations = "src"
+"task_variations.common" = "src/common"
+"task_variations.summary" = "src/01-summary"
+"task_variations.generate" = "src/02-generate"
+"task_variations.review" = "src/03-review"
+"task_variations.improve" = "src/04-improve"
+"task_variations.programs" = "src/05-programs"
+"task_variations.shared" = "src/shared"
+
+[tool.setuptools.package-data]
+"task_variations.common" = ["trace_storage.c"]
+"task_variations.programs" = ["inspection.html", "inspection-lazy.html", "inspection-app.js", "inspection.css", "authoring.txt", "PROGRAM_DATA_REQUIREMENTS.md"]

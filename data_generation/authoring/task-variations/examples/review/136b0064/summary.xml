@@ -1,0 +1,53 @@
+<rules_summary>
+A full-length separator divides the input into a two-lane instruction panel and a blank drawing pane containing a one-cell seed. Read all three-by-three instruction glyphs down the first lane, then all glyphs down the second lane. Interpret each glyph’s occupancy pattern as a fixed stroke command. Starting at the seed, draw every commanded stroke in the glyph’s foreground color, immediately below the current endpoint, and make the stroke’s far end the next endpoint. Return the entire drawing pane, preserving its dimensions and blank margins while discarding the instruction panel and separator.
+</rules_summary>
+
+<input_generation>
+The input contains a neutral background, a full-height structural separator, two instruction lanes on one side, and a seven-cell-wide drawing pane on the other. Each lane contains the same number of three-by-three monochrome glyphs, aligned into three-row bands separated by one blank row. Thus, for n glyph rows, the height is 4n-1.
+
+After replacing each glyph’s color by X and its empty cells by dots, four command masks are possible:
+- XX./X.X/.X. is a three-cell rightward stroke.
+- X.X/X.X/XXX is a two-cell leftward stroke.
+- X.X/.X./.X. is a two-cell downward stroke.
+- XXX/.X./X.X is a four-cell leftward stroke.
+
+The drawing pane is initially empty except for a distinct seed in its top row. The seed column and command sequence ensure that the completed path fits inside the pane and that no conflicting stroke overlaps occur. The background, separator, seed, and glyph foreground roles are distinguishable.
+</input_generation>
+
+<variation_guidance>
+The number of glyph rows, total height, instruction order, frequency of each command, and seed column may vary. A command type may repeat consecutively, causing same-colored strokes to merge visually, and some command types may be absent. The amount of unused background below or beside the path may also vary. Literal colors may be reassigned: glyph geometry determines the movement command, while each resulting stroke inherits its glyph’s foreground color. The three-by-three command masks, two-lane column-major reading order, separator-defined drawing pane, and one-cell seed remain invariant. No rotations, alternative panel layouts, or noise are evidenced.
+</variation_guidance>
+
+<train_test_shift>
+The training examples contain two, three, or four glyph rows, yielding four, six, or eight commands on heights from 7 to 15. The test increases this to five glyph rows and ten commands on a height-19 grid, producing the longest path and a new ordering with repeated rightward commands in the second lane. It retains the same width, separator orientation, pane size, four command masks, seed role, and color-role assignments; it introduces no new command or rotated layout. The required generalization is to preserve column-major program order, exact glyph-to-stroke decoding, endpoint chaining, and the full-pane output crop for a longer instruction sequence.
+</train_test_shift>
+
+<solution_steps>
+1. Locate the full-height separator and extract the seven-column drawing pane on its blank side.
+2. Preserve the seed cell and use it as the initial endpoint.
+3. Segment the opposite panel into its two columns of three-by-three glyphs.
+4. List the glyphs from top to bottom in the first lane, followed by those from top to bottom in the second lane.
+5. Normalize each glyph to its occupied-cell mask and identify its command.
+6. For a right-three command, paint the next row from the current column through two columns to the right; set the rightmost cell as the endpoint.
+7. For a left-two command, paint the next row from one column left through the current column; set the leftmost cell as the endpoint.
+8. For a down-two command, paint the next two cells below the endpoint in its current column; set the lower cell as the endpoint.
+9. For a left-four command, paint the next row from three columns left through the current column; set the leftmost cell as the endpoint.
+10. Color every stroke with its source glyph’s foreground color and continue from the updated endpoint.
+11. Return the complete drawing pane unchanged in size, including the seed and all unused background cells.
+</solution_steps>
+
+<key_insight>
+The left panel is a column-major drawing program: the ornate three-by-three glyphs are commands for successive colored strokes, not shapes to copy directly.
+</key_insight>
+
+<puzzle_concepts>
+- instruction decoding
+- column-major traversal
+- sequential path construction
+- glyph-to-command mapping
+- endpoint chaining
+- colored stroke drawing
+- panel extraction
+- semantic color roles
+- variable-length programs
+</puzzle_concepts>

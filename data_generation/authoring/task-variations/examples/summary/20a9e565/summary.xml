@@ -1,0 +1,43 @@
+<rules_summary>
+Two three-cell L-shaped markers annotate opposite corners of an erased axis-aligned region. The tight bounding rectangle containing both markers is the output window, including the rows and columns occupied by the markers themselves. Infer the latent structured pattern from the unmasked scene, including its motif geometry, regular changes in position or size, and cyclic assignment of content colors. Extend that construction into the marked rectangle and return exactly that crop in its original orientation. Replace the marker cells with the predicted underlying content or background; the marker color never appears in the output.
+</rules_summary>
+
+<input_generation>
+Every input contains a uniform background and a partially visible deterministic construction made from one or more interleaved sequences of colored motifs. Successive motifs need not be identical pixel-for-pixel: their positions, dimensions, or extents may change by a consistent arithmetic progression, while their content colors follow a repeating cycle. Enough consecutive instances must be visible to determine these geometric and color phases uniquely.
+
+A distinct annotation color forms exactly two disconnected three-cell L shapes. At the upper-left corner of the target rectangle the marker occupies the top and left cells of a 2-by-2 corner block; at the lower-right corner it occupies the bottom and right cells of the corresponding corner block. The entire rectangle between their extreme rows and columns represents a masked portion of the same latent construction. Apart from the markers, this region is shown as background and supplies no pattern evidence.
+</input_generation>
+
+<variation_guidance>
+The construction may progress horizontally, vertically, or through staggered or diagonal arrangements, and the target may require forward or backward extrapolation. Motifs may be lines, comb-like shapes, hollow or filled blocks, or compound arrangements; their count, scale, alignment, spacing, and growth increment may vary, provided each instance has a consistent rule. The marker rectangle may be tall, wide, shallow, or may cut through only part of one or several motifs.
+
+The number and literal identities of content colors may vary. Treat them as positions in an instance-specific repeating color cycle, distinct from the background and marker roles. Preserve the input’s actual content colors when rendering the prediction. Arbitrary noise is not evidenced: every non-background, non-marker cell should contribute to identifying the structured continuation.
+</variation_guidance>
+
+<train_test_shift>
+In all three training examples, the marked window lies to the right of the principal visible construction and is narrow, with output widths of 2, 3, or 6. The test examples move the missing region onto the vertical continuation axis: one window is above the visible construction and the other is below it. They are also substantially wider, producing 2-by-21 and 8-by-17 crops that span multiple motif positions rather than only a narrow strip or single motif. Both tests use two content colors where each training input uses three, but those colors retain the same cyclic-content role. The required generalization is to preserve the inferred geometric and color phase across changes in extrapolation axis, direction, palette size, and target aspect ratio.
+</train_test_shift>
+
+<solution_steps>
+1. Locate the two three-cell L markers and distinguish their annotation color from the background and content colors.
+2. Take the minimum and maximum marker rows and columns as the inclusive bounds of the output rectangle.
+3. Ignore all marker cells and regard the entire bounded rectangle as erased.
+4. Decompose the visible content into repeated or interleaved motif sequences. Infer each motif’s internal geometry, alignment, spacing, systematic size changes, and content-color cycle from all available repetitions.
+5. Continue the inferred construction in global input coordinates, forward or backward as required, while maintaining its exact positional, geometric, and color phase.
+6. Crop the reconstructed field to the marker rectangle, leaving cells background wherever the continuation places no motif. Return this crop without either marker or any material outside the rectangle.
+</solution_steps>
+
+<key_insight>
+The L shapes do not outline an area to fill uniformly; they specify the exact crop of a hidden continuation whose object geometry, growth, placement, and color cycle must be extrapolated from the rest of the scene.
+</key_insight>
+
+<puzzle_concepts>
+- marked-region reconstruction
+- opposite-corner markers
+- inclusive bounding-box extraction
+- object-level pattern extrapolation
+- arithmetic growth and spacing
+- cyclic color phase
+- forward and backward continuation
+- orientation and aspect-ratio generalization
+</puzzle_concepts>

@@ -1,0 +1,35 @@
+<rules_summary>
+Each composite object is a directional hollow frame with one pointed tip and an associated payload color. Use the payload as a unary quantity: clear the payload cells embedded in the frame’s hollow, preserve the frame, and write that quantity as a one-cell-wide straight ray in the payload color, beginning immediately beyond the tip and continuing in the tip’s outward direction. Stop at the grid boundary, so a ray is truncated when fewer outward cells are available. Unrelated cells outside the object are unchanged.
+</rules_summary>
+<input_generation>
+A valid input contains one or more spatially separable directional objects. Each object has a connected frame whose geometry identifies a unique tip, an opposite open or broad side, and a hollow region containing or associated with payload markers of another semantic color. The frame and payload roles must be distinguishable locally even if their literal colors are reused elsewhere. Objects must be sufficiently separated for each payload quantity and tip direction to be assigned unambiguously. Payload-colored marks outside a frame’s bounded hollow may be inert and must remain unchanged unless their placement clearly associates them with that object.
+</input_generation>
+<variation_guidance>
+Grid height and width, object count, object placement, spacing, frame size, cavity depth, payload quantity, and payload arrangement may vary. Frames may be rotated; the examples establish upward-, leftward-, and rightward-pointing tips, and the same tip-relative rule applies after rotation. Payload markers may be sparse, contiguous, or irregularly arranged because their original pattern is discarded and only their unary quantity is exported. Different objects may use different frame and payload colors, several objects may share a payload color, and a literal color may serve as a frame for one object while serving as payload for another. Rays may be fully visible or clipped by an edge. The background remains the neutral field, and unrelated exterior marks are preserved.
+</variation_guidance>
+<train_test_shift>
+The training set contains one or two objects per grid, uses square grids of sizes 10 or 12, and separately demonstrates horizontal tips, repeated upward tips, shared payload colors, and boundary truncation. The test increases the count to three objects, uses a slightly wider 12-by-13 grid, combines upward and rightward objects in one scene, and uses a richer palette in which one literal color has different roles in different objects. Its right-pointing objects are also close enough to the right edge that their exported rays are truncated. No unseen orientation is required; the solver or generator must preserve local role assignment, direction from each frame’s tip, unary payload serialization, clipping, and independence between objects despite color reuse.
+</train_test_shift>
+<solution_steps>
+1. Segment the grid into spatially distinct frame-and-payload objects, using geometry rather than literal color alone.
+2. For each frame, locate its unique pointed tip and determine the outward direction from the broad or open side through that tip.
+3. Identify the payload markers associated with that frame and determine the encoded unary quantity.
+4. Restore the frame’s hollow by replacing its embedded payload cells with background while leaving the frame unchanged.
+5. Starting in the first cell immediately beyond the tip, place payload-colored cells consecutively along the outward axis until the encoded quantity is exhausted or the grid edge is reached.
+6. Preserve all unrelated objects, exterior marks, and the original grid dimensions.
+</solution_steps>
+<key_insight>
+The irregular payload pattern is not reproduced geometrically: it encodes a quantity that must be extracted from a directional hollow frame and rewritten as a straight, possibly edge-clipped continuation beyond the frame’s tip.
+</key_insight>
+<puzzle_concepts>
+- object segmentation
+- semantic color roles
+- directional frame recognition
+- unary quantity encoding
+- payload extraction
+- ray construction
+- rotation invariance
+- boundary clipping
+- color-role reuse
+- distractor preservation
+</puzzle_concepts>

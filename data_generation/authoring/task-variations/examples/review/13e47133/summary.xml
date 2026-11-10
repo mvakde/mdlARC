@@ -1,0 +1,43 @@
+<rules_summary>
+Preserve the one-cell-wide orthogonal divider network and recolor every region it separates into cyclic contour bands. For each open region, a short diagonal key supplies an ordered color period for successive inward layers. Define layer 0 as all region cells touching the canvas exterior or divider network, including diagonal contact; repeatedly strip this boundary to obtain layers 1, 2, and so on. Fill layer d with key color d modulo the key length. The neutral canvas color may itself be a key entry, and a region with no visible key remains uniformly neutral.
+</rules_summary>
+
+<input_generation>
+Each input contains a rectangular neutral canvas crossed by a connected network of one-cell-wide horizontal and vertical divider segments. Treating every non-divider cell as open, this network partitions the canvas into unambiguous four-connected regions, which may be rectangular, indented, or surround attached divider boxes.
+
+Each nontrivially colored region contains one short key running diagonally inward from a convex corner, with consecutive key positions lying on consecutive contour depths. The prefix through the deepest explicit non-neutral cue defines one complete period; neutral-colored positions within that prefix are meaningful entries despite blending into the canvas. An entirely unmarked region implicitly has the one-color neutral period. Every non-neutral, non-divider cell belongs to such a key, and the line geometry and cue placement must uniquely determine the associated region, corner, period length, and phase.
+</input_generation>
+
+<variation_guidance>
+Canvas dimensions, divider topology, branch positions, attached boxes, region count, region depth, and the shapes of connected regions may vary. Keys may point inward from any convex-corner orientation, may contain one or several colors, and may include neutral gaps. Their period lengths and palettes may differ independently between regions, while colors may be reused across different keys. Literal identities of the neutral, divider, and band colors may be reassigned; only their local roles matter. The divider remains one cell wide, and arbitrary noise is not evidenced.
+</variation_guidance>
+
+<train_test_shift>
+Each training grid has a relatively simple divider arrangement producing three regions on a 10-by-13 or 20-by-20 canvas. It demonstrates rectangular regions, a region distorted by an attached divider box, one-, two-, and three-entry periods, a period containing the neutral color, and keys entering from upper corners. Both tests expand to 30-by-30 canvases with substantially more branches, attached structures, regions, contour depth, and interacting concavities. The second test also introduces keys read upward from lower corners, uses the richest palette, and reassigns a familiar literal color to the divider role. The required generalization is to preserve region segmentation, eight-neighbor contour depth, key phase, cyclic coloring, and divider preservation across larger scale, more complex topology, new key orientations, and semantic color reassignment.
+</train_test_shift>
+
+<solution_steps>
+1. Identify the neutral canvas color and the distinct one-cell-wide orthogonal divider color.
+2. Preserve the divider cells and segment all remaining cells into four-connected open regions.
+3. For each region, construct contour layers by assigning layer 0 to cells with any of their eight neighboring positions outside the region, counting positions beyond the canvas as outside. Remove that layer and repeat to assign increasing depths.
+4. Locate the region’s diagonal key at a convex corner and read its positions in increasing contour-depth order.
+5. Take the prefix ending at the deepest explicit non-neutral cue as one period, retaining any neutral-colored positions inside that prefix. If there is no cue, use the one-entry neutral period.
+6. For every cell at depth d, write entry d modulo the period length from that region’s key.
+7. Repeat independently for every region, leaving the divider network, grid dimensions, and orientation unchanged.
+</solution_steps>
+
+<key_insight>
+The sparse diagonal colors encode a repeating palette by erosion depth: the divider geometry, including concave corners and holes, determines the contour layers that receive that cycle.
+</key_insight>
+
+<puzzle_concepts>
+- orthogonal divider network
+- connected-component segmentation
+- iterative morphological erosion
+- eight-neighbor contour depth
+- diagonal key decoding
+- cyclic color propagation
+- concave-region handling
+- semantic color roles
+- orientation and scale generalization
+</puzzle_concepts>

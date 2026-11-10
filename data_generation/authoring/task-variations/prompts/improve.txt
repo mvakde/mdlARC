@@ -1,0 +1,250 @@
+You are improving a reusable Python generator for one existing ARC-AGI puzzle family.
+
+The current generator was synthesized from the original solved task and a seven-section summary. A reviewer then inspected puzzles produced by that generator and wrote correction and diversity instructions. The review may be automated. Improve the staged generator so it implements compatible requests while remaining faithful to the original ARC rule.
+
+This is a self-contained, puzzle-specific Git workspace. Inspect its staged evidence and tools. Edit `generator.py` as the deliverable and use `scratch/` for temporary code, analysis, reports, and renderings. Do not inspect parent or sibling directories or modify protected files.
+
+<source_task>
+{TASK_JSON}
+</source_task>
+
+<task_summary>
+{SEVEN_SECTION_SUMMARY}
+</task_summary>
+
+<current_generator_code>
+{CURRENT_GENERATOR_CODE}
+</current_generator_code>
+
+<human_review_instructions>
+{HUMAN_REVIEW_INSTRUCTIONS}
+</human_review_instructions>
+
+## Evidence priority and objective
+
+Treat the original solved task as the primary evidence for the invariant transformation. The summary is an interpretation: <rules_summary>, <solution_steps>, and <key_insight> describe the intended family where supported by the source; <input_generation>, <variation_guidance>, and <train_test_shift> guide construction and diversity. The current generator is an implementation attempt. Verify the review's claims and requests against the original task.
+
+The source rule takes priority over requested expansion. For a shape-to-color or pattern-to-label lookup, preserve the demonstrated pattern identities. Component counts, areas, or other statistics that happen to distinguish the source patterns do not justify new shape equivalences. Teaching those equivalences in synthetic training does not make them faithful to the source. Decline incompatible review requests and report the conflict; do not retain an unsupported extra regime to satisfy a diversity request.
+
+Implement every compatible human instruction. If the review identifies an error in the current generator or summary, re-derive that point from the source task and correct the replacement. If an instruction is ambiguous, choose the strongest faithful interpretation supported by the source task rather than ignoring it. Do not preserve an implementation choice merely because it exists in the current code.
+
+Your replacement may substantially redesign the current generator. Retain useful, correct logic when appropriate, but eliminate collapsed generation modes, accidental fixed constants, weak parameter ranges, repeated layouts, and validators or tests that encode the current generator's mistakes.
+
+Generate a broad distribution of valid, unambiguous puzzles from the same family, with meaningful variation both among pairs in one puzzle and across puzzle seeds.
+
+## Review-driven implementation
+
+Before coding, reason through every distinct request in `review.md`. For each requested axis of variation or correction:
+
+1. Identify whether it is a puzzle-level parameter, pair-level parameter, train/test regime property, or invariant rule.
+2. Give it a real sampling mechanism with a useful range, not a token two-case branch.
+3. Allow multiple compatible variation axes to combine in the same generated pair and puzzle.
+4. Avoid strong correlations that collapse independently variable properties into a small set of templates.
+5. Add task-specific validation for hard invariants.
+6. Add meaningful self-test coverage and diversity measurements when the property is machine-checkable.
+
+Record this mapping in `scratch/review_coverage.md`: quote each review request, state the supported range and sampling mechanism, identify within-puzzle versus cross-seed requirements, and give its measured result or a concrete visual inspection. Include compatible combinations of variation axes. Use the protected criteria in `acceptance.json` and measurements from `scratch/verification.json`; add task-specific measurements in your own tests when a review property has no host metric. Explicitly label anything not verified. Never claim that a generic check establishes an unmeasured review requirement.
+
+Use `task.json` for exact numeric evidence, `source_task.svg` for the labeled original grids, and `reviewed_samples.json` for a small set of old generated samples with their seeds and count settings. Run `python render.py reviewed_samples.json --output scratch/reviewed.png` and render your own representative seeds with `python render.py --seed 123 --output scratch/candidate.png`. Inspect examples from small and large sizes and different measured regimes, including combined variations.
+
+Edit `generator.py` in place. Preserve useful correct logic where practical, but make whatever implementation changes are needed to satisfy the review and this contract.
+
+## Whole-puzzle generation
+
+Implement:
+
+    generate_puzzle(
+        seed: int,
+        num_train: int | None = None,
+        num_test: int | None = None,
+    ) -> dict
+
+Each call returns one complete solved ARC puzzle:
+
+    {
+        "train": [
+            {"input": np.ndarray, "output": np.ndarray},
+            ...
+        ],
+        "test": [
+            {"input": np.ndarray, "output": np.ndarray},
+            ...
+        ],
+    }
+
+The test outputs are included because this program creates solved synthetic training data. The program will normally be called for approximately 30-40 seeds. Each call must return a coherent puzzle, not one isolated pair or a bag of unrelated pairs.
+
+## Pair counts
+
+Every generated puzzle must satisfy:
+
+    2 <= num_train <= 10
+    1 <= num_test <= 4
+    num_train > num_test
+
+If both counts are supplied, validate and use them exactly. If one is omitted, choose a legal value deterministically from the seed while honoring the supplied count. If both are omitted, choose a legal pair deterministically. Raise ValueError for illegal or impossible requests. Automatic counts must genuinely vary across seeds.
+
+## Puzzle-level and pair-level parameters
+
+At the beginning of generate_puzzle, sample conventions that a solver learns from the training set once for the whole puzzle. Examples include semantic color roles, direction conventions, marker meanings, color maps, ordering rules, or shared geometric constants. Only use conventions supported by the source family.
+
+Then generate all training and test pairs using those conventions. Pair-level properties such as dimensions, positions, counts, spacing, scale, local geometry, and arrangement should vary independently when permitted. Do not randomize independently per pair anything the solver is supposed to learn across the task.
+
+The generated training pairs must collectively reveal every puzzle-level convention needed to solve every test pair. They must remain mutually consistent and must not imply contradictory rules.
+
+## Train and test regimes
+
+Use regime "source_train" for puzzle["train"]. Training pairs must clearly demonstrate the rule, expose all puzzle-level conventions, preserve any real training-side restriction, and vary enough to prevent memorization of one layout.
+
+Use regime "target_test" for puzzle["test"]. Test pairs must use the same rule and conventions, incorporate supported test-side shifts, remain uniquely solvable from the training demonstrations, and be new configurations rather than copies of source pairs.
+
+If the source task has no meaningful train-test shift, draw test pairs from a more challenging or less common part of the same permitted variation space. Do not invent a new ARC concept just to make test pairs different.
+
+## Core correctness requirements
+
+A generated puzzle must satisfy all of the following:
+
+1. Every pair uses the same invariant transformation rule.
+2. Every convention affecting test outputs is demonstrated unambiguously by training pairs.
+3. Every test output is uniquely determined by the complete generated training set and its test input.
+4. A solver never needs the seed, RNG state, hidden parameters, or implementation details.
+5. Pair-level choices affecting an output are visible in that input or established by training demonstrations.
+6. Ground truth is built by the same rule a solver should infer.
+7. Training evidence distinguishes the intended rule from reasonable alternatives.
+8. Test pairs exercise the supported shift without changing the rule.
+9. Puzzles are not malformed, ambiguous, contradictory, or unsolvable.
+10. No generated pair exactly copies an original source pair.
+11. Every grid has 1-30 rows and 1-30 columns.
+12. Every cell is an integer ARC color from 0 through 9.
+13. Input should not equal output unless unchanged examples are meaningful for this family.
+14. A puzzle contains no duplicate inputs and no duplicate input/output pairs.
+15. Input/output dimension relationships demonstrated by the task are preserved.
+16. Background, structural, marker, object, and output color roles remain semantically correct.
+17. Every correction and compatible diversity requirement from the human review is implemented.
+
+## Diversity requirements
+
+Structural and conceptual diversity matters more than superficial recoloring. Do not make every pair a translated, recolored, resized, or lightly perturbed copy of one layout.
+
+Across seeds and, when compatible, within a puzzle, vary the broadest supported combination of:
+
+- dimensions and aspect ratios
+- object or region counts
+- positions, spacing, orientation, and scale
+- motif and boundary geometry
+- sequence lengths and compartment layouts
+- semantic color assignments
+- corruption, masking, or incomplete-boundary patterns
+- target-region position and dimensions
+- repeated-structure counts and arrangements
+- source-supported train/test shifts
+- every variation axis called out by the human review
+
+Avoid template banks with only a few hand-written layouts unless the source family itself has a finite vocabulary. Prefer compositional construction that can produce many structurally distinct valid configurations.
+
+Across 42 fixed seeds, require substantial diversity in grids, layouts, dimensions, counts, puzzle-level parameter assignments, and review-requested properties. Tests for diversity must examine generated results or independently reconstructed properties, not merely values sampled into an internal dictionary.
+
+Prevent source copies by comparing input/output grid contents, including shape. Do not ban all original grid dimensions, palettes, or layout categories to avoid exact copies. In particular, 30-by-30 source grids do not make new 30-by-30 grids invalid. The host compares actual source pairs and measures color-normalized, cropped structure as well as palettes and sizes. Distinct hashes alone do not demonstrate broad structural diversity: inspect feature distributions and combinations and remove unnecessary correlations or narrow ranges.
+
+Within one puzzle, include meaningful diversity among pairs while keeping learned conventions stable. In particular, do not accidentally hold a pair-level property constant across all pairs when the human review asks for within-puzzle variation.
+
+## Randomness and determinism
+
+Use:
+
+    rng = np.random.default_rng(seed)
+
+For fixed seed and count arguments, the complete puzzle must be deterministic. Do not use global random state. Derive independent deterministic randomness for pairs without recreating the same RNG from the same unchanged seed. Different seeds should usually produce structurally different puzzles.
+
+Use bounded construction and deterministic fallback logic. Avoid flaky rejection loops that can fail legal seeds or requested boundary counts.
+
+## Whole-puzzle recoverability
+
+A test output need not always be recoverable from its test input alone, but it must be uniquely recoverable from the generated training pairs plus that test input. Hidden puzzle-level parameters may be used internally to construct ground truth only when the returned training pairs reveal them unambiguously.
+
+Do not choose a hidden color map, direction, pattern, or selection rule that is absent from training but needed at test time. Do not erase all evidence needed to reconstruct a masked test output. Validate that demonstrations cover every convention and every test-side case that requires learned information.
+
+Perform a prediction check using only copies of training input/output pairs and a test input. Do not use any test output, seed, or generator metadata to infer the expected answer. A protected `reference_checks.py`, when present, may supply `solve(train_pairs, test_input)` for this purpose; the host tests it against the source tests and new generated tests. The report explicitly states when no reference solver is configured. Your own solver or tests may support your analysis, but agreement between code you wrote is not independent evidence that the rule is correct.
+
+## Required Python interface
+
+The complete program must contain:
+
+    import numpy as np
+
+    def generate_puzzle(
+        seed: int,
+        num_train: int | None = None,
+        num_test: int | None = None,
+    ) -> dict:
+        ...
+
+The returned dictionary contains exactly "train" and "test". Each value is a list of pair dictionaries containing exactly "input" and "output", both integer NumPy arrays.
+
+Also implement:
+
+    def validate_generated_puzzle(puzzle: dict) -> None:
+        ...
+
+    def self_test() -> None:
+        ...
+
+The validator raises AssertionError for an invalid generated puzzle. You may add task-specific helpers. The exported generator must not implement a CLI, read or write files, access the network, use eval, exec, subprocesses, multiprocessing, or external packages other than NumPy. These restrictions apply to the exported generator; you may use ordinary shell/Python tools to inspect staged evidence and write experiments and images inside `scratch/`.
+
+## Validator requirements
+
+validate_generated_puzzle must check at least:
+
+1. Exactly the train and test keys exist and both values are lists.
+2. Pair counts obey all required bounds and train count exceeds test count.
+3. Every pair has exactly input and output.
+4. Every grid is a two-dimensional integer NumPy array with legal dimensions and colors.
+5. Inputs and input/output pairs are unique within the puzzle.
+6. Task-specific transformation and structural invariants hold for every pair.
+7. Puzzle-level conventions are consistent.
+8. Training demonstrations expose every convention needed by tests.
+9. Training and test regime restrictions are satisfied.
+10. Generated pairs do not copy source pairs.
+11. Machine-checkable properties required by the human review hold.
+
+The validator must independently inspect the returned puzzle where practical. It must not accept a puzzle merely because generation-time metadata says it is valid.
+
+## Self-test requirements
+
+self_test must:
+
+1. Test automatic, fully explicit, and partially specified pair counts.
+2. Test whole-puzzle determinism and cross-seed difference.
+3. Validate every generated puzzle.
+4. Check task-specific transformations independently for every pair.
+5. Check shared puzzle-level conventions and training coverage for test outputs.
+6. Check source_train restrictions and target_test properties.
+7. Check non-duplication against source pairs.
+8. Generate 42 fixed seeds and enforce substantial structural diversity.
+9. Observe at least four train counts and at least three test counts across automatic seeds.
+10. Exercise legal boundaries: (2,1), (10,1), and (10,4).
+11. Exercise partial counts: (None,1), (None,4), (2,None), and (10,None).
+12. Require ValueError for num_train 1 or 11, num_test 0 or 5, and num_train <= num_test.
+13. Check all grid sizes, dtypes, colors, and duplicate constraints.
+14. Explicitly measure every machine-checkable correction and variation axis in the human review, including requested within-puzzle versus cross-seed diversity.
+
+Tests must be meaningful and task-specific. Do not satisfy requirements with trivial assertions that only repeat internal assignments. Keep self_test bounded enough to run in the existing sampling workflow.
+
+`python verify.py` also runs host-owned checks that call generate_puzzle directly: 42 fresh automatic seeds, all legal explicit count combinations, partial counts, illegal counts, repeated calls for determinism, actual grid/schema/bounds checks, duplicate/source-copy checks, and protected review criteria. Host acceptance repeats verification with a new recorded seed base. Failures include the seed and count request; reproduce them using `python verify.py --seed-base N`. Inspect the complete distributions and per-puzzle metrics in `scratch/verification.json`. A run without configured semantic or task-specific checks must be reported as such.
+
+## Completion report
+
+After `python verify.py` passes, briefly explain in your final response:
+
+- the invariant puzzle family
+- every review-driven correction or expansion
+- properties sampled once per puzzle versus varied per pair
+- train/test regime differences
+- how training reveals all conventions needed by tests
+- why test outputs are uniquely inferable
+- how ground truth is constructed
+- how ambiguity and rule drift are prevented
+- how structural and review-requested diversity is measured
+- the actual measured coverage of each review request and any unverified claims
+
+Do not paste the replacement program into the response. The edited `generator.py` is the deliverable. Do not leave placeholders, pseudocode, TODO comments, or unimplemented functions in it.

@@ -1,0 +1,4 @@
+#!/bin/sh
+# This helper only prepares/checks artifacts. Claude Code supplies all model work.
+pipeline_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${ARC_PIPELINE_PYTHON:-$pipeline_root/../task-variations/.venv/bin/python}" "$pipeline_root/claude_web.py" "$@"

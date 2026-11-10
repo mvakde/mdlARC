@@ -1,0 +1,430 @@
+You are creating additional solved puzzles for one existing ARC-AGI task.
+
+Your job is to write a reusable Python program that generates complete new ARC puzzles belonging to the same puzzle family.
+
+Each generated puzzle must contain multiple training input/output pairs and multiple test input/output pairs. All pairs within one generated puzzle must share one coherent transformation rule and any puzzle-level conventions.
+
+Do not combine the source task with another task. Generate new instances and new train-test configurations of this task only.
+
+<source_task>
+{TASK_JSON}
+</source_task>
+
+<task_summary>
+{SEVEN_SECTION_SUMMARY}
+</task_summary>
+
+## Summary structure
+
+The summary contains:
+
+- <rules_summary>: the invariant input-to-output transformation
+- <input_generation>: how valid input instances are constructed
+- <variation_guidance>: properties that may safely vary
+- <train_test_shift>: differences between the source training examples and the target test examples
+- <solution_steps>: how an output is derived from an input
+- <key_insight>: the central invariant
+- <puzzle_concepts>: relevant concepts
+
+The original solved task is primary evidence; the summary is an interpretation that may be wrong. Use <rules_summary>, <solution_steps>, and <key_insight> to describe the invariant family only where supported by the original. Surface properties may vary, but the underlying reasoning rule must not drift into a different ARC task.
+
+For shape-to-color or pattern-to-label tasks, exact shape identity may be the rule. Preserve the demonstrated vocabulary; do not substitute component counts, areas, or another coincidentally matching statistic and then generate unrelated shapes. Teaching a broader rule in synthetic demonstrations does not establish that it belongs to the source family. Limited geometry variation is valid when the geometry is what the solver must recognize.
+
+Use <input_generation> to construct valid input instances.
+
+Use <variation_guidance> to introduce permitted diversity.
+
+Use <train_test_shift> to create a meaningful difference between the generated training and test distributions.
+
+## Whole-puzzle generation
+
+Implement:
+
+    generate_puzzle(
+        seed: int,
+        num_train: int | None = None,
+        num_test: int | None = None,
+    ) -> dict
+
+Each call must return one complete solved ARC puzzle in this structure:
+
+    {
+        "train": [
+            {"input": np.ndarray, "output": np.ndarray},
+            ...
+        ],
+        "test": [
+            {"input": np.ndarray, "output": np.ndarray},
+            ...
+        ],
+    }
+
+The test outputs are included because this program produces solved synthetic training data, including the labels
+
+The program will be called approximately 30–40 times. Each call must produce one complete derived puzzle, not one isolated pair.
+
+## Pair counts
+
+Every generated puzzle must satisfy:
+
+    2 <= num_train <= 10
+    1 <= num_test <= 4
+    num_train > num_test
+
+If num_train and num_test are both supplied, validate both values and use them exactly.
+
+If both are omitted, select a legal pair of counts deterministically from the seed.
+
+Raise ValueError for illegal or impossible count combinations.
+
+Across different seeds, the number of train and test pairs must genuinely vary.
+
+## Puzzle-level generation
+
+At the beginning of generate_puzzle, sample any puzzle-level parameters that must remain consistent across the entire generated puzzle.
+
+Examples may include:
+
+- semantic color roles
+- transformation direction
+- marker conventions
+- motif vocabulary
+- object-selection criteria
+- ordering rules
+- output color mappings
+- shared geometric constants
+- shared structural conventions
+
+Only use puzzle-level parameters supported by the source task and summary.
+
+Then generate every training and test pair using those same puzzle-level
+parameters.
+
+You may implement helpers such as:
+
+    sample_puzzle_parameters(
+        rng: np.random.Generator,
+    ) -> dict
+
+    generate_pair(
+        rng: np.random.Generator,
+        regime: str,
+        puzzle_parameters: dict,
+    ) -> tuple[np.ndarray, np.ndarray]
+
+The precise helper structure may differ when another organization is more
+appropriate for the task.
+
+## Pair regimes
+
+Use the regime "source_train" when generating entries for puzzle["train"].
+
+Generated training pairs should:
+
+- clearly demonstrate the transformation
+- follow the structural distribution of the original source training examples
+- collectively reveal every puzzle-level convention needed to solve the test
+  pairs
+- contain enough variation to prevent memorization of one layout
+- preserve training-side restrictions described by <train_test_shift>
+
+Use the regime "target_test" when generating entries for puzzle["test"].
+
+Generated test pairs must:
+
+- use the same transformation rule as the generated training pairs
+- use the same puzzle-level conventions
+- incorporate test-side changes described by <train_test_shift>
+- remain solvable using the generated training pairs
+- be new configurations rather than copies of the original test pairs
+
+Examples of supported train-test shifts may include:
+
+- a new orientation
+- larger or smaller scale
+- a different arrangement of compartments
+- a different extrapolation direction
+- a different number of objects
+- reassignment of semantic color roles
+- a partial rather than complete repetition
+- a different combination of already-established factors
+- a change in output dimensions or aspect ratio
+- forward rather than backward continuation
+- a change in the number or arrangement of repeated structures
+
+You are encouraged to combine multiple already-established variations or test-side shifts when the resulting pair remains unambiguous and faithful to the source task.
+
+Do not introduce an unrelated ARC concept or transformation merely to increase difficulty.
+
+If <train_test_shift> describes no meaningful shift, generate test pairs from the more challenging or less common portion of the permitted variation space without inventing a new rule.
+
+## Puzzle coherence
+
+The returned object is one ARC puzzle, not an unrelated collection of pairs.
+
+Distinguish between:
+
+- puzzle-level parameters, which remain consistent across all pairs
+- pair-level parameters, which may vary from pair to pair
+
+Infer this distinction from the source task.
+
+For example, if a color mapping is learned from the source training outputs and then applied to the source test input, sample that mapping once for the whole generated puzzle. Demonstrate it unambiguously in the generated training pairs and apply it unchanged to every generated test pair.
+
+Conversely, properties such as object position, grid dimensions, object count, spacing, corruption location, and particular motif arrangement may vary per pair when the summary permits them.
+
+Do not randomize independently per pair any convention that the solver is supposed to learn across the task.
+
+The generated training pairs must be mutually consistent. They must not imply different transformation rules or contradictory puzzle-level conventions.
+
+## Core requirements
+
+A generated puzzle must satisfy all of the following:
+1. Every train and test pair uses the same underlying transformation rule.
+2. Any puzzle-level convention affecting the test outputs must be demonstrated unambiguously by the generated training pairs.
+3. Every generated test output must be uniquely determined by the complete generated training set together with that test input.
+4. A solver must not need the generator seed, hidden generator state, random number generator, or internal puzzle_parameters object. Everything needed to infer the test outputs must be observable in the returned grids.
+5. Pair-level random choices affecting an output must either be visible in that pair's input or determined by conventions demonstrated in the training pairs.
+6. Ground-truth outputs must be generated by the same rule that a solver is expected to infer. Do not generate outputs using arbitrary inaccessible information.
+7. The training pairs must provide enough evidence to distinguish the intended rule from reasonable alternative hypotheses.
+8. The test pairs must exercise the shift described by <train_test_shift> without changing the underlying rule.
+9. Do not create malformed, ambiguous, contradictory, or unsolvable puzzles.
+10. Do not copy any original train or test pair exactly.
+11. Every input and output grid must have between 1 and 30 rows and between 1 and 30 columns.
+12. Every cell must be an integer color from 0 through 9.
+13. Avoid degenerate pairs where input equals output unless unchanged examples are meaningful and explicitly supported by the source task.
+14. Within one generated puzzle, avoid duplicate inputs and duplicate input/output pairs.
+15. Preserve any invariant relationship between input and output dimensions demonstrated by the task.
+16. Preserve the semantic role of background, structural, marker, object, and output colors, while allowing literal colors to vary only when permitted.
+
+## Diversity requirements
+
+Across different puzzle seeds and across pairs within each puzzle, vary as many supported factors as possible. These factors are the ones supported or implied by <input_generation>, <variation_guidance>, <train_test_shift>, and the source grids.
+
+Some other factors that can be varied regardless (as long as it doesn't contradict the task rule or make it unsolvable):
+- dimensions
+- object count
+- object positions
+- spacing
+- orientation
+- scale
+- motif geometry
+- sequence length
+- compartment layout
+- semantic color assignment
+- corruption count and location
+- incomplete boundary repetitions
+- target-region position
+- target-region dimensions
+- number of repeated structures
+- arrangement of otherwise familiar components
+
+Structural and conceptual diversity is more important than superficial recoloring.
+
+Do not make every pair a recolored, translated, or resized copy of the same layout.
+
+Across approximately 30–40 calls, vary:
+- the number of train pairs
+- the number of test pairs
+- puzzle-level parameter assignments
+- pair-level layouts
+- grid shapes and sizes
+- the particular test-side shifts instantiated
+
+Within an individual puzzle, the training pairs must collectively demonstrate every puzzle-level convention needed to solve all its test pairs.
+
+## Randomness and determinism
+
+For a fixed seed and fixed count arguments, the complete generated puzzle must be deterministic.
+
+Use:
+    rng = np.random.default_rng(seed)
+
+Do not use global random state.
+
+Derive independent deterministic randomness for each pair. Do not pass the same unchanged seed or recreate the same random-number generator for every pair.
+
+The same call must always return exactly the same grids:
+    generate_puzzle(seed, num_train, num_test)
+
+Different seeds should usually produce structurally different puzzles.
+
+## Whole-puzzle recoverability
+
+This is critical.
+
+A test output does not necessarily need to be recoverable from its test input alone. It must be uniquely recoverable from:
+    generated training input/output pairs + generated test input
+
+The generator may use hidden puzzle-level parameters internally to construct ground truth only when those parameters are revealed unambiguously by the returned training pairs.
+
+Invalid example:
+- randomly choose whether red maps to blue or yellow
+- generate only training pairs where no red object occurs
+- place a red object in the test input
+- use the hidden random choice to construct the test output
+
+The solver has no evidence for the red mapping.
+
+Valid example:
+- randomly choose whether red maps to blue or yellow
+- include one or more training pairs that visibly demonstrate the chosen
+  mapping
+- use the same mapping in every test output
+
+For pair-specific masking, corruption, or erasure, enough information must exist either inside that input or through a convention demonstrated by the training pairs.
+
+Invalid example:
+- randomly generate a hidden pattern
+- erase every occurrence of the pattern from the test input
+- use hidden generator state to restore it in the test output
+- provide no corresponding evidence in the training pairs
+
+Valid example:
+- generate several consistent repetitions of a pattern
+- corrupt or mask only part of the pattern
+- leave enough repetitions or training demonstrations to infer the missing
+  content uniquely
+
+Do not rely on information that exists only in the seed, random-number generator, or internal puzzle_parameters object.
+
+## Required Python interface
+Return Python code containing:
+
+    import numpy as np
+
+    def generate_puzzle(
+        seed: int,
+        num_train: int | None = None,
+        num_test: int | None = None,
+    ) -> dict:
+        ...
+
+The returned dictionary must contain exactly:
+
+    "train"
+    "test"
+
+Each value must be a list of pair dictionaries containing exactly:
+
+    {
+        "input": np.ndarray,
+        "output": np.ndarray,
+    }
+
+All returned grids should use an integer NumPy dtype.
+
+Generate both the input and its corresponding ground-truth output for every pair.
+
+The ground-truth construction may use internal puzzle parameters, but the returned training pairs must expose every convention needed to infer the returned test outputs.
+
+You may add task-specific helper functions.
+
+Also implement:
+
+    def validate_generated_puzzle(puzzle: dict) -> None:
+        ...
+
+The validator must raise AssertionError when the generated puzzle is invalid.
+
+Implement:
+
+    def self_test() -> None:
+        ...
+
+Do not implement a command-line interface.
+
+Do not read files.
+
+Do not access the network.
+
+Do not use eval, exec, subprocesses, multiprocessing, or external packages
+other than NumPy.
+
+## Validation requirements
+
+validate_generated_puzzle must check at least:
+
+1. The result is a dictionary containing exactly "train" and "test".
+2. Both values are lists.
+3. The number of pairs satisfies:
+
+       2 <= len(puzzle["train"]) <= 10
+       1 <= len(puzzle["test"]) <= 4
+       len(puzzle["train"]) > len(puzzle["test"])
+
+4. Every pair is a dictionary containing exactly "input" and "output".
+5. Every grid is a two-dimensional NumPy array.
+6. Every grid has between 1 and 30 rows and between 1 and 30 columns.
+7. Every grid uses an integer dtype.
+8. Every grid contains only values from 0 through 9.
+9. There are no duplicate input grids within the puzzle.
+10. There are no duplicate input/output pairs within the puzzle.
+11. Every pair satisfies task-specific structural and transformation invariants.
+12. Training pairs satisfy source_train restrictions.
+13. Test pairs exhibit target_test properties.
+14. Puzzle-level conventions remain consistent across all pairs.
+15. Training pairs expose every convention required to determine the test outputs
+16. Generated pairs do not exactly duplicate source-task pairs.
+
+## Self-test requirements
+
+The self-test must:
+1. Generate complete puzzles using automatic pair counts.
+2. Generate complete puzzles using explicitly requested pair counts.
+3. Check whole-puzzle determinism: the same seed and requested counts must produce exactly the same puzzle.
+4. Check that different seeds usually produce different puzzles.
+5. Validate every generated puzzle using validate_generated_puzzle.
+6. Check task-specific input/output transformation invariants for every pair.
+7. Check that all pairs within a puzzle share the required puzzle-level conventions.
+8. Check that the generated training pairs demonstrate every puzzle-level parameter needed to determine the generated test outputs.
+9. Check that training pairs satisfy source_train structural restrictions.
+10. Check that test pairs contain the target_test properties described by <train_test_shift>.
+11. Check that generated pairs do not exactly duplicate source-task pairs.
+12. Generate 42 fixed puzzle seeds and require substantial diversity in grids, layouts, and puzzle-level parameters.
+13. Across those 42 seeds, observe at least four distinct train counts and at least three distinct test counts.
+14. Verify that legal boundary cases work, including:
+
+        num_train=2, num_test=1
+        num_train=10, num_test=1
+        num_train=10, num_test=4
+
+15. Verify that partial count specification works, including:
+
+        num_train=None, num_test=1
+        num_train=None, num_test=4
+        num_train=2, num_test=None
+        num_train=10, num_test=None
+
+16. Verify that illegal counts raise ValueError, including:
+
+        num_train=1
+        num_train=11
+        num_test=0
+        num_test=5
+        num_train <= num_test
+
+17. Check that every input and output satisfies all size, dtype, and color restrictions.
+18. Check that no generated puzzle contains duplicate pairs.
+
+The tests must be meaningful and task-specific. Do not satisfy them with
+trivial assertions that merely repeat values assigned by the generator.
+
+## Final answer
+
+First explain:
+
+- the invariant puzzle family
+- which properties are sampled once per puzzle
+- which properties vary independently per pair
+- how source_train pairs differ from target_test pairs
+- how the training pairs reveal all conventions needed for the test pairs
+- why the generated test outputs are uniquely inferable
+- how ground-truth outputs are constructed
+- how ambiguity and rule drift are prevented
+- how structural diversity is achieved across seeds
+
+Then provide the complete Python program in one fenced Python code block.
+
+The final answer must contain all required code and must not leave placeholders,
+pseudocode, TODO comments, or unimplemented functions.

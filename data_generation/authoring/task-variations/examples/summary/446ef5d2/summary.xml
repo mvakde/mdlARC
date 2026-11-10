@@ -1,0 +1,41 @@
+<rules_summary>
+Replace the scattered arrangement with a single filled, axis-aligned rectangle assembled from all payload pieces. Each piece is translated only: preserve its dimensions, orientation, internal color pattern, and every payload pixel. Repeated color sequences on piece boundaries encode adjacency; an entire edge may match either an equally long facing edge or a contiguous segment of a longer edge, allowing several smaller pieces to border one larger piece. Resolve these matches together with the requirements that pieces do not overlap, leave no gaps, and form one rectangle. A three-cell marker identifies one corner of an anchor piece. Keep that anchor corner at its original coordinate, make it the corresponding corner of the assembled rectangle, extend the assembly away from the marker, erase the marker, and restore every vacated input location to the background.
+</rules_summary>
+
+<input_generation>
+Every valid input contains a uniform background and several separated, fully occupied, axis-aligned rectangular payload pieces. Payload cells use a shared structural or carrier color together with one or more pattern colors whose ordered boundary sequences provide matching clues. One payload corner is accompanied externally by a distinct three-cell L marker: the marker cells and the payload corner together form a 2-by-2 square. The marker lies outside the eventual assembled rectangle and uniquely specifies both the anchor piece and which of its corners must remain fixed. The pieces collectively have exactly the area needed for a gapless rectangular tiling. Their boundary signatures, dimensions, the fixed anchor, and the no-overlap/full-rectangle constraints must determine a unique assembly. There are no unrelated distractors or noise cells.
+</input_generation>
+
+<variation_guidance>
+The canvas dimensions, output-rectangle dimensions and aspect ratio, number of pieces, piece widths and heights, and irregularity of the rectangular partition may vary. A long side may be partitioned among multiple shorter neighboring sides. Pieces may be scattered at arbitrary valid positions and spacings, but they are not rotated, reflected, scaled, cropped, recolored, or internally modified. The marker may designate any of the four anchor corners, and the final rectangle may therefore extend down-right, down-left, up-right, or up-left from the fixed corner. The background, marker, carrier, and pattern colors may be reassigned between instances. The number of pattern colors may also vary; only their within-instance equality and ordered placement in edge signatures matter.
+</variation_guidance>
+
+<train_test_shift>
+The training examples demonstrate anchors at the top-left and bottom-right corners. The two test examples deliberately use the complementary unseen orientations: bottom-left and top-right. The tests also use larger canvases and larger, more numerous assemblies, including a tall portrait rectangle and a long horizontal rectangle. One test reassigns a literal color previously used as the marker to the background and uses a different marker color, while also increasing the pattern-palette complexity. The required generalization is to preserve the role-based marker interpretation, the anchor corner’s absolute coordinate, exact unrotated piece contents, and edge-constrained rectangular assembly independently of literal colors, scale, piece count, or corner orientation.
+</train_test_shift>
+
+<solution_steps>
+1. Identify the uniform background and the distinct three-cell L marker.
+2. Find the payload corner that completes the marker’s 2-by-2 square; record its coordinate, corner orientation, and anchor piece.
+3. Remove the marker conceptually and segment every payload rectangle, recording its dimensions, full pixel matrix, and ordered top, bottom, left, and right edge sequences.
+4. Keep the anchor piece unrotated with its marked corner at the original coordinate. Restrict the prospective assembly to the direction opposite the external marker.
+5. Compare facing edges for exact ordered matches. Permit a shorter edge to align with the appropriate contiguous segment of a longer edge, and combine compatible matches into adjacency and offset constraints.
+6. Solve for the unique set of translations in which all pieces are edge-to-edge, non-overlapping, and gaplessly tile one rectangle of the total payload area. Use the global rectangle constraint to resolve contacts that provide no independent distinctive match.
+7. Fill the output canvas with the background, copy every piece unchanged to its solved position, and leave the marker and all former scattered locations as background.
+</solution_steps>
+
+<key_insight>
+The three-cell L is not part of the picture: it pins a specific payload corner as a fixed corner of the final rectangle, after which exact boundary signatures and gapless rectangular packing determine translations of all unrotated pieces.
+</key_insight>
+
+<puzzle_concepts>
+- rectangular jigsaw assembly
+- object segmentation
+- anchor-marker interpretation
+- exact edge-signature matching
+- full-edge and subedge alignment
+- irregular rectangular tiling
+- translation without rotation
+- color-role abstraction
+- corner-orientation generalization
+</puzzle_concepts>

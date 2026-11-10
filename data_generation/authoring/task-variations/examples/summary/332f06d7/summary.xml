@@ -1,0 +1,39 @@
+<rules_summary>
+A solid movable square travels along the unique orthogonal corridor from its starting pocket toward an equally sized goal square. It may occupy only corridor or goal cells and may never overlap the surrounding wall region. If its entire footprint fits through every section, it reaches and replaces the goal. Otherwise, it stops at the last valid placement immediately before the first corridor section narrower than the square. Its original footprint is restored to corridor cells, and all other cells remain unchanged.
+</rules_summary>
+
+<input_generation>
+Each input contains four semantic roles: a wall/background, a connected winding corridor, one movable solid square, and one differently marked goal square. The two squares have the same side length k and occupy opposite terminal pockets of the corridor. The corridor has a single unbranched route between them, so forward motion and the order of its bends are unambiguous. Corridor width may change along the route; these widths determine whether the k-by-k mover can reach the goal. No unrelated objects or noise are present.
+</input_generation>
+
+<variation_guidance>
+The square grid size, route length, endpoint locations, number and direction of bends, and widths of individual corridor sections may vary. The mover side length k also varies, while the mover and goal must remain equally sized. The starting direction and overall orientation are unrestricted by the examples, and the route may either remain at least k cells wide throughout or contain a narrower bottleneck. The input object count remains two markers plus the corridor and wall regions. Exact color identities are not essential, but the four roles must be visually distinct; the goal color disappears only when the mover reaches and replaces it.
+</variation_guidance>
+
+<train_test_shift>
+Training uses grid sizes from 10-by-10 through 16-by-16 and mover side lengths 1, 2, and 3. It demonstrates both outcomes: complete traversal when every passage fits the mover, and stopping when a 2-by-2 or 3-by-3 mover encounters a passage one cell narrower. The test extrapolates to a larger 20-by-20 layout with a 4-by-4 mover, which stops before a three-cell-wide throat. It does not introduce new semantic roles; the required generalization is to preserve the same footprint-versus-corridor-width rule at a larger scale and on a new route.
+</train_test_shift>
+
+<solution_steps>
+1. Identify the wall, corridor, movable-square, and goal-square roles.
+2. Measure the common side length k of the two squares.
+3. Trace the unique corridor route from the movable square toward the goal.
+4. Advance a virtual k-by-k footprint along that route, translating it orthogonally through straight sections and bends.
+5. At every step, require the full footprint to lie on corridor or goal cells without overlapping a wall cell.
+6. If the next forward placement is impossible, place the mover at its current last-valid position and leave the goal unchanged.
+7. If the footprint reaches the goal, recolor the goal footprint with the mover role.
+8. Restore the mover's original footprint to the corridor role and leave the remaining grid unchanged.
+</solution_steps>
+
+<key_insight>
+The corridor is not merely a path to follow: its varying width acts as a size filter, so the mover's destination is determined by the first bottleneck too narrow for its entire square footprint.
+</key_insight>
+
+<puzzle_concepts>
+- path following
+- constrained object movement
+- footprint collision
+- bottleneck detection
+- size comparison
+- conditional goal replacement
+</puzzle_concepts>

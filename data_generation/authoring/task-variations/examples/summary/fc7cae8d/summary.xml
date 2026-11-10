@@ -1,0 +1,47 @@
+<rules_summary>
+The input contains an outer orientation key and one interior rectangular payload. Two distinct marker identities form long control lines on two adjacent outer sides. The same identities form one-cell-wide guide bars immediately outside two adjacent sides of the payload. Apply the unique dihedral symmetry—rotation, reflection, or their combination—that maps each payload guide side onto the outer control side with the matching marker identity. Remove both guide bars and all surrounding canvas material, then output the entire guide-defined payload rectangle under that symmetry. Preserve every payload cell exactly, including cells matching the canvas background; do not recolor, resize, or trim the transformed rectangle further.
+</rules_summary>
+
+<input_generation>
+Every valid input must contain:
+1. A background canvas with two distinguishable, adjacent outer control sides. Each control side is marked predominantly by one of two distinct marker identities and is much more complete than the dotted distractor borders. Corner overlap, short inward protrusions, or isolated interference may occur without obscuring the side represented by each control.
+2. One interior rectangular payload separated from the outer frame by background space. The payload contains a dominant fill and an arbitrary asymmetric multicolor motif.
+3. Two perpendicular, one-cell-wide guide bars directly outside adjacent payload sides. Each bar spans exactly the corresponding payload dimension, so the pair determines the payload’s full rectangular extent even when background-colored cells occur along its boundary.
+4. A one-to-one identity match between the two interior guides and the two outer controls. Their distinct identities and adjacent-side positions must determine exactly one rotation/reflection of the payload.
+5. No competing pair of long bars that could define another equally valid payload or orientation. Sparse border marks, guide-colored protrusions, and other noise may be present but must remain distinguishable from the complete controls and guides.
+</input_generation>
+
+<variation_guidance>
+Canvas size, payload height and width, aspect ratio, interior placement, and surrounding margins may vary. The outer control pair may occupy any adjacent pair of canvas sides, while the interior guide pair may independently occupy any adjacent pair of payload sides. Consequently, the required symmetry may be any rotation or reflection in the rectangular dihedral family; transformations that exchange horizontal and vertical directions also exchange the output dimensions. The payload motif may vary freely in geometry, density, palette size, and use of canvas-background cells, provided it is copied without alteration. Marker, fill, motif, noise, and canvas-background colors are role-based and may be reassigned between instances. Border noise may vary in amount and spacing and can include dotted distractor sides or short inward extensions. The invariant object count remains one payload with exactly two corresponding orientation markers.
+</variation_guidance>
+
+<train_test_shift>
+All training inputs use 22-by-22 canvases. Their outer control pairs occupy the top-left, bottom-right, and bottom-left adjacent-side combinations, while the test uses a 29-by-29 canvas with controls on the top and right—the remaining adjacent-side orientation. The test also has a substantially larger, non-square 12-by-20 payload and a richer interior motif. Its interior guides lie on the left and bottom, so aligning them with the top and right controls requires a main-diagonal reflection, producing a 20-by-12 output. Training already establishes both quarter-turn rotation and diagonal reflection behavior, so the test is a new orientation and size combination rather than a new rule. Generalization must preserve identity-based side alignment, exact payload extent, and lossless transformation despite the larger rectangle and noisier frame.
+</train_test_shift>
+
+<solution_steps>
+1. Identify the two long, adjacent outer control sides and record the marker identity assigned to each side, ignoring dotted borders and short protrusions.
+2. Locate the interior rectangular payload and its two perpendicular external guide bars.
+3. Use the guide lengths and positions to determine the exact payload rectangle; retain all cells inside it, including background-colored boundary cells.
+4. Match each interior guide to the outer control with the same marker identity.
+5. Determine the unique rotation or reflection that sends both guide sides to their corresponding outer sides simultaneously.
+6. Remove the interior guides and apply that symmetry to the payload rectangle alone.
+7. Return the transformed rectangle with unchanged cell values and with dimensions swapped exactly when the selected symmetry exchanges its axes.
+</solution_steps>
+
+<key_insight>
+The repeated marker identities encode orientation rather than output content: matching both interior guide sides to their corresponding outer control sides uniquely fixes the payload’s rotation or reflection, while the guide lengths fix the exact crop.
+</key_insight>
+
+<puzzle_concepts>
+- dihedral symmetry
+- rotation
+- reflection
+- matrix transpose
+- color-role correspondence
+- orientation encoding
+- guide-line alignment
+- rectangular extraction
+- cropping
+- distractor noise
+</puzzle_concepts>

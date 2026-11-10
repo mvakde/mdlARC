@@ -1,0 +1,42 @@
+<rules_summary>
+A unique main rectangular window has a one-cell frame around a uniform interior fill. One-cell-wide, axis-aligned rectangular outlines pass behind this window, so their perimeter cells inside the frame have been erased to the interior fill while exposed portions remain visible outside. Infer each complete outline—including any alternating color phase—and restore its hidden perimeter cells. Return only the reconstructed interior of the main frame, excluding the frame itself, all exterior material, and unrelated objects.
+</rules_summary>
+
+<input_generation>
+Each valid input contains a background and one uniquely identifiable main occluding rectangle with a complete one-cell frame and a uniform interior, whose fill may equal or differ from the background. At least one separate rectangular perimeter intersects the main rectangle and has hidden portions within its strict interior. Exposed straight sides, corners, and continuations must provide enough evidence to infer every crossing rectangle’s bounding coordinates, color scheme, and phase uniquely. A perimeter may be monochrome or alternate regularly between two role colors. Distinct crossing outlines must not create unresolved hidden-cell conflicts. Smaller framed objects or other shapes may occur outside the main window, but they must remain distinguishishable as non-crossing distractors.
+</input_generation>
+
+<variation_guidance>
+Canvas dimensions, main-frame size and aspect ratio, interior-fill identity, window placement, and output dimensions may vary. The number, dimensions, positions, and approach directions of the crossing rectangular outlines may change, provided they remain axis-aligned and sufficiently exposed for unique completion. Outlines may be solid-colored or use a cell-by-cell alternating palette, with arbitrary phase. The interior fill may match the outer background or be a separate color. Literal colors may be reassigned among background, frame, fill, solid-outline, patterned-outline, and distractor roles. Additional non-crossing framed objects or exterior shapes may appear and must be ignored.
+</variation_guidance>
+
+<train_test_shift>
+Every training example has one main window crossed by two hidden rectangular outlines. The first two use monochrome outlines, while the third establishes alternating two-color perimeters; training also demonstrates both background-matching and distinct interior fills. The test increases the crossing-outline count to three and combines two monochrome outlines with one alternating outline behind a distinct fill. It also adds two small exterior framed distractors and expands the palette, while retaining familiar axis-aligned crossing arrangements and sizes within the demonstrated range. The required generalization is to select the operative occluding window among multiple framed shapes, reconstruct every crossing perimeter independently with the correct color phase, and ignore exterior distractors despite the richer role assignment.
+</train_test_shift>
+
+<solution_steps>
+1. Identify the background and all framed rectangular structures.
+2. Select the main occluding window: the unique large framed rectangle across which several exposed outline fragments are interrupted.
+3. Record its strict interior bounds and initialize an output of that size with the window’s uniform fill.
+4. Segment the exposed fragments belonging to each rectangular outline that crosses the window, excluding non-crossing distractors.
+5. Infer each outline’s full top, bottom, left, and right coordinates from its collinear sides and visible corners.
+6. Determine whether its perimeter is monochrome or alternating, and recover the exact color phase from exposed cells.
+7. Draw every inferred perimeter cell that falls within the window’s strict interior onto the output, leaving all other cells as the interior fill.
+8. Return only this reconstructed interior crop, without the main frame or any exterior cells.
+</solution_steps>
+
+<key_insight>
+The blank-looking window interior is an occlusion mask: the exterior fragments are parts of complete rectangular loops whose straight sides and color phases must be continued behind the frame.
+</key_insight>
+
+<puzzle_concepts>
+- occlusion reconstruction
+- rectangular outline completion
+- framed-region extraction
+- axis-aligned geometry
+- alternating color phase
+- object continuation
+- distractor rejection
+- semantic color roles
+- cropping
+</puzzle_concepts>

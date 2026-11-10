@@ -1,0 +1,49 @@
+<rules_summary>
+Each structural object is a directional three-pronged receiver: two longer guard arms flank a shorter central stop prong. Erase all scattered solid token rectangles. For each receiver, find the unique token lying on the outward continuation of its central prong whose perpendicular span matches the prong and which fits between the guard arms. Translate that token straight inward until its leading face touches the exposed end of the central prong. Restore the token at this final position and color the entire swept strip, excluding the final footprint, with the dedicated black trail color. Tokens that match no receiver simply become background; preserve all structural cells and unrelated background cells.
+</rules_summary>
+
+<input_generation>
+Every input contains a uniform background, one or more separated receiver structures in a common structural role, and several solid rectangular tokens in a distinct movable role. Each receiver has two parallel outer arms and a shorter centered prong pointing toward its open side. This geometry uniquely determines its approach direction, stopping surface, and required token span perpendicular to motion.
+
+A token can activate a receiver only if it is centered on the central prong’s axis, has the same perpendicular span as that prong, has a clear straight route through the opening, and can occupy the final position without overlapping structural cells. Some receivers may have no matching token, and extra tokens act as distractors. There must be at most one valid token for each receiver, no token may be valid for multiple receivers, and successful swept paths must not create ambiguous interactions. The black trail color is reserved and absent from the input.
+</input_generation>
+
+<variation_guidance>
+Canvas dimensions, receiver and token counts, spacing, travel distances, and the number of successful matches may vary. Receivers may face any orthogonal direction, and their guard-arm lengths, central-prong thicknesses, and channel widths may change. Tokens may be single cells or larger rectangles; their motion-axis length may vary independently of the matching perpendicular span, provided the final footprint fits inside the receiver.
+
+The background and receiver colors may be reassigned, while the movable-token, structural, background, and trail roles must remain distinguishable. The examples consistently use one common token identity and black as the newly written trail. Noise is limited to unmatched token rectangles rather than arbitrary cells. Grid dimensions and all receiver geometry remain unchanged.
+</variation_guidance>
+
+<train_test_shift>
+All training grids are 19-by-22 and contain two receivers. They demonstrate leftward, upward, and downward insertion, token spans from one to three cells, both one- and two-cell token lengths, and the case where a receiver has no aligned token. The 23-by-27 test enlarges the canvas, increases the receiver count to three, and performs three successful insertions simultaneously. It combines familiar upward and downward movements with the previously unseen rightward movement into a left-opening receiver, while rotating the familiar three-cell span from horizontal to vertical. It also supplies more unmatched token distractors. The palette roles repeat a familiar training assignment rather than introducing a new role. The required generalization is to preserve direction-independent alignment, perpendicular size matching, rigid insertion against the central stop, swept-path coloring, and distractor erasure across the larger multi-receiver layout.
+</train_test_shift>
+
+<solution_steps>
+1. Identify the dominant background, the receiver-structure role, the solid token role, and the reserved black trail color.
+2. Segment the structural cells into separate receivers and the token cells into solid rectangular components.
+3. For each receiver, locate its two longer guard arms and shorter central prong. Infer the open side, inward travel direction, central axis, and stopping surface.
+4. Measure the central prong’s span perpendicular to that axis.
+5. Test each token for exact axial alignment, matching perpendicular span, an unobstructed straight route, and a valid final footprint immediately beyond the central prong.
+6. Assign the unique valid token to each receiver; leave a receiver inactive when no token qualifies.
+7. Replace every original token cell with background.
+8. For each assigned token, translate its complete rectangle inward until its leading face is adjacent to the central prong. Color the union of its original and intermediate footprints black, excluding the final footprint, and place the token color in that final footprint.
+9. Preserve every receiver cell, all unaffected background cells, and the original grid dimensions.
+</solution_steps>
+
+<key_insight>
+The short middle prong is simultaneously a size-and-alignment key and the stopping surface: only a collinear token with the matching cross-section is inserted, while its entire vacated route becomes a black trail and every unmatched token disappears.
+</key_insight>
+
+<puzzle_concepts>
+- directional receiver recognition
+- object segmentation
+- axis alignment
+- cross-section matching
+- rigid translation
+- stopping-surface detection
+- swept-path marking
+- distractor erasure
+- multiple-object processing
+- orientation generalization
+- semantic color roles
+</puzzle_concepts>

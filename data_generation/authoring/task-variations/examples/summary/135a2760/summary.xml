@@ -1,0 +1,39 @@
+<rules_summary>
+Partition the grid into framed compartments. Within each compartment, a central binary motif uses the structural color together with a compartment-specific accent color and repeats periodically along the compartment’s long axis. A few motif cells have been flipped to the wrong one of those two colors. Recover the repeating unit independently for each compartment and replace only the inconsistent motif cells; preserve the frame, dividers, padding, dimensions, and all uncorrupted cells.
+</rules_summary>
+
+<input_generation>
+The grid has a one-cell outer frame and may have parallel one-cell internal dividers, all in a common structural color. These lines form one or more rectangular compartments. Each compartment contains a one-cell margin of a common padding color surrounding a central motif rectangle. The motif contains only the structural color and one compartment-specific accent color. Reading the motif as successive cross-sectional slices along the compartment’s long axis yields a periodic sequence, possibly ending with a partial repetition. Sparse cells are corrupted by exchanging the two motif colors. There must be enough repeated phases, with sufficiently few corruptions, to determine a unique periodic template by agreement across repetitions.
+</input_generation>
+
+<variation_guidance>
+Compartments may be horizontal or vertical, may occur singly or in a parallel array, and may have different lengths and cross-sectional sizes. Their number, spacing between divider positions, motif periods, repeating units, and accent colors may vary; compartments in the same grid need not share a period or motif. The long dimension need not contain an integer number of periods. The palette may grow as more compartment-specific accents are used, and literal colors may exchange the roles of structure, padding, and accent between instances. Corruption counts and locations may vary but remain sparse relative to the repeated evidence. The examples retain one-cell structural lines and one-cell padding margins.
+</variation_guidance>
+
+<train_test_shift>
+Both training grids use motifs whose long axis is horizontal: the first has one compartment, while the second has four compartments stacked vertically. The test retains the familiar four-compartment case but rotates the partitioning scheme by 90 degrees, placing unequal-width vertical compartments side by side and repeating their motifs from top to bottom. It also increases the motif length and cross-sectional sizes and reassigns palette values among the structural, padding, and accent roles. The required generalization is to recover each compartment’s slice period independently despite changes in orientation, scale, compartment width, motif design, and literal color assignment.
+</train_test_shift>
+
+<solution_steps>
+1. Detect the structural color from the outer frame and full-length internal divider lines, then determine the divider orientation and extract the compartments.
+2. Identify the common padding color and remove the one-cell padding margin from each compartment to isolate its central motif rectangle.
+3. For each motif, represent every position along its long axis as a cross-sectional row or column vector.
+4. Find the shortest strongly supported period of this vector sequence while treating a small number of cell disagreements as corruption.
+5. For every phase of the period and every position within a slice, infer the intended structural-or-accent value from the repeated copies, using their consistent or majority value.
+6. Repeat the recovered template across the entire motif length, including any final partial period, and correct every disagreeing motif cell.
+7. Copy the frame, dividers, padding, grid dimensions, and all other cells unchanged.
+</solution_steps>
+
+<key_insight>
+The task is periodic error correction within independently framed lanes, not general mirror-symmetry completion: compare corresponding cells in repeated cross-sectional slices to expose and repair the sparse flips.
+</key_insight>
+
+<puzzle_concepts>
+- periodic repetition
+- framed compartment segmentation
+- vector-slice pattern recovery
+- sparse-noise correction
+- pattern completion
+- orientation generalization
+- semantic color roles
+</puzzle_concepts>
