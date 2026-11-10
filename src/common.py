@@ -8,8 +8,10 @@ import functools
 import hashlib
 import json
 import math
+import os
 import random
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -17,6 +19,10 @@ import numpy as np
 import torch
 from numba import njit
 from torch.utils.data import DataLoader, Dataset, Sampler
+import distributed_training as distributed
+from demo_schedule import MAX_CONTEXT_DEMOS, balanced_demonstrations, training_demonstrations
+from pair_identity import balanced_pair_vertices, leave_one_out, schedule_seed
+from intermediate_sampling import intermediate_candidates, intermediate_indices
 
 
 # =============================================================================
@@ -25,7 +31,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 VOCAB_SIZE = 14
 
-SPECIAL_TOKENS = ["<start>", "<next_line>", "<input_output_separator>", "<end>"]
+SPECIAL_TOKENS = ["<start>", "<next_line>", "<input_output_separator>", "<end_pair>"]
 TOKEN_TO_ID: Dict[str, int] = {str(i): i for i in range(10)}
 for offset, token in enumerate(SPECIAL_TOKENS, start=10):
     TOKEN_TO_ID[token] = offset
@@ -35,36 +41,99 @@ ID_TO_TOKEN = {idx: token for token, idx in TOKEN_TO_ID.items()}
 START_TOKEN_ID = TOKEN_TO_ID["<start>"]
 NEXT_LINE_TOKEN_ID = TOKEN_TO_ID["<next_line>"]
 IO_SEPARATOR_TOKEN_ID = TOKEN_TO_ID["<input_output_separator>"]
-END_TOKEN_ID = TOKEN_TO_ID["<end>"]
+END_PAIR_TOKEN_ID = TOKEN_TO_ID["<end_pair>"]
 
-MAX_SEQ_LEN = 1863
+DEMO_PAIRS = 2
+MAX_PAIR_LEN = 1861
+# One start token followed by three input/output pairs, each at most 30x30.
+MAX_SEQ_LEN = 1 + (DEMO_PAIRS + 1) * (MAX_PAIR_LEN - 1)
+SEQUENCE_FORMAT = "two_demo_bidirectional_v1"
+GROUP_SEQUENCE_FORMAT = "all_demo_pair_group_target_roles_two_lookup_v1"
+GRID_CHAIN_SEQUENCE_FORMAT = "intermediate_grid_pair_group_two_lookup_v1"
+SUPERVISED_GRID_CHAIN_SEQUENCE_FORMAT = "supervised_intermediate_grid_chain_v1"
 IGNORE_INDEX = -100
+
+AUGMENTATION_SAMPLING_MODES = ("full_task_prefix", "single_grid_prefix", "context_palette")
+
+
+def normalize_attention_pattern(value: Optional[str]) -> str:
+    pattern = "dense" if value is None else value
+    if pattern not in ("dense", "pair_group"):
+        raise ValueError("attention_pattern must be 'dense' or 'pair_group'.")
+    return pattern
+
+
+def sequence_format_for_attention(pattern: str) -> str:
+    return GROUP_SEQUENCE_FORMAT if normalize_attention_pattern(pattern) == "pair_group" else SEQUENCE_FORMAT
+
+
+def normalize_augmentation_sampling_mode(value: Optional[str]) -> str:
+    mode = "full_task_prefix" if value is None else value
+    if mode not in AUGMENTATION_SAMPLING_MODES:
+        raise ValueError(
+            "augmentation_sampling_mode must be 'full_task_prefix', 'single_grid_prefix' or 'context_palette'."
+        )
+    return mode
 
 
 # =============================================================================
 # Color Extraction
 # =============================================================================
 
-def _extract_task_colors(task: Dict[str, object], key: str) -> Set[int]:
+def _extract_pairs_colors(
+    pairs: Sequence[Dict[str, object]], key: str
+) -> Set[int]:
     colors: Set[int] = set()
-    for split in ("train", "test"):
-        pairs = task.get(split, [])
-        for pair in pairs:
-            grid = pair.get(key) or []
+    for pair in pairs:
+        grids = [pair.get(key) or []]
+        if key == "output":
+            grids.extend(intermediate_candidates(pair))
+        for grid in grids:
             for row in grid:
                 for val in row:
                     val_i = int(val)
-                    if 1 <= val_i <= 9:
+                    if 0 <= val_i <= 9:
                         colors.add(val_i)
     return colors
 
 
-def extract_task_input_colors(task: Dict[str, object]) -> List[int]:
-    """Return sorted colors (1-9) eligible for permutation, excluding output-only colors."""
-    input_colors = _extract_task_colors(task, "input")
-    output_colors = _extract_task_colors(task, "output")
-    output_only = output_colors - input_colors
-    return [color for color in range(1, 10) if color not in output_only]
+def extract_task_colors(task: Dict[str, object]) -> List[int]:
+    """Return colors available from demonstrations and test inputs."""
+    train_pairs = task.get("train", [])
+    test_pairs = task.get("test", [])
+    return sorted(
+        _extract_pairs_colors(train_pairs, "input")
+        | _extract_pairs_colors(train_pairs, "output")
+        | _extract_pairs_colors(test_pairs, "input")
+    )
+
+
+def extract_pairs_colors(pairs: Sequence[Dict[str, object]]) -> List[int]:
+    """Return every color appearing in a list of input/output pairs."""
+    return sorted(_extract_pairs_colors(pairs, "input") | _extract_pairs_colors(pairs, "output"))
+
+
+def extract_task_output_only_colors(task: Dict[str, object]) -> List[int]:
+    """Protect demonstration output colors absent from every known task input.
+
+    Test outputs are deliberately excluded, even when a file contains them.
+    """
+    train = task.get("train", [])
+    inputs = _extract_pairs_colors(train, "input") | _extract_pairs_colors(task.get("test", []), "input")
+    return sorted(_extract_pairs_colors(train, "output") - inputs)
+
+
+def color_augmentation_domain(
+    colors: Sequence[int], protected_colors: Sequence[int], mode: Optional[str]
+) -> Tuple[List[int], Optional[List[int]]]:
+    if normalize_augmentation_sampling_mode(mode) == "context_palette":
+        raise ValueError("context_palette requires the selected visible context")
+    if normalize_augmentation_sampling_mode(mode) == "full_task_prefix":
+        return list(colors), None
+    protected = set(protected_colors)
+    return [color for color in colors if color not in protected], [
+        color for color in range(10) if color not in protected
+    ]
 
 
 # =============================================================================
@@ -172,7 +241,7 @@ def apply_inverse_dihedral_transform(
 def apply_color_permutation_to_tokens(
     tokens: Sequence[int], mapping: Sequence[int]
 ) -> List[int]:
-    """Apply a color permutation mapping to a token list (keeps specials/0 fixed)."""
+    """Apply a color permutation mapping to a token list."""
     return [int(mapping[tok] if 0 <= tok < len(mapping) else tok) for tok in tokens]
 
 
@@ -185,6 +254,20 @@ def apply_color_permutation_to_grid(
     ]
 
 
+def invert_color_mapping(
+    mapping: Sequence[int], source_colors: Sequence[int]
+) -> List[int]:
+    """Invert an injective color mapping, leaving colors outside its image unchanged."""
+    inverse = list(range(len(mapping)))
+    for source in source_colors:
+        source_i = int(source)
+        if 0 <= source_i < len(mapping):
+            target = int(mapping[source_i])
+            if 0 <= target < len(inverse):
+                inverse[target] = source_i
+    return inverse
+
+
 # =============================================================================
 # Grid/Token Conversion
 # =============================================================================
@@ -195,13 +278,18 @@ def _value_to_token_id(value: int) -> int:
     return value
 
 
-def grid_to_tokens(grid: Iterable[Iterable[int]]) -> List[int]:
-    """Flattens a 2D grid into a token list, inserting <next_line> after each row."""
+def grid_to_tokens(
+    grid: Iterable[Iterable[int]], final_token: int = NEXT_LINE_TOKEN_ID
+) -> List[int]:
+    """Flatten a grid, using ``final_token`` in place of its last newline."""
     tokens: List[int] = []
     for row in grid:
         for value in row:
             tokens.append(_value_to_token_id(int(value)))
         tokens.append(NEXT_LINE_TOKEN_ID)
+    if not tokens:
+        raise ValueError("ARC grids must contain at least one row.")
+    tokens[-1] = int(final_token)
     return tokens
 
 
@@ -213,18 +301,171 @@ def encode_example(
 ) -> List[int]:
     """Serializes an ARC pair into a single token stream."""
     tokens = [START_TOKEN_ID]
-    tokens.extend(grid_to_tokens(input_grid))
-    tokens.append(IO_SEPARATOR_TOKEN_ID)
+    tokens.extend(grid_to_tokens(input_grid, IO_SEPARATOR_TOKEN_ID))
     if include_output and output_grid is not None:
-        tokens.extend(grid_to_tokens(output_grid))
-    if append_end:
-        tokens.append(END_TOKEN_ID)
+        final_token = END_PAIR_TOKEN_ID if append_end else NEXT_LINE_TOKEN_ID
+        tokens.extend(grid_to_tokens(output_grid, final_token))
     return tokens
+
+
+def encode_pair(
+    pair: Dict[str, object],
+    transform_index: int = 0,
+    mapping: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, int]:
+    """Serialize one input and optional output, applying the same augmentation."""
+    output = pair.get("output")
+    tokens = encode_example(
+        apply_dihedral_transform(pair["input"], transform_index),
+        apply_dihedral_transform(output, transform_index) if output is not None else None,
+    )
+    sep_index = tokens.index(IO_SEPARATOR_TOKEN_ID)
+    tensor = torch.tensor(tokens, dtype=torch.long)
+    return (mapping[tensor] if mapping is not None else tensor), sep_index
+
+
+def encode_context(
+    demonstrations: Sequence[Dict[str, object]],
+    target: Dict[str, object],
+    transform_index: int = 0,
+    mapping: Optional[torch.Tensor] = None,
+    *, predict_intermediate_grids: bool = False,
+) -> Tuple[torch.Tensor, int]:
+    """Serialize complete demos and a target using one shared augmentation."""
+    tokens = [START_TOKEN_ID]
+    target_sep = -1
+    for index, pair in enumerate([*demonstrations, target]):
+        if index < len(demonstrations) and pair.get("output") is None:
+            raise ValueError("Demonstrations must have outputs.")
+        tokens.extend(grid_to_tokens(
+            apply_dihedral_transform(pair["input"], transform_index), IO_SEPARATOR_TOKEN_ID,
+        ))
+        if index == len(demonstrations):
+            target_sep = len(tokens) - 1
+        if index < len(demonstrations) or (predict_intermediate_grids and pair.get("output") is not None):
+            intermediates = pair.get("intermediate_grids", [])
+            if len(intermediates) > 2:
+                raise ValueError("A demonstration supports at most two intermediate grids")
+            for grid in intermediates:
+                tokens.extend(grid_to_tokens(
+                    apply_dihedral_transform(grid, transform_index), IO_SEPARATOR_TOKEN_ID,
+                ))
+        if pair.get("output") is not None:
+            tokens.extend(grid_to_tokens(
+                apply_dihedral_transform(pair["output"], transform_index), END_PAIR_TOKEN_ID,
+            ))
+    tensor = torch.tensor(tokens, dtype=torch.long)
+    return (mapping[tensor] if mapping is not None else tensor), target_sep
+
+
+def select_balanced_demonstrations(
+    pair_indices: Sequence[int], *, visit: int, seed: int,
+) -> Tuple[int, ...]:
+    """Two distinct demos; every prefix balances inclusion and each slot to ±1.
+
+    A cycle has N rows. Odd N pairs adjacent entries in two copies of a
+    shuffled bag. Even N first pairs the bag, then reverses each pair's slots.
+    Every demo appears twice per cycle, once in each slot. No mutable worker
+    state or training/augmentation RNG is consumed.
+    """
+    count = len(pair_indices)
+    if count < 2:
+        return tuple(pair_indices)
+    cycle, row = divmod(max(0, int(visit)), count)
+    order = _order_for_cycle(seed, pair_indices, 13, cycle)
+    if count % 2:
+        return order[(2 * row) % count], order[(2 * row + 1) % count]
+    first, second = order[2 * (row % (count // 2)):2 * (row % (count // 2)) + 2]
+    return (first, second) if row < count // 2 else (second, first)
 
 
 def load_challenges(json_path: Path) -> Dict[str, dict]:
     with Path(json_path).open("r") as handle:
         return json.load(handle)
+
+
+def load_nvarc_pairs(json_path: Path) -> List[Dict[str, object]]:
+    with Path(json_path).open("r") as handle:
+        pairs = json.load(handle)
+    if not isinstance(pairs, list):
+        raise TypeError(f"NVARC file {json_path} must contain a list of input/output pairs.")
+    return pairs
+
+
+def split_nvarc_task_id(task_id: str) -> Tuple[str, str]:
+    first_task_id, separator, second_task_id = str(task_id).partition("_")
+    if not separator or not first_task_id or not second_task_id:
+        raise ValueError(
+            f"Invalid NVARC task id '{task_id}': expected '<task1>_<task2>'."
+        )
+    return first_task_id, second_task_id
+
+
+def build_task_embedding_index(
+    task_ids: Sequence[str],
+    *,
+    regular_task_ids: Optional[Set[str]] = None,
+    nvarc_task_ids: Optional[Set[str]] = None,
+    embedding_task_whitelist: Optional[Sequence[str]] = None,
+) -> Tuple[List[str], Dict[str, int], Dict[str, Tuple[int, int]]]:
+    regular_task_ids = set(regular_task_ids or ())
+    nvarc_task_ids = set(nvarc_task_ids or ())
+    embedding_task_ids: List[str] = []
+    embedding_task_id_to_index: Dict[str, int] = {}
+    task_id_to_embedding_ids: Dict[str, Tuple[int, int]] = {}
+
+    def ensure_embedding_task_id(task_id: str) -> int:
+        existing = embedding_task_id_to_index.get(task_id)
+        if existing is not None:
+            return existing
+        new_index = len(embedding_task_ids)
+        embedding_task_ids.append(task_id)
+        embedding_task_id_to_index[task_id] = new_index
+        return new_index
+
+    if embedding_task_whitelist is not None:
+        for embedding_task_id in embedding_task_whitelist:
+            ensure_embedding_task_id(str(embedding_task_id))
+
+    for task_id in task_ids:
+        is_nvarc_task = task_id in nvarc_task_ids
+        split_task_ids: Optional[Tuple[str, str]] = None
+        if not is_nvarc_task and "_" in task_id:
+            try:
+                split_task_ids = split_nvarc_task_id(task_id)
+            except ValueError:
+                split_task_ids = None
+            if split_task_ids is not None:
+                is_nvarc_task = (
+                    (split_task_ids[0] in regular_task_ids or split_task_ids[0] in embedding_task_id_to_index)
+                    and (split_task_ids[1] in regular_task_ids or split_task_ids[1] in embedding_task_id_to_index)
+                )
+        if is_nvarc_task:
+            if split_task_ids is None:
+                split_task_ids = split_nvarc_task_id(task_id)
+            first_task_id, second_task_id = split_task_ids
+            task_id_to_embedding_ids[task_id] = (
+                ensure_embedding_task_id(first_task_id),
+                ensure_embedding_task_id(second_task_id),
+            )
+            continue
+        task_id_to_embedding_ids[task_id] = (ensure_embedding_task_id(task_id), -1)
+
+    return embedding_task_ids, embedding_task_id_to_index, task_id_to_embedding_ids
+
+
+def scan_nvarc_dir(root: Optional[Path]) -> Dict[str, Path]:
+    if root is None:
+        return {}
+    root = Path(root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Missing expected NVARC directory: {root}")
+    paths_by_task: Dict[str, Path] = {}
+    for path in sorted(root.rglob("*.json")):
+        if path.stem in paths_by_task:
+            raise ValueError(f"Duplicate NVARC task id '{path.stem}' in {root}.")
+        paths_by_task[path.stem] = path
+    return paths_by_task
 
 
 def tokens_to_grid(tokens: Sequence[int]) -> List[List[int]]:
@@ -247,15 +488,14 @@ def tokens_to_grid(tokens: Sequence[int]) -> List[List[int]]:
 
 
 def extract_output_tokens(sequence: Sequence[int]) -> List[int]:
-    """Returns the tokens that appear after the <input_output_separator> marker."""
-    after_separator = False
+    """Return the target output following the sequence's last separator."""
     outputs: List[int] = []
-    for token in sequence:
-        if not after_separator:
-            if token == IO_SEPARATOR_TOKEN_ID:
-                after_separator = True
-            continue
-        if token == END_TOKEN_ID:
+    last_separator = max(
+        (index for index, token in enumerate(sequence) if token == IO_SEPARATOR_TOKEN_ID),
+        default=-1,
+    )
+    for token in sequence[last_separator + 1 :]:
+        if token == END_PAIR_TOKEN_ID:
             break
         outputs.append(token)
     return outputs
@@ -276,11 +516,9 @@ def split_grids_from_tokens(tokens: Sequence[int]) -> List[List[List[int]]]:
     current_row: List[int] = []
 
     for tok in tokens:
-        if tok == END_TOKEN_ID:
-            break
         if tok == START_TOKEN_ID:
             continue
-        if tok == IO_SEPARATOR_TOKEN_ID:
+        if tok == IO_SEPARATOR_TOKEN_ID or tok == END_PAIR_TOKEN_ID:
             if current_row:
                 current_grid.append(current_row)
                 current_row = []
@@ -341,21 +579,6 @@ def _fill_3d_positions_numba(ids, mask, out, start_id, sep_id, end_id, nl_id):
                 z = 1
                 continue
 
-            if val == sep_id:
-                out[b, t, 0] = 0
-                out[b, t, 1] = 0
-                out[b, t, 2] = 2
-                x = 0
-                y = 0
-                z = 3
-                continue
-
-            if val == end_id:
-                out[b, t, 0] = 0
-                out[b, t, 1] = 0
-                out[b, t, 2] = 4
-                continue
-
             px = x
             if px < 0:
                 px = 0
@@ -372,7 +595,11 @@ def _fill_3d_positions_numba(ids, mask, out, start_id, sep_id, end_id, nl_id):
             out[b, t, 1] = py
             out[b, t, 2] = z
 
-            if val == nl_id:
+            if val == sep_id or val == end_id:
+                x = 0
+                y = 0
+                z += 1
+            elif val == nl_id:
                 x = 0
                 y += 1
             else:
@@ -395,7 +622,7 @@ def compute_positions_3d(
         mask_np = attention_mask.detach().cpu().numpy().astype(bool)
 
     B, S = ids_np.shape
-    pos_np = np.zeros((B, S, 3), dtype=np.int64)
+    pos_np = np.zeros((B, S, 3), dtype=np.int32)
 
     _fill_3d_positions_numba(
         ids_np,
@@ -403,7 +630,7 @@ def compute_positions_3d(
         pos_np,
         START_TOKEN_ID,
         IO_SEPARATOR_TOKEN_ID,
-        END_TOKEN_ID,
+        END_PAIR_TOKEN_ID,
         NEXT_LINE_TOKEN_ID,
     )
 
@@ -424,10 +651,16 @@ class SequenceExample:
     pair_index: int
     has_output: bool
     seq_len: int
-    tokens_by_dihedral: Optional[List[torch.LongTensor]] = None
-    cached_positions_by_dihedral: Optional[List[torch.LongTensor]] = None
-    seq_len_by_dihedral: Optional[List[int]] = None
-    sep_index_by_dihedral: Optional[List[int]] = None
+    task_embedding_ids: Tuple[int, int]
+    preselected_dihedral_index: Optional[int] = None
+    is_rearc: bool = False
+    is_nvarc: bool = False
+    augment_epoch_override: Optional[int] = None
+    dihedral_occurrence_override: Optional[int] = None
+    demo_visit_override: Optional[int] = None
+    variation_path: Optional[str] = None
+    variation_colors: Tuple[int, ...] = ()
+    variation_output_only_colors: Tuple[int, ...] = ()
 
 
 class ARCExampleDataset(Dataset):
@@ -436,12 +669,31 @@ class ARCExampleDataset(Dataset):
     def __init__(
         self,
         json_path: Path,
+        rearc_json_path: Optional[Path] = None,
+        nvarc_training_dir: Optional[Path] = None,
+        nvarc_full_dir: Optional[Path] = None,
+        rearc_pairs_per_epoch: int = 10,
+        nvarc_pairs_per_epoch: int = 10,
+        nvarc_puzzles_per_epoch: Optional[int] = None,
         splits: Sequence[str] = ("train", "test"),
         include_outputs: bool = True,
-        max_seq_len: int = MAX_SEQ_LEN,
+        max_seq_len: Optional[int] = None,
         drop_long_sequences: bool = False,
         task_whitelist: Optional[Sequence[str]] = None,
-        load_test_solutions: bool = False,
+        embedding_task_whitelist: Optional[Sequence[str]] = None,
+        allow_missing_tasks: bool = False,
+        seed: int = 0,
+        max_augments: int = 1,
+        augmentation_sampling_mode: Optional[str] = None,
+        index_present_tasks_only: bool = False,
+        selected_task_ids: Optional[Sequence[str]] = None,
+        attention_pattern: str = "dense",
+        training_demo_schedule: str = "all",
+        max_training_demos: int = MAX_CONTEXT_DEMOS,
+        inference_demo_policy: str = "all",
+        inference_max_demos: int = MAX_CONTEXT_DEMOS,
+        pair_identity_vertices: int = 0,
+        predict_intermediate_grids: bool = False,
     ) -> None:
         available_splits = {"train", "test"}
         for split in splits:
@@ -451,143 +703,525 @@ class ARCExampleDataset(Dataset):
                 )
 
         self.source_path = Path(json_path)
-        self.max_seq_len = max_seq_len
+        self.rearc_source_path = (
+            Path(rearc_json_path) if rearc_json_path is not None else None
+        )
+        self.nvarc_training_dir = (
+            Path(nvarc_training_dir) if nvarc_training_dir is not None else None
+        )
+        self.nvarc_full_dir = (
+            Path(nvarc_full_dir) if nvarc_full_dir is not None else None
+        )
+        self.attention_pattern = normalize_attention_pattern(attention_pattern)
+        if training_demo_schedule not in ("all", "half_or_more", "two"):
+            raise ValueError("training_demo_schedule must be all, half_or_more or two")
+        if inference_demo_policy not in ("all", "leave_one_out", "two"):
+            raise ValueError("inference_demo_policy must be all, leave_one_out or two")
+        self.training_demo_schedule = training_demo_schedule
+        if isinstance(max_training_demos, bool) or not isinstance(max_training_demos, int) or not 1 <= max_training_demos <= MAX_CONTEXT_DEMOS:
+            raise ValueError("max_training_demos must be an integer from 1 to 6")
+        self.max_training_demos = max_training_demos
+        if isinstance(inference_max_demos, bool) or not isinstance(inference_max_demos, int) or not 1 <= inference_max_demos <= MAX_CONTEXT_DEMOS:
+            raise ValueError("inference_max_demos must be an integer from 1 to 6")
+        self.inference_max_demos = inference_max_demos
+        self.inference_demo_policy = inference_demo_policy
+        self.pair_identity_vertices = int(pair_identity_vertices)
+        self.predict_intermediate_grids = bool(predict_intermediate_grids)
+        if self.predict_intermediate_grids and (self.attention_pattern != "pair_group" or self.pair_identity_vertices):
+            raise ValueError("Supervised grid chains require pair_group attention and no pair identities")
+        self.max_seq_len = max_seq_len if max_seq_len is not None else (
+            MAX_SEQ_LEN if self.attention_pattern == "dense" else 2**31 - 1
+        )
         self.drop_long_sequences = drop_long_sequences
         self.include_outputs = include_outputs
-
+        self.seed = int(seed)
+        self.max_augments = max(1, int(max_augments))
+        self.augmentation_sampling_mode = normalize_augmentation_sampling_mode(augmentation_sampling_mode)
         challenges = load_challenges(self.source_path)
+        self.has_intermediate_grids = any(
+            intermediate_candidates(pair) for task in challenges.values()
+            for pair in task.get("train", [])
+        )
+        if self.has_intermediate_grids and (self.attention_pattern != "pair_group" or self.pair_identity_vertices):
+            raise ValueError("Intermediate-grid demos require pair_group attention and pair_identity_vertices=0")
+        rearc_challenges = (
+            load_challenges(self.rearc_source_path)
+            if self.rearc_source_path is not None
+            else {}
+        )
+        rearc_task_ids = set(rearc_challenges.keys())
+        nvarc_source_paths = scan_nvarc_dir(self.nvarc_training_dir)
+        for task_id, source_path in scan_nvarc_dir(self.nvarc_full_dir).items():
+            if task_id in nvarc_source_paths:
+                raise ValueError(f"Duplicate NVARC task id '{task_id}' across NVARC directories.")
+            nvarc_source_paths[task_id] = source_path
+        nvarc_task_ids = set(nvarc_source_paths.keys())
+        duplicate_task_ids = (
+            set(challenges.keys()) | rearc_task_ids
+        ) & nvarc_task_ids
+        if duplicate_task_ids:
+            raise ValueError(
+                "NVARC task ids must not overlap existing dataset ids: "
+                + ", ".join(sorted(duplicate_task_ids)[:10])
+            )
 
-        solutions_map = {}
-        if load_test_solutions:
-            sol_path = self.source_path.with_name("solutions.json")
-            if sol_path.exists():
-                with sol_path.open("r") as handle:
-                    solutions_map = json.load(handle)
-            else:
-                print(f"Warning: solutions.json not found at {sol_path}")
         if task_whitelist is not None:
             task_ids = list(task_whitelist)
-            missing = [task_id for task_id in task_ids if task_id not in challenges]
-            if missing:
-                raise ValueError(f"Task ids {missing} were not found in {json_path}.")
         else:
-            task_ids = sorted(challenges.keys())
+            task_ids = sorted(set(challenges.keys()) | rearc_task_ids)
+            task_ids.extend(sorted(nvarc_task_ids))
+        if index_present_tasks_only:
+            # Keep the embedding whitelist intact: learned row numbers and
+            # fresh-factor initialization must survive evaluation filtering.
+            present_task_ids = set(challenges) | rearc_task_ids | nvarc_task_ids
+            task_ids = [task_id for task_id in task_ids if task_id in present_task_ids]
+        if selected_task_ids is not None:
+            selected = set(selected_task_ids)
+            task_ids = [task_id for task_id in task_ids if task_id in selected]
 
         self.examples: List[SequenceExample] = []
         self.task_id_to_example_id: Dict[str, int] = {}
         self.indices_by_split: Dict[str, List[int]] = {split: [] for split in splits}
         self.task_ids = task_ids
         self.sequence_lengths: List[int] = []
-        self.task_input_colors: Dict[str, List[int]] = {}
+        self.task_colors: Dict[str, List[int]] = {}
+        self.task_output_only_colors: Dict[str, List[int]] = {}
+        self.pairs_by_task: Dict[str, List[Dict[str, object]]] = {}
+        self.test_pairs_by_task: Dict[str, List[Dict[str, object]]] = {}
+        self.regular_train_indices_by_example_id: Dict[int, List[int]] = {}
+        self.rearc_pairs_by_task: Dict[str, List[Dict[str, object]]] = {}
+        self.rearc_pair_counts_by_example_id: Dict[int, int] = {}
+        self.rearc_example_cache: Dict[Tuple[int, int, int], SequenceExample] = {}
+        self.nvarc_source_paths = nvarc_source_paths
+        self.nvarc_pair_counts_by_example_id: Dict[int, int] = {}
+        self.nvarc_raw_cache: OrderedDict[str, List[Dict[str, object]]] = OrderedDict()
+        self.nvarc_raw_cache_size = 16
+        self.rearc_pairs_per_epoch = max(0, int(rearc_pairs_per_epoch))
+        self.nvarc_pairs_per_epoch = max(0, int(nvarc_pairs_per_epoch))
+        self.nvarc_puzzles_per_epoch = (
+            None
+            if nvarc_puzzles_per_epoch is None
+            else max(0, int(nvarc_puzzles_per_epoch))
+        )
+        self.embedding_task_ids, self.embedding_task_id_to_index, self.task_id_to_embedding_ids = (
+            build_task_embedding_index(
+                task_ids,
+                regular_task_ids=set(challenges.keys()) | rearc_task_ids,
+                nvarc_task_ids=nvarc_task_ids,
+                embedding_task_whitelist=embedding_task_whitelist,
+            )
+        )
 
         for example_id, task_id in enumerate(task_ids):
             self.task_id_to_example_id[task_id] = example_id
-            task = challenges[task_id]
-            self.task_input_colors[task_id] = extract_task_input_colors(task)
+            is_rearc_task = task_id in rearc_task_ids
+            is_nvarc_task = task_id in nvarc_task_ids
+            if is_nvarc_task:
+                nvarc_pairs = self._get_nvarc_pairs(task_id)
+                self.pairs_by_task[task_id] = nvarc_pairs
+                self.task_colors[task_id] = extract_pairs_colors(nvarc_pairs)
+                self.task_output_only_colors[task_id] = extract_task_output_only_colors({"train": nvarc_pairs})
+                nvarc_pair_count = len(nvarc_pairs)
+                if nvarc_pair_count > 0:
+                    self.nvarc_pair_counts_by_example_id[example_id] = nvarc_pair_count
+                continue
+            task = rearc_challenges.get(task_id) if is_rearc_task else challenges.get(task_id)
+            if task is None:
+                if allow_missing_tasks:
+                    continue
+                raise ValueError(f"Task id '{task_id}' was not found in the loaded challenge files.")
+            train_pairs = list(task.get("train", []))
+            self.pairs_by_task[task_id] = train_pairs
+            self.test_pairs_by_task[task_id] = list(task.get("test", []))
+            self.task_colors[task_id] = extract_task_colors(task)
+            self.task_output_only_colors[task_id] = extract_task_output_only_colors(task)
+            if is_rearc_task:
+                if "train" in splits:
+                    if train_pairs:
+                        self.rearc_pairs_by_task[task_id] = train_pairs
+                        self.rearc_pair_counts_by_example_id[example_id] = len(train_pairs)
+                continue
             for split in splits:
                 pairs = task.get(split, [])
                 for pair_index, pair in enumerate(pairs):
-                    input_grid = pair["input"]
-                    output_grid = pair.get("output")
-
-                    if split == "test" and load_test_solutions:
-                        if task_id in solutions_map:
-                            task_sols = solutions_map[task_id]
-                            if pair_index < len(task_sols):
-                                output_grid = task_sols[pair_index]
-
-                    has_output = output_grid is not None
-                    include_output_tokens = include_outputs and has_output
-                    append_end = include_output_tokens
-
-                    tokens_by_dihedral: List[torch.Tensor] = []
-                    seq_len_by_dihedral: List[int] = []
-                    sep_index_by_dihedral: List[int] = []
-                    skip_example = False
-                    for transform_index in range(8):
-                        dihedral_input = apply_dihedral_transform(
-                            input_grid, transform_index
-                        )
-                        dihedral_output = (
-                            apply_dihedral_transform(output_grid, transform_index)
-                            if output_grid is not None
-                            else None
-                        )
-                        tokens = encode_example(
-                            dihedral_input,
-                            dihedral_output,
-                            include_output=include_output_tokens,
-                            append_end=append_end,
-                        )
-                        if len(tokens) > max_seq_len:
-                            if drop_long_sequences:
-                                skip_example = True
-                                break
-                            raise ValueError(
-                                f"Sequence length {len(tokens)} exceeds max_seq_len={max_seq_len} "
-                                f"for task {task_id} ({split} pair {pair_index}) dihedral {transform_index}."
-                            )
-                        tensor = torch.tensor(tokens, dtype=torch.long)
-                        tokens_by_dihedral.append(tensor)
-                        seq_len_by_dihedral.append(len(tokens))
-                        try:
-                            sep_index_by_dihedral.append(tokens.index(IO_SEPARATOR_TOKEN_ID))
-                        except ValueError as exc:
-                            raise ValueError(
-                                f"Missing IO separator token for task {task_id} "
-                                f"({split} pair {pair_index}) dihedral {transform_index}."
-                            ) from exc
-                    if skip_example:
-                        continue
-
-                    tensor = tokens_by_dihedral[0]
-                    seq_len = seq_len_by_dihedral[0]
-                    example = SequenceExample(
-                        tokens=tensor,
-                        sep_index=sep_index_by_dihedral[0],
+                    example = self._build_sequence_example(
                         example_id=example_id,
                         task_id=task_id,
+                        task_embedding_ids=self.task_id_to_embedding_ids[task_id],
                         split=split,
                         pair_index=pair_index,
-                        has_output=has_output,
-                        seq_len=seq_len,
-                        tokens_by_dihedral=tokens_by_dihedral,
-                        seq_len_by_dihedral=seq_len_by_dihedral,
-                        sep_index_by_dihedral=sep_index_by_dihedral,
+                        pair=pair,
+                        is_rearc=False,
+                        is_nvarc=False,
                     )
-                    self.indices_by_split.setdefault(split, []).append(
-                        len(self.examples)
-                    )
+                    if example is None:
+                        continue
+                    example_index = len(self.examples)
+                    self.indices_by_split.setdefault(split, []).append(example_index)
                     self.examples.append(example)
-                    self.sequence_lengths.append(max(seq_len_by_dihedral))
+                    self.sequence_lengths.append(example.seq_len)
+                    if split == "train":
+                        self.regular_train_indices_by_example_id.setdefault(
+                            example_id, []
+                        ).append(example_index)
 
-        self.num_examples = len(self.task_id_to_example_id)
+        self.num_examples = len(self.embedding_task_ids)
+        self.has_regular_train_sampling = bool(self.regular_train_indices_by_example_id)
+        self.has_rearc_train_sampling = bool(self.rearc_pairs_by_task)
+        self.has_nvarc_train_sampling = bool(self.nvarc_pair_counts_by_example_id)
+        self.has_lazy_train_sampling = (
+            self.has_regular_train_sampling
+            or self.has_rearc_train_sampling
+            or self.has_nvarc_train_sampling
+        )
+        if max_seq_len is None:
+            # Reserve full-size grids and one target in addition to the demos.
+            # This is a capacity limit, not padding or a preallocated buffer.
+            counts = [len(pairs) for pairs in self.pairs_by_task.values()]
+            self.max_seq_len = self.context_capacity(max(counts, default=0))
 
-        print("Precomputing 3D positions...")
-        for ex in self.examples:
-            if ex.tokens_by_dihedral:
-                cached_positions_by_dihedral: List[torch.Tensor] = []
-                for tokens in ex.tokens_by_dihedral:
-                    fake_batch = tokens.unsqueeze(0)
-                    mask = torch.ones_like(fake_batch, dtype=torch.bool)
-                    pos = compute_positions_3d(fake_batch, mask)
-                    cached_positions_by_dihedral.append(pos.squeeze(0))
-                ex.cached_positions_by_dihedral = cached_positions_by_dihedral
-                ex.cached_positions = cached_positions_by_dihedral[0]
-            else:
-                fake_batch = ex.tokens.unsqueeze(0)
-                mask = torch.ones_like(fake_batch, dtype=torch.bool)
-                pos = compute_positions_3d(fake_batch, mask)
-                ex.cached_positions = pos.squeeze(0)
+    def context_capacity(self, pair_count: int) -> int:
+        if self.attention_pattern == "dense":
+            return MAX_SEQ_LEN
+        if self.has_intermediate_grids:
+            demo_cap = min(self.max_training_demos, 2 if self.training_demo_schedule == "two" else MAX_CONTEXT_DEMOS)
+            if "test" in self.indices_by_split:
+                demo_cap = max(demo_cap, 2 if self.inference_demo_policy == "two" else MAX_CONTEXT_DEMOS)
+            target_grids = 4 if self.predict_intermediate_grids else 2
+            return max(MAX_SEQ_LEN, 1 + (min(demo_cap, int(pair_count)) * 4 + target_grids) * ((MAX_PAIR_LEN - 1) // 2))
+        return max(MAX_SEQ_LEN, 1 + (min(MAX_CONTEXT_DEMOS, int(pair_count)) + 1) * (MAX_PAIR_LEN - 1))
+
+    def _get_nvarc_pairs(self, task_id: str) -> List[Dict[str, object]]:
+        cached = self.nvarc_raw_cache.pop(task_id, None)
+        if cached is None:
+            cached = load_nvarc_pairs(self.nvarc_source_paths[task_id])
+        self.nvarc_raw_cache[task_id] = cached
+        while len(self.nvarc_raw_cache) > self.nvarc_raw_cache_size:
+            self.nvarc_raw_cache.popitem(last=False)
+        return cached
+
+    def _build_sequence_example(
+        self,
+        *,
+        example_id: int,
+        task_id: str,
+        task_embedding_ids: Optional[Tuple[int, int]] = None,
+        split: str,
+        pair_index: int,
+        pair: Dict[str, object],
+        is_rearc: bool,
+        is_nvarc: bool,
+        dihedral_indices: Optional[Sequence[int]] = None,
+    ) -> Optional[SequenceExample]:
+        input_grid = pair["input"]
+        output_grid = pair.get("output")
+
+        has_output = output_grid is not None
+        include_output_tokens = self.include_outputs and has_output
+        append_end = include_output_tokens
+        if task_embedding_ids is None:
+            task_embedding_ids = self.task_id_to_embedding_ids[task_id]
+
+        transform_index = 0 if dihedral_indices is None else int(dihedral_indices[0])
+        tokens = encode_example(
+            apply_dihedral_transform(input_grid, transform_index),
+            apply_dihedral_transform(output_grid, transform_index) if has_output else None,
+            include_output=include_output_tokens,
+            append_end=append_end,
+        )
+        if len(tokens) > self.max_seq_len:
+            if self.drop_long_sequences:
+                return None
+            raise ValueError(
+                f"Sequence length {len(tokens)} exceeds max_seq_len={self.max_seq_len} "
+                f"for task {task_id} ({split} pair {pair_index})."
+            )
+        return SequenceExample(
+            tokens=torch.tensor(tokens, dtype=torch.long),
+            sep_index=tokens.index(IO_SEPARATOR_TOKEN_ID),
+            example_id=example_id,
+            task_embedding_ids=(
+                int(task_embedding_ids[0]),
+                int(task_embedding_ids[1]),
+            ),
+            task_id=task_id,
+            split=split,
+            pair_index=pair_index,
+            has_output=has_output,
+            seq_len=len(tokens),
+            preselected_dihedral_index=(
+                transform_index if dihedral_indices is not None else None
+            ),
+            is_rearc=is_rearc,
+            is_nvarc=is_nvarc,
+        )
+
+    def build_training_sequence(
+        self,
+        example: SequenceExample,
+        transform_index: Optional[int],
+        mapping: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, int, torch.Tensor]:
+        pairs = (
+            self.test_pairs_by_task[example.task_id]
+            if example.split == "test"
+            else self.demonstration_pairs(example)
+        )
+        pair = dict(pairs[example.pair_index])
+        if not self.include_outputs:
+            pair.pop("output", None)
+        visit = example.demo_visit_override
+        if visit is None:
+            visit = int(example.augment_epoch_override or 0)
+        token_tensor, target_sep = self.build_context_sequence(
+            example, pair, int(transform_index or 0), mapping, visit=visit,
+        )
+        if token_tensor.numel() > self.max_seq_len:
+            raise ValueError(
+                f"Sequence length {token_tensor.numel()} exceeds max_seq_len={self.max_seq_len}."
+            )
+        mask = torch.ones_like(token_tensor, dtype=torch.bool).unsqueeze(0)
+        positions = compute_positions_3d(token_tensor.unsqueeze(0), mask).squeeze(0)
+        return token_tensor, target_sep, positions
+
+    def demonstration_pairs(self, example: SequenceExample) -> Sequence[Dict[str, object]]:
+        return self.pairs_by_task[example.task_id]
+
+    def demonstration_indices(self, example: SequenceExample, visit: int) -> Tuple[int, ...]:
+        pairs = self.demonstration_pairs(example)
+        solved = tuple(i for i, pair in enumerate(pairs) if pair.get("output") is not None)
+        if self.attention_pattern == "pair_group":
+            if example.split == "train":
+                return training_demonstrations(
+                    solved, target=example.pair_index, visit=visit,
+                    half_or_more=self.training_demo_schedule == "half_or_more",
+                    max_demos=min(self.max_training_demos, 2 if self.training_demo_schedule == "two" else MAX_CONTEXT_DEMOS),
+                    seed=schedule_seed(self.seed,
+                        example.variation_path or example.task_id,
+                        "balanced-capped-training-demos-v1",
+                    ),
+                )
+            # Match the maximum fine-tuning context: one demo becomes the
+            # target there. Apply the six-demo cap after this subtraction.
+            seed = schedule_seed(self.seed, example.task_id, example.split, example.pair_index)
+            # inference_max_demos (default 6) caps the decode context, e.g. to
+            # the fine-tuning cap so decode prompts match the trained contexts.
+            if self.inference_demo_policy == "leave_one_out":
+                if self.inference_max_demos >= MAX_CONTEXT_DEMOS:
+                    return leave_one_out(solved, visit=visit, seed=seed)
+                count = min(len(solved) - 1, self.inference_max_demos)
+                return balanced_demonstrations(solved, count=count, visit=visit, seed=seed)
+            count = 2 if self.inference_demo_policy == "two" else len(solved)
+            return balanced_demonstrations(solved, count=min(count, self.inference_max_demos), visit=visit, seed=seed)
+        eligible = tuple(i for i in solved if example.split != "train" or i != example.pair_index)
+        return select_balanced_demonstrations(
+            eligible, visit=visit,
+            seed=_derive_order_seed(self.seed, (
+                example.variation_path or example.task_id,
+                f"demos:{example.split}", example.pair_index,
+            )),
+        )
+
+    def build_context_sequence(
+        self, example: SequenceExample, target: Dict[str, object],
+        transform_index: int, mapping: Optional[torch.Tensor], *, visit: int,
+    ) -> Tuple[torch.Tensor, int]:
+        pairs = self.demonstration_pairs(example)
+        demos = []
+        for index in self.demonstration_indices(example, visit):
+            pair = pairs[index]
+            candidates = intermediate_candidates(pair)
+            grids = [candidates[i] for i in self.intermediate_grid_indices(example, index, visit)]
+            demos.append({**pair, "intermediate_grids": grids})
+        if self.predict_intermediate_grids and target.get("output") is not None:
+            target = {**target, "intermediate_grids": self.target_intermediates(example, visit)}
+        return encode_context(demos, target, transform_index, mapping,
+                              predict_intermediate_grids=self.predict_intermediate_grids)
+
+    def target_intermediates(self, example, visit):
+        pairs = self.test_pairs_by_task[example.task_id] if example.split == "test" else self.demonstration_pairs(example)
+        pair = pairs[example.pair_index]
+        candidates = intermediate_candidates(pair)
+        indices = intermediate_indices(pair, seed=self.seed,
+            task=example.variation_path or example.task_id, split=example.split,
+            target=example.pair_index, visit=visit)
+        return [candidates[i] for i in indices]
+
+    def intermediate_grid_indices(self, example, pair_index, visit):
+        return intermediate_indices(self.demonstration_pairs(example)[pair_index],
+            seed=self.seed, task=example.variation_path or example.task_id,
+            split=example.split, target=example.pair_index, visit=visit)
+
+    def pair_identity_ids(self, example, positions, *, visit):
+        """IDs use physical pair identity before role RoPE erases pair numbers."""
+        ids = torch.zeros(positions.shape[:-1], dtype=torch.long)
+        if not self.pair_identity_vertices:
+            return ids
+        visible = self.demonstration_indices(example, visit)
+        # Count visits to this context, so skipped/subsampled contexts do not
+        # repeatedly land on the same phase of the Latin cycle.
+        demo_cap = self.max_training_demos if example.split == "train" else self.inference_max_demos
+        varying = len(self.demonstration_pairs(example)) > demo_cap or (
+            example.split == "train" and self.training_demo_schedule != "all") or (
+            example.split == "test" and self.inference_demo_policy != "all")
+        occurrence = sum(self.demonstration_indices(example, v) == visible for v in range(visit)) if varying else visit
+        assignment = balanced_pair_vertices(visible, visit=occurrence,
+            seed=schedule_seed(self.seed, example.variation_path or example.task_id,
+                               example.split, example.pair_index),
+            vertices=self.pair_identity_vertices)
+        for slot, pair in enumerate(visible):
+            ids[(positions[..., 2] == 2 * slot + 1) | (positions[..., 2] == 2 * slot + 2)] = assignment[pair]
+        return ids
 
     def __len__(self) -> int:
         return len(self.examples)
 
-    def __getitem__(self, idx: int) -> SequenceExample:
-        return self.examples[idx]
+    def _with_augment_epoch_override(
+        self,
+        example: SequenceExample,
+        augment_epoch_override: Optional[int],
+        dihedral_index: Optional[int] = None,
+        dihedral_occurrence: Optional[int] = None,
+    ) -> SequenceExample:
+        override = None if augment_epoch_override is None else int(augment_epoch_override)
+        transform = (
+            example.preselected_dihedral_index
+            if dihedral_index is None
+            else int(dihedral_index)
+        )
+        occurrence = (
+            example.dihedral_occurrence_override
+            if dihedral_occurrence is None
+            else int(dihedral_occurrence)
+        )
+        if (
+            example.augment_epoch_override == override
+            and example.preselected_dihedral_index == transform
+            and example.dihedral_occurrence_override == occurrence
+        ):
+            return example
+        return replace(
+            example,
+            augment_epoch_override=override,
+            preselected_dihedral_index=transform,
+            dihedral_occurrence_override=occurrence,
+        )
+
+    def _resolve_lazy_dihedral_index(
+        self,
+        *,
+        task_id: str,
+        pair_index: int,
+        augment_epoch_override: int,
+        is_nvarc: bool,
+    ) -> int:
+        augmentor = getattr(self, "augmentor", None)
+        if augmentor is None:
+            return 0
+        if hasattr(augmentor, "select_lazy_dihedral"):
+            return int(
+                augmentor.select_lazy_dihedral(
+                    task_id,
+                    pair_index,
+                    int(augment_epoch_override),
+                    is_nvarc=bool(is_nvarc),
+                )
+            )
+        order_seed = _derive_order_seed(
+            int(getattr(augmentor, "rearc_seed", 0)),
+            (task_id, "train", pair_index),
+        )
+        return _index_for_epoch(
+            order_seed,
+            list(range(8)),
+            int(augment_epoch_override),
+            2,
+        )
+
+    def __getitem__(self, idx: object) -> SequenceExample:
+        if isinstance(idx, tuple):
+            if idx and isinstance(idx[0], str):
+                source = str(idx[0])
+                if source == "regular":
+                    example_index = int(idx[1])
+                    augment_epoch_override = int(idx[2]) if len(idx) > 2 else 0
+                    return self._with_augment_epoch_override(
+                        self.examples[example_index],
+                        augment_epoch_override,
+                        int(idx[3]) if len(idx) > 3 else None,
+                        int(idx[4]) if len(idx) > 4 else None,
+                    )
+                example_id = int(idx[1])
+                pair_index = int(idx[2])
+                augment_epoch_override = int(idx[3]) if len(idx) > 3 else 0
+                scheduled_dihedral = int(idx[4]) if len(idx) > 4 else None
+                dihedral_occurrence = int(idx[5]) if len(idx) > 5 else None
+            else:
+                example_id, pair_index = int(idx[0]), int(idx[1])
+                augment_epoch_override = None
+                scheduled_dihedral = None
+                dihedral_occurrence = None
+            task_id = self.task_ids[example_id]
+            if task_id in self.rearc_pairs_by_task:
+                pair = self.rearc_pairs_by_task[task_id][pair_index]
+                is_rearc = True
+                is_nvarc = False
+            else:
+                pair = self._get_nvarc_pairs(task_id)[pair_index]
+                is_rearc = False
+                is_nvarc = True
+            selected_dihedral_index = scheduled_dihedral
+            if selected_dihedral_index is None and augment_epoch_override is not None:
+                selected_dihedral_index = self._resolve_lazy_dihedral_index(
+                    task_id=task_id,
+                    pair_index=pair_index,
+                    augment_epoch_override=augment_epoch_override,
+                    is_nvarc=is_nvarc,
+                )
+            cache_dihedral_index = (
+                -1 if selected_dihedral_index is None else int(selected_dihedral_index)
+            )
+            cache_key = (example_id, pair_index, cache_dihedral_index)
+            cached = self.rearc_example_cache.get(cache_key)
+            if cached is not None:
+                return self._with_augment_epoch_override(
+                    cached,
+                    augment_epoch_override,
+                    selected_dihedral_index,
+                    dihedral_occurrence,
+                )
+            example = self._build_sequence_example(
+                example_id=example_id,
+                task_id=task_id,
+                task_embedding_ids=self.task_id_to_embedding_ids[task_id],
+                split="train",
+                pair_index=pair_index,
+                pair=pair,
+                is_rearc=is_rearc,
+                is_nvarc=is_nvarc,
+                dihedral_indices=(
+                    None
+                    if selected_dihedral_index is None
+                    else (selected_dihedral_index,)
+                ),
+            )
+            if example is None:
+                raise ValueError(f"Unexpected dropped lazy example for {task_id}:{pair_index}.")
+            if is_rearc:
+                self.rearc_example_cache[cache_key] = example
+            return self._with_augment_epoch_override(
+                example,
+                augment_epoch_override,
+                selected_dihedral_index,
+                dihedral_occurrence,
+            )
+        return self._with_augment_epoch_override(self.examples[idx], None)
 
     def get_task_example_id(self, task_id: str) -> int:
         return self.task_id_to_example_id[task_id]
+
+    def get_task_embedding_ids(self, task_id: str) -> Tuple[int, int]:
+        return self.task_id_to_embedding_ids[task_id]
 
     def iter_examples(
         self, split: Optional[str] = None, has_output: Optional[bool] = None
@@ -604,6 +1238,90 @@ class ARCExampleDataset(Dataset):
 # Batch Sampler and DataLoader
 # =============================================================================
 
+def build_shuffle_balanced_dihedral_schedule(
+    example_keys: Sequence[object],
+    seed: int,
+) -> List[int]:
+    """Edge-colour occurrences so every full stream/example block uses D4 once."""
+    if not example_keys:
+        return []
+
+    appearances: Dict[object, int] = {}
+    left_ids: Dict[Tuple[object, int], int] = {}
+    edges: List[Tuple[int, int]] = []
+    for position, key in enumerate(example_keys):
+        appearance = appearances.get(key, 0)
+        appearances[key] = appearance + 1
+        left_key = (key, appearance // 8)
+        left_id = left_ids.setdefault(left_key, len(left_ids))
+        edges.append((left_id, position // 8))
+
+    rng = random.Random(int(seed))
+    edge_order = list(range(len(edges)))
+    rng.shuffle(edge_order)
+    edge_colors = [-1] * len(edges)
+    incident: Dict[Tuple[int, int], Dict[int, int]] = {}
+
+    def assign(edge_id: int, color: int) -> None:
+        left_id, right_id = edges[edge_id]
+        edge_colors[edge_id] = color
+        incident.setdefault((0, left_id), {})[color] = edge_id
+        incident.setdefault((1, right_id), {})[color] = edge_id
+
+    for edge_id in edge_order:
+        left_id, right_id = edges[edge_id]
+        left = (0, left_id)
+        right = (1, right_id)
+        left_colors = incident.get(left, {})
+        right_colors = incident.get(right, {})
+        common = [
+            color
+            for color in range(8)
+            if color not in left_colors and color not in right_colors
+        ]
+        if common:
+            assign(edge_id, rng.choice(common))
+            continue
+
+        alpha = rng.choice([color for color in range(8) if color not in left_colors])
+        beta = rng.choice([color for color in range(8) if color not in right_colors])
+        stack = [left]
+        component_vertices = {left}
+        component_edges: List[int] = []
+        seen_edges: Set[int] = set()
+        while stack:
+            vertex = stack.pop()
+            for color in (alpha, beta):
+                alternating_edge = incident.get(vertex, {}).get(color)
+                if alternating_edge is None or alternating_edge in seen_edges:
+                    continue
+                seen_edges.add(alternating_edge)
+                component_edges.append(alternating_edge)
+                edge_left, edge_right = edges[alternating_edge]
+                other = (1, edge_right) if vertex[0] == 0 else (0, edge_left)
+                if other not in component_vertices:
+                    component_vertices.add(other)
+                    stack.append(other)
+        if right in component_vertices:
+            raise RuntimeError("Failed to construct bipartite dihedral edge colouring.")
+
+        for alternating_edge in component_edges:
+            old_color = edge_colors[alternating_edge]
+            edge_left, edge_right = edges[alternating_edge]
+            del incident[(0, edge_left)][old_color]
+            del incident[(1, edge_right)][old_color]
+        for alternating_edge in component_edges:
+            old_color = edge_colors[alternating_edge]
+            new_color = beta if old_color == alpha else alpha
+            edge_left, edge_right = edges[alternating_edge]
+            edge_colors[alternating_edge] = new_color
+            incident[(0, edge_left)][new_color] = alternating_edge
+            incident[(1, edge_right)][new_color] = alternating_edge
+        assign(edge_id, beta)
+
+    return edge_colors
+
+
 class LengthBucketBatchSampler(Sampler[List[int]]):
     """Group indices with similar sequence lengths to limit padding within a batch."""
 
@@ -614,6 +1332,7 @@ class LengthBucketBatchSampler(Sampler[List[int]]):
         shuffle: bool = True,
         bucket_size: Optional[int] = None,
         drop_last: bool = False,
+        seed: int = 0,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
@@ -622,8 +1341,13 @@ class LengthBucketBatchSampler(Sampler[List[int]]):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
+        self.seed = int(seed)
+        self._epoch = 0
         bucket_size = bucket_size or batch_size * 4
         self.bucket_size = max(bucket_size, batch_size)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = max(0, int(epoch))
 
     def __len__(self) -> int:
         if self.drop_last:
@@ -635,7 +1359,9 @@ class LengthBucketBatchSampler(Sampler[List[int]]):
             return iter(())
 
         if self.shuffle:
-            indices = torch.randperm(len(self.lengths)).tolist()
+            generator = torch.Generator()
+            generator.manual_seed(self.seed + self._epoch)
+            indices = torch.randperm(len(self.lengths), generator=generator).tolist()
         else:
             indices = sorted(
                 range(len(self.lengths)),
@@ -653,7 +1379,7 @@ class LengthBucketBatchSampler(Sampler[List[int]]):
                     if len(batch) == self.batch_size or not self.drop_last:
                         batches.append(batch)
             if len(batches) > 1:
-                order = torch.randperm(len(batches)).tolist()
+                order = torch.randperm(len(batches), generator=generator).tolist()
                 batches = [batches[i] for i in order]
         else:
             for start in range(0, len(indices), self.batch_size):
@@ -664,9 +1390,245 @@ class LengthBucketBatchSampler(Sampler[List[int]]):
         return iter(batches)
 
 
+class LazyTrainBatchSampler(Sampler[List[object]]):
+    """Build pair-centric epochs across regular ARC, REARC, and NVARC."""
+
+    def __init__(
+        self,
+        *,
+        regular_train_indices_by_example_id: Dict[int, Sequence[int]],
+        rearc_pair_counts_by_example_id: Dict[int, int],
+        nvarc_pair_counts_by_example_id: Dict[int, int],
+        task_ids: Sequence[str],
+        batch_size: int,
+        seed: int = 0,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        rearc_pairs_per_task: int = 10,
+        nvarc_pairs_per_task: int = 10,
+        nvarc_puzzles_per_epoch: Optional[int] = None,
+        balance_dihedrals: bool = False,
+        num_epochs: int = 1,
+        minibatch_multiple: int = 1,
+    ) -> None:
+        self.regular_train_indices = [
+            int(index)
+            for indices in regular_train_indices_by_example_id.values()
+            for index in indices
+        ]
+        self.regular_train_indices_by_example_id = {
+            int(example_id): [int(index) for index in indices]
+            for example_id, indices in regular_train_indices_by_example_id.items()
+            if indices
+        }
+        self.rearc_pair_counts_by_example_id = {
+            int(example_id): int(pair_count)
+            for example_id, pair_count in rearc_pair_counts_by_example_id.items()
+            if int(pair_count) > 0
+        }
+        self.nvarc_pair_counts_by_example_id = {
+            int(example_id): int(pair_count)
+            for example_id, pair_count in nvarc_pair_counts_by_example_id.items()
+            if int(pair_count) > 0
+        }
+        self.task_ids = list(task_ids)
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.rearc_pairs_per_task = max(0, int(rearc_pairs_per_task))
+        self.nvarc_pairs_per_task = max(0, int(nvarc_pairs_per_task))
+        self.nvarc_puzzles_per_epoch = (
+            None
+            if nvarc_puzzles_per_epoch is None
+            else max(0, int(nvarc_puzzles_per_epoch))
+        )
+        self.balance_dihedrals = bool(balance_dihedrals)
+        self.num_epochs = max(1, int(num_epochs))
+        self.minibatch_multiple = max(1, int(minibatch_multiple))
+        self._epoch = 0
+        self._balanced_cache: Optional[
+            Tuple[Tuple[int, bool, int, int], List[List[object]]]
+        ] = None
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = max(0, int(epoch))
+
+    def _sample_indices_for_epoch(
+        self,
+        *,
+        order_seed: int,
+        item_count: int,
+        items_per_epoch: int,
+        epoch_index: int,
+    ) -> List[Tuple[int, int]]:
+        if item_count <= 0 or items_per_epoch <= 0:
+            return []
+        sample_count = min(int(items_per_epoch), int(item_count))
+        offset = int(epoch_index) * sample_count
+        cycle = offset // item_count
+        index_in_cycle = offset % item_count
+        remaining = sample_count
+        sampled: List[Tuple[int, int]] = []
+        indices = list(range(item_count))
+        while remaining > 0:
+            order = _order_for_cycle(order_seed, indices, 4, cycle)
+            take = min(remaining, item_count - index_in_cycle)
+            sampled.extend(
+                (int(item_index), int(cycle))
+                for item_index in order[index_in_cycle : index_in_cycle + take]
+            )
+            remaining -= take
+            cycle += 1
+            index_in_cycle = 0
+        return sampled
+
+    def _sample_pairs_for_epoch(
+        self,
+        *,
+        source: str,
+        example_id: int,
+        pair_count: int,
+        pairs_per_epoch: int,
+        epoch_index: int,
+    ) -> List[Tuple[int, int]]:
+        order_seed = _derive_order_seed(
+            self.seed,
+            (f"{source}_pair", self.task_ids[example_id], 0),
+        )
+        return self._sample_indices_for_epoch(
+            order_seed=order_seed,
+            item_count=pair_count,
+            items_per_epoch=pairs_per_epoch,
+            epoch_index=epoch_index,
+        )
+
+    def _sample_nvarc_puzzles_for_epoch(
+        self, epoch_index: Optional[int] = None
+    ) -> List[Tuple[int, int]]:
+        example_ids = sorted(self.nvarc_pair_counts_by_example_id.keys())
+        if not example_ids:
+            return []
+        puzzles_per_epoch = (
+            len(example_ids)
+            if self.nvarc_puzzles_per_epoch is None
+            else self.nvarc_puzzles_per_epoch
+        )
+        sampled_positions = self._sample_indices_for_epoch(
+            order_seed=_derive_order_seed(self.seed, ("nvarc_puzzle", "all", 0)),
+            item_count=len(example_ids),
+            items_per_epoch=puzzles_per_epoch,
+            epoch_index=self._epoch if epoch_index is None else int(epoch_index),
+        )
+        return [
+            (example_ids[position], selection_count)
+            for position, selection_count in sampled_positions
+        ]
+
+    def __len__(self) -> int:
+        total = len(self._indices_for_epoch(self._epoch))
+        return (total + self.batch_size - 1) // self.batch_size
+
+    def _indices_for_epoch(self, epoch: int) -> List[object]:
+        epoch_i = max(0, int(epoch))
+        rng = random.Random(self.seed + epoch_i)
+        indices: List[object] = [
+            ("regular", index, epoch_i) for index in self.regular_train_indices
+        ]
+        for example_id in sorted(self.rearc_pair_counts_by_example_id.keys()):
+            sampled_pairs = self._sample_pairs_for_epoch(
+                source="rearc",
+                example_id=example_id,
+                pair_count=self.rearc_pair_counts_by_example_id[example_id],
+                pairs_per_epoch=self.rearc_pairs_per_task,
+                epoch_index=epoch_i,
+            )
+            indices.extend(
+                ("rearc", example_id, pair_index, augment_epoch)
+                for pair_index, augment_epoch in sampled_pairs
+            )
+        for example_id, selection_count in self._sample_nvarc_puzzles_for_epoch(epoch_i):
+            sampled_pairs = self._sample_pairs_for_epoch(
+                source="nvarc",
+                example_id=example_id,
+                pair_count=self.nvarc_pair_counts_by_example_id[example_id],
+                pairs_per_epoch=self.nvarc_pairs_per_task,
+                epoch_index=selection_count,
+            )
+            indices.extend(
+                ("nvarc", example_id, pair_index, augment_epoch)
+                for pair_index, augment_epoch in sampled_pairs
+            )
+        if self.shuffle:
+            rng.shuffle(indices)
+        if self.drop_last:
+            batch_count = len(indices) // self.batch_size
+            if self.balance_dihedrals:
+                batch_count -= batch_count % self.minibatch_multiple
+            indices = indices[: batch_count * self.batch_size]
+        return indices
+
+    @staticmethod
+    def _augmentation_key(index: object) -> object:
+        values = tuple(index)
+        if values[0] == "regular":
+            return values[0], int(values[1])
+        return values[0], int(values[1]), int(values[2])
+
+    def _balanced_indices(self) -> List[List[object]]:
+        horizon = max(self.num_epochs, self._epoch + 1)
+        signature = (
+            horizon,
+            bool(self.drop_last),
+            self.batch_size,
+            self.minibatch_multiple,
+        )
+        if self._balanced_cache is not None and self._balanced_cache[0] == signature:
+            return self._balanced_cache[1]
+
+        epochs = [self._indices_for_epoch(epoch) for epoch in range(horizon)]
+        flat = [index for epoch_indices in epochs for index in epoch_indices]
+        keys = [self._augmentation_key(index) for index in flat]
+        dihedrals = build_shuffle_balanced_dihedral_schedule(
+            keys,
+            _derive_order_seed(self.seed, ("dihedral", "train", 0)),
+        )
+        dihedral_counts: Dict[Tuple[object, int], int] = {}
+        decorated: List[object] = []
+        for index, key, dihedral in zip(flat, keys, dihedrals):
+            count_key = (key, dihedral)
+            occurrence = dihedral_counts.get(count_key, 0)
+            dihedral_counts[count_key] = occurrence + 1
+            decorated.append((*tuple(index), dihedral, occurrence))
+
+        balanced_epochs: List[List[object]] = []
+        cursor = 0
+        for epoch_indices in epochs:
+            next_cursor = cursor + len(epoch_indices)
+            balanced_epochs.append(decorated[cursor:next_cursor])
+            cursor = next_cursor
+        self._balanced_cache = signature, balanced_epochs
+        return balanced_epochs
+
+    def __iter__(self):
+        indices = (
+            self._balanced_indices()[self._epoch]
+            if self.balance_dihedrals
+            else self._indices_for_epoch(self._epoch)
+        )
+
+        batches: List[List[object]] = []
+        for start in range(0, len(indices), self.batch_size):
+            batch = indices[start : start + self.batch_size]
+            if len(batch) == self.batch_size or not self.drop_last:
+                batches.append(batch)
+        return iter(batches)
+
+
 def collate_examples(
     batch: List[SequenceExample],
-    pad_token_id: int = END_TOKEN_ID,
+    dataset: ARCExampleDataset,
+    pad_token_id: int = END_PAIR_TOKEN_ID,
     augment_selector: Optional[
         Callable[[SequenceExample], Tuple[Optional[torch.Tensor], Optional[int]]]
     ] = None,
@@ -679,45 +1641,43 @@ def collate_examples(
         Tuple[
             SequenceExample,
             torch.Tensor,
-            Optional[torch.Tensor],
+            torch.Tensor,
             int,
             int,
-            Optional[torch.Tensor],
             int,
         ]
     ] = []
     for example in batch:
-        tokens = example.tokens
-        sep_index = example.sep_index
-        cached_positions = getattr(example, "cached_positions", None)
         mapping: Optional[torch.Tensor] = None
-        transform_index: Optional[int] = None
-        dihedral_id = 0
+        transform_index = getattr(example, "preselected_dihedral_index", None)
         if augment_selector is not None:
-            mapping, transform_index = augment_selector(example)
+            mapping, selected_transform_index = augment_selector(example)
+            if transform_index is None:
+                transform_index = selected_transform_index
+            elif (
+                selected_transform_index is not None
+                and int(selected_transform_index) != int(transform_index)
+            ):
+                if getattr(dataset, "augmentation_sampling_mode", None) == "single_grid_prefix":
+                    # A symmetric/exhausted unique-input pool may have no entry
+                    # for the requested geometry. Serialize the selected entry.
+                    transform_index = selected_transform_index
+                else:
+                    raise ValueError(
+                        "Augmentor returned a dihedral index that disagrees with the "
+                        f"preselected transform for {example.task_id}:{example.pair_index}."
+                    )
         if transform_index is not None:
             if transform_index < 0 or transform_index >= 8:
                 raise ValueError(
                     f"Invalid dihedral index {transform_index} for example {example.task_id}."
                 )
-            dihedral_id = int(transform_index)
-            tokens_by_dihedral = getattr(example, "tokens_by_dihedral", None)
-            if tokens_by_dihedral:
-                if transform_index < 0 or transform_index >= len(tokens_by_dihedral):
-                    raise ValueError(
-                        f"Invalid dihedral index {transform_index} for example {example.task_id}."
-                    )
-                tokens = tokens_by_dihedral[transform_index]
-                cached_by_dihedral = getattr(example, "cached_positions_by_dihedral", None)
-                if cached_by_dihedral:
-                    cached_positions = cached_by_dihedral[transform_index]
-                sep_by_dihedral = getattr(example, "sep_index_by_dihedral", None)
-                if sep_by_dihedral:
-                    sep_index = sep_by_dihedral[transform_index]
-        seq_len = int(tokens.size(0))
-        selected.append(
-            (example, tokens, cached_positions, seq_len, sep_index, mapping, dihedral_id)
+        tokens, sep_index, positions = dataset.build_training_sequence(
+            example, transform_index, mapping
         )
+        seq_len = int(tokens.size(0))
+        dihedral_id = 0 if transform_index is None else int(transform_index)
+        selected.append((example, tokens, positions, seq_len, sep_index, dihedral_id))
 
     batch_size = len(selected)
     seq_lengths = torch.tensor([item[3] for item in selected], dtype=torch.int32)
@@ -725,39 +1685,51 @@ def collate_examples(
     total_tokens = int(seq_lengths.sum().item())
 
     input_ids = torch.zeros(total_tokens, dtype=torch.long)
-    example_ids = torch.zeros(batch_size, dtype=torch.long)
-    dihedral_ids = torch.zeros(batch_size, dtype=torch.long)
-    sep_indices = torch.zeros(batch_size, dtype=torch.long)
-    positions_3d = torch.zeros((total_tokens, 3), dtype=torch.long)
+    example_ids = torch.full((batch_size, 2), -1, dtype=torch.int32)
+    dihedral_ids = torch.zeros(batch_size, dtype=torch.int32)
+    # All-demo contexts can exceed the signed 16-bit separator range.
+    sep_indices = torch.zeros(batch_size, dtype=torch.int32)
+    positions_3d = torch.zeros((total_tokens, 3), dtype=torch.int32)
+    pair_identity_ids = torch.zeros(total_tokens, dtype=torch.long) if getattr(dataset, "pair_identity_vertices", 0) else None
 
     cursor = 0
     for idx, (
         example,
         tokens,
-        cached_positions,
+        positions,
         seq_len,
         sep_index,
-        mapping,
         dihedral_id,
     ) in enumerate(selected):
-        if mapping is not None:
-            tokens = mapping[tokens]
         next_cursor = cursor + seq_len
         input_ids[cursor:next_cursor] = tokens
-        example_ids[idx] = example.example_id
-        dihedral_ids[idx] = int(dihedral_id)
+        task_embedding_ids = tuple(int(task_id) for task_id in example.task_embedding_ids)
+        if len(task_embedding_ids) != 2:
+            raise ValueError(
+                f"Expected exactly 2 task embedding ids for {example.task_id}, got {task_embedding_ids}."
+            )
+        example_ids[idx, 0] = task_embedding_ids[0]
+        example_ids[idx, 1] = task_embedding_ids[1]
+        dihedral_ids[idx] = dihedral_id
         sep_indices[idx] = int(sep_index)
-        if cached_positions is None:
-            fake_batch = tokens.unsqueeze(0)
-            mask = torch.ones_like(fake_batch, dtype=torch.bool)
-            cached_positions = compute_positions_3d(fake_batch, mask).squeeze(0)
-        positions_3d[cursor:next_cursor] = cached_positions
+        positions_3d[cursor:next_cursor] = positions
+        if pair_identity_ids is not None:
+            visit = example.demo_visit_override
+            if visit is None:
+                visit = int(example.augment_epoch_override or 0)
+            pair_identity_ids[cursor:next_cursor] = dataset.pair_identity_ids(example, positions, visit=visit)
         cursor = next_cursor
 
     cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32)
     cu_seqlens[1:] = torch.cumsum(seq_lengths, dim=0)
 
-    return {
+    prepared = {}
+    if getattr(dataset, "prepare_target_demo_layout", getattr(dataset, "attention_pattern", "dense") == "pair_group"):
+        from target_demo_attention import PreparedLayout, build_split_layout
+        prepared["target_demo_layout"] = PreparedLayout(
+            build_split_layout(input_ids, cu_seqlens, sep_indices + 1))
+
+    return {**prepared, **({"pair_identity_ids": pair_identity_ids} if pair_identity_ids is not None else {}),
         "input_ids": input_ids,
         "cu_seqlens": cu_seqlens,
         "max_seqlen": max_len,
@@ -781,14 +1753,65 @@ def create_dataloader(
         Callable[[SequenceExample], Tuple[Optional[torch.Tensor], Optional[int]]]
     ] = None,
     use_length_bucketing: bool = True,
+    seed: int = 0,
+    augmentor: Optional[object] = None,
+    num_workers: int = 0,
+    pin_memory: Optional[bool] = None,
+    persistent_workers: Optional[bool] = None,
+    prefetch_factor: Optional[int] = None,
+    num_epochs: int = 1,
+    gradient_accumulation_steps: int = 1,
 ) -> DataLoader:
-    if augment_selector is not None:
-        collate_fn = functools.partial(
-            collate_examples,
-            augment_selector=augment_selector,
+    collate_fn = functools.partial(
+        collate_examples,
+        dataset=dataset,
+        augment_selector=augment_selector,
+    )
+
+    num_workers = max(0, int(num_workers))
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
+    loader_kwargs: Dict[str, object] = {
+        "num_workers": num_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": bool(pin_memory),
+    }
+    if num_workers > 0:
+        if distributed.world_size() > 1:
+            # NCCL is initialized before workers start and is not fork safe.
+            loader_kwargs["multiprocessing_context"] = "spawn"
+        if persistent_workers is None:
+            persistent_workers = True
+        loader_kwargs["persistent_workers"] = bool(persistent_workers)
+        loader_kwargs["prefetch_factor"] = (
+            2 if prefetch_factor is None else max(1, int(prefetch_factor))
         )
-    else:
-        collate_fn = collate_examples
+        if augmentor is not None and hasattr(augmentor, "set_shared_epoch_buffer"):
+            shared_epoch = torch.zeros((), dtype=torch.int64)
+            shared_epoch.share_memory_()
+            augmentor.set_shared_epoch_buffer(shared_epoch)
+
+    if not use_length_bucketing and getattr(dataset, "has_lazy_train_sampling", False):
+        batch_sampler = LazyTrainBatchSampler(
+            regular_train_indices_by_example_id=dataset.regular_train_indices_by_example_id,
+            rearc_pair_counts_by_example_id=dataset.rearc_pair_counts_by_example_id,
+            nvarc_pair_counts_by_example_id=dataset.nvarc_pair_counts_by_example_id,
+            task_ids=dataset.task_ids,
+            batch_size=batch_size,
+            seed=seed,
+            shuffle=shuffle,
+            rearc_pairs_per_task=getattr(dataset, "rearc_pairs_per_epoch", 10),
+            nvarc_pairs_per_task=getattr(dataset, "nvarc_pairs_per_epoch", 10),
+            nvarc_puzzles_per_epoch=getattr(dataset, "nvarc_puzzles_per_epoch", None),
+            balance_dihedrals=augmentor is not None,
+            num_epochs=num_epochs,
+            minibatch_multiple=gradient_accumulation_steps,
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=distributed.shard_batch_sampler(batch_sampler),
+            **loader_kwargs,
+        )
 
     if use_length_bucketing:
         lengths = getattr(dataset, "sequence_lengths", None)
@@ -797,13 +1820,16 @@ def create_dataloader(
 
         bucket_size = max(batch_size * max(1, bucket_size_multiplier), batch_size)
         batch_sampler = LengthBucketBatchSampler(
-            lengths=lengths, batch_size=batch_size, shuffle=shuffle, bucket_size=bucket_size
+            lengths=lengths,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            bucket_size=bucket_size,
+            seed=seed,
         )
         return DataLoader(
             dataset,
             batch_sampler=batch_sampler,
-            num_workers=0,
-            collate_fn=collate_fn,
+            **loader_kwargs,
         )
 
     return DataLoader(
@@ -811,8 +1837,7 @@ def create_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=False,
-        num_workers=0,
-        collate_fn=collate_fn,
+        **loader_kwargs,
     )
 
 
@@ -824,6 +1849,13 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def recommended_num_workers(max_workers: int = 8) -> int:
+    cpu_count = os.cpu_count() or 1
+    if cpu_count <= 1 or max_workers <= 0:
+        return 0
+    return max(0, min(int(max_workers), cpu_count - 1))
 
 
 def resolve_device(device_str: str) -> torch.device:
@@ -846,33 +1878,26 @@ def capture_rng_state(device: torch.device) -> Dict[str, Any]:
     state["torch"] = torch.get_rng_state()
     if torch.cuda.is_available() and device.type == "cuda":
         try:
-            state["cuda"] = torch.cuda.get_rng_state_all()
+            if distributed.world_size() > 1:
+                state["cuda_local"] = torch.cuda.get_rng_state(device)
+            else:
+                state["cuda"] = torch.cuda.get_rng_state_all()
         except Exception:
             pass
     return state
 
 
-def restore_rng_state(state: Optional[Dict[str, Any]], device: torch.device) -> None:
-    """Restore RNG state saved in a checkpoint; safe to call with None."""
-    if not state:
-        return
-    try:
-        random.setstate(state["python"])
-    except Exception:
-        pass
-    try:
-        np.random.set_state(state["numpy"])
-    except Exception:
-        pass
-    try:
-        torch.set_rng_state(state["torch"])
-    except Exception:
-        pass
-    if "cuda" in state and torch.cuda.is_available() and device.type == "cuda":
-        try:
+def restore_rng_state(state: Dict[str, Any], device: torch.device) -> None:
+    """Restore RNG state saved in a checkpoint."""
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and device.type == "cuda":
+        if "cuda_local" in state:
+            # DDP rank RNGs must also load on a single-GPU evaluation host.
+            torch.cuda.set_rng_state(state["cuda_local"], device)
+        elif "cuda" in state:
             torch.cuda.set_rng_state_all(state["cuda"])
-        except Exception:
-            pass
 
 
 # =============================================================================
@@ -913,6 +1938,24 @@ def _shuffled_indices(indices: Sequence[int], seed: int) -> List[int]:
     return order
 
 
+def _order_for_cycle(
+    order_seed: int,
+    indices: Sequence[int],
+    mode: int,
+    cycle: int,
+) -> List[int]:
+    cycle_i = max(0, int(cycle))
+    order = _shuffled_indices(indices, _cycle_seed(order_seed, mode, cycle_i))
+    if cycle_i > 0:
+        prev_order = _shuffled_indices(
+            indices,
+            _cycle_seed(order_seed, mode, cycle_i - 1),
+        )
+        if order == prev_order:
+            order = order[1:] + order[:1]
+    return order
+
+
 def _index_for_epoch(order_seed: int, indices: Sequence[int], epoch: int, mode: int) -> int:
     if len(indices) == 1:
         return int(indices[0])
@@ -920,63 +1963,169 @@ def _index_for_epoch(order_seed: int, indices: Sequence[int], epoch: int, mode: 
     cycle_len = len(indices)
     cycle = epoch_i // cycle_len
     offset = epoch_i % cycle_len
-    order = _shuffled_indices(indices, _cycle_seed(order_seed, mode, cycle))
-    if cycle > 0:
-        prev_order = _shuffled_indices(indices, _cycle_seed(order_seed, mode, cycle - 1))
-        if order == prev_order:
-            order = order[1:] + order[:1]
+    order = _order_for_cycle(order_seed, indices, mode, cycle)
     return int(order[offset])
 
 
-def _colors_from_tokens(tokens: Sequence[int]) -> List[int]:
-    return sorted({int(tok) for tok in tokens if 1 <= int(tok) <= 9})
-
-
-def _max_color_permutations(n_colors: int, k: int) -> int:
-    if k <= 0 or n_colors <= 0 or k > n_colors:
-        return 1
-    return math.factorial(n_colors) // math.factorial(n_colors - k)
-
-
-def _unrank_permutation(domain: Sequence[int], index: int, factorials: Sequence[int]) -> Tuple[int, ...]:
-    items = [int(c) for c in domain]
-    result: List[int] = []
-    idx = int(index)
-    for size in range(len(items), 0, -1):
-        fact = factorials[size - 1]
-        pos = idx // fact
-        idx %= fact
-        result.append(int(items.pop(pos)))
-    return tuple(result)
-
-
-def _generate_task_permutations(domain: Sequence[int], max_permutations: int, rng: random.Random) -> List[Tuple[int, ...]]:
-    domain_list = [int(c) for c in domain]
-    n = len(domain_list)
-    if n == 0:
-        return [tuple()]
-    total = math.factorial(n)
-    target = min(max(1, int(max_permutations)), total)
-    if target == 1:
-        return [tuple(domain_list)]
-    factorials = [1]
-    for i in range(1, n + 1):
-        factorials.append(factorials[-1] * i)
-    if target >= total:
-        indices = list(range(total))
-        rng.shuffle(indices)
-    else:
-        indices = rng.sample(range(1, total), target - 1)
-        indices.append(0)
-        rng.shuffle(indices)
-    return [_unrank_permutation(domain_list, idx, factorials) for idx in indices]
-
-
-def _mapping_from_permutation(domain: Sequence[int], perm: Sequence[int]) -> List[int]:
-    mapping = list(range(VOCAB_SIZE))
-    for src, dst in zip(domain, perm):
-        mapping[int(src)] = int(dst)
+def _color_mapping_tensor(
+    colors: Sequence[int], targets: Sequence[int], destination_colors: Optional[Sequence[int]] = None,
+) -> torch.Tensor:
+    mapping = torch.arange(VOCAB_SIZE, dtype=torch.long)
+    for source, target in zip(colors, targets):
+        mapping[source] = target
+    if destination_colors is not None:
+        # Extend the injection to a permutation of all ten labels. Reserved
+        # output-only labels stay fixed; unused labels cannot collide either.
+        fixed = set(range(10)) - set(destination_colors)
+        assigned = set(colors) | fixed
+        remaining_sources = set(range(10)) - assigned
+        remaining_targets = set(range(10)) - {int(mapping[source]) for source in assigned}
+        for color in sorted(remaining_sources & remaining_targets):
+            remaining_sources.remove(color)
+            remaining_targets.remove(color)
+        for source, target in zip(sorted(remaining_sources), sorted(remaining_targets)):
+            mapping[source] = target
     return mapping
+
+
+def random_color_mapping(
+    colors: Sequence[int], seed: int, *, destination_colors: Optional[Sequence[int]] = None,
+) -> torch.Tensor:
+    colors = [int(color) for color in colors if 0 <= int(color) <= 9]
+    rng = random.Random(int(seed))
+    if destination_colors is None:
+        permutation = list(colors)
+        rng.shuffle(permutation)
+    else:
+        permutation = rng.sample(list(destination_colors), len(colors))
+    return _color_mapping_tensor(colors, permutation, destination_colors)
+
+
+def _unrank_color_injection(
+    colors: Sequence[int], rank: int, destination_colors: Optional[Sequence[int]] = None,
+) -> Tuple[int, ...]:
+    """Return one lexicographically ranked injection from colors into ARC colors."""
+    available = list(range(10)) if destination_colors is None else list(destination_colors)
+    targets: List[int] = []
+    rank_i = int(rank)
+    color_count = len(colors)
+    for index in range(color_count):
+        remaining = color_count - index - 1
+        block_size = math.factorial(len(available) - 1) // math.factorial(
+            len(available) - 1 - remaining
+        )
+        choice, rank_i = divmod(rank_i, block_size)
+        targets.append(available.pop(choice))
+    return tuple(targets)
+
+
+def build_augmentation_schedule(
+    colors: Sequence[int], count: int, seed: int, *,
+    destination_colors: Optional[Sequence[int]] = None,
+) -> Tuple[torch.Tensor, List[int]]:
+    colors = sorted({int(color) for color in colors if 0 <= int(color) <= 9})
+    requested = max(1, int(count))
+    destination_count = 10 if destination_colors is None else len(destination_colors)
+    injection_count = math.perm(destination_count, len(colors))
+    color_count = min(injection_count, requested)
+    schedule_count = min(requested, injection_count * 8)
+
+    rank_rng = random.Random(_cycle_seed(seed, 6, 0))
+    ranks = rank_rng.sample(range(injection_count), color_count)
+    targets = [_unrank_color_injection(colors, rank, destination_colors) for rank in ranks]
+
+    color_rng = random.Random(_cycle_seed(seed, 7, 0))
+    dihedral_rng = random.Random(_cycle_seed(seed, 8, 0))
+    color_pool: List[int] = []
+    dihedral_pool: List[int] = []
+    seen: Set[Tuple[int, int]] = set()
+    selected: List[Tuple[int, int]] = []
+    while len(selected) < schedule_count:
+        if not color_pool:
+            color_pool = list(range(color_count))
+            color_rng.shuffle(color_pool)
+        if not dihedral_pool:
+            dihedral_pool = list(range(8))
+            dihedral_rng.shuffle(dihedral_pool)
+        pair = (color_pool.pop(), dihedral_pool.pop())
+        if pair in seen:
+            continue
+        seen.add(pair)
+        selected.append(pair)
+
+    mappings: List[torch.Tensor] = []
+    dihedrals: List[int] = []
+    for color_index, dihedral in selected:
+        mapping = _color_mapping_tensor(colors, targets[color_index], destination_colors)
+        mappings.append(mapping)
+        dihedrals.append(dihedral)
+    return torch.stack(mappings), dihedrals
+
+
+def _balanced_color_block(
+    colors: Sequence[int], rng: random.Random, destination_colors: Optional[Sequence[int]] = None,
+) -> List[Tuple[int, ...]]:
+    permutation = list(range(10)) if destination_colors is None else list(destination_colors)
+    if not permutation:
+        return [tuple()]
+    rng.shuffle(permutation)
+    period = len(permutation)
+    offsets = rng.sample(range(period), len(colors))
+    block = [
+        tuple(permutation[(position + offset) % period] for offset in offsets)
+        for position in range(period)
+    ]
+    rng.shuffle(block)
+    return block
+
+
+def build_balanced_color_schedules(
+    colors: Sequence[int],
+    pair_keys: Sequence[Tuple[str, str, int]],
+    count: int,
+    seed: int,
+    *, destination_colors: Optional[Sequence[int]] = None,
+) -> Dict[Tuple[str, str, int], torch.Tensor]:
+    """Build task-coordinated balanced-block color schedules for regular ARC."""
+    colors = sorted({int(color) for color in colors if 0 <= int(color) <= 9})
+    requested = max(1, int(count))
+    period = 10 if destination_colors is None else max(1, len(destination_colors))
+    schedules: Dict[Tuple[str, str, int], torch.Tensor] = {}
+    task_seen: Set[Tuple[int, ...]] = set()
+
+    for key in sorted(set(pair_keys)):
+        rng = random.Random(_cycle_seed(_derive_order_seed(seed, key), 9, 0))
+        pair_seen: Set[Tuple[int, ...]] = set()
+        targets: List[Tuple[int, ...]] = []
+        block_sizes = [period] * (requested // period)
+        if requested % period:
+            block_sizes.append(requested % period)
+
+        for block_size in block_sizes:
+            best: Optional[List[Tuple[int, ...]]] = None
+            best_score: Optional[Tuple[int, int]] = None
+            for _ in range(32):
+                candidate = _balanced_color_block(colors, rng, destination_colors)[:block_size]
+                score = (
+                    sum(target in pair_seen for target in candidate),
+                    sum(target in task_seen for target in candidate),
+                )
+                if best_score is None or score < best_score:
+                    best, best_score = candidate, score
+                if score == (0, 0):
+                    break
+            assert best is not None
+            targets.extend(best)
+            task_seen.update(best)
+            pair_seen.update(best)
+
+        rng.shuffle(targets)
+        mappings = torch.stack([
+            _color_mapping_tensor(colors, target, destination_colors) for target in targets
+        ])
+        schedules[key] = mappings
+
+    return schedules
 
 
 @dataclass
@@ -984,10 +2133,200 @@ class Augments:
     color_maps: torch.Tensor
     dihedral_indices: List[int]
     color_map_indices: List[int]
-    identity_tuple_index: int
-    color_identity_indices: List[int]
-    dihedral_identity_indices: List[int]
     order_seed: int = 0
+    unique_inputs: bool = False
+    _candidates: Dict[Optional[int], List[int]] = field(default_factory=dict, repr=False)
+    _orders: Dict[Tuple[int, Optional[int]], Tuple[int, List[int]]] = field(default_factory=dict, repr=False)
+
+
+def _input_grid_bytes(grid: Sequence[Sequence[int]]) -> bytes:
+    """Compact, shape-preserving input key; row separators cannot be recolored."""
+    array = np.asarray(grid, dtype=np.uint8)
+    rows = np.empty((array.shape[0], array.shape[1] + 1), dtype=np.uint8)
+    rows[:, :-1] = array
+    rows[:, -1] = NEXT_LINE_TOKEN_ID
+    return rows.tobytes()
+
+
+def _input_geometry_bytes(grid: Sequence[Sequence[int]]) -> List[bytes]:
+    array = np.asarray(grid, dtype=np.uint8)
+    variants = (
+        array, np.rot90(array, -1), array[::-1, ::-1], np.rot90(array, 1),
+        array[:, ::-1], array[::-1], array.T, array.T[::-1, ::-1],
+    )
+    return [_input_grid_bytes(variant) for variant in variants]
+
+
+def _unique_color_targets(colors, destinations, rng):
+    """Balanced proposals, skipping mappings equivalent on this input."""
+    total = math.perm(len(destinations), len(colors))
+    limit = min(total, 5000)
+    seen = set()
+    stale_blocks = 0
+    while len(seen) < limit and stale_blocks < 32:
+        added = False
+        for target in _balanced_color_block(colors, rng, destinations):
+            if target not in seen:
+                seen.add(target)
+                added = True
+                yield target
+                if len(seen) >= limit:
+                    return
+        stale_blocks = 0 if added else stale_blocks + 1
+    # Finish small domains exhaustively; bound work for large color domains.
+    ranks = rng.sample(range(total), min(total, 5000))
+    for rank in ranks:
+        target = _unrank_color_injection(colors, rank, destinations)
+        if target not in seen:
+            seen.add(target)
+            yield target
+            if len(seen) >= limit:
+                return
+
+
+def build_unique_input_augments(
+    inputs_by_key: Dict[Tuple[str, str, int], Sequence[Sequence[int]]],
+    colors: Sequence[int], *, protected_colors: Sequence[int] = (),
+    original_inputs: Iterable[Sequence[Sequence[int]]] = (),
+    max_augments: int, seed: int,
+    mapping_dtype: torch.dtype = torch.long,
+) -> Dict[Tuple[str, str, int], Augments]:
+    """March-style task-wide pools, using byte translation instead of cell loops.
+
+    Preserve every original pair, even duplicate originals. All added inputs
+    must be distinct from every known original and every addition in this task.
+    Try new input-color signatures first, then remaining geometries of accepted
+    maps. Requested pool size is a cap, not a reason to repeat an input.
+    """
+    movable, destinations = color_augmentation_domain(colors, protected_colors, "single_grid_prefix")
+    seen_inputs = {_input_grid_bytes(grid) for grid in original_inputs}
+    seen_inputs.update(_input_grid_bytes(grid) for grid in inputs_by_key.values())
+    states = []
+    for key, grid in sorted(inputs_by_key.items()):
+        input_colors = sorted(set(np.asarray(grid).ravel().tolist()) & set(movable))
+        order_seed = _derive_order_seed(seed, key)
+        rng = random.Random(order_seed)
+        geometries = list(range(8))
+        rng.shuffle(geometries)
+        states.append(dict(
+            key=key, inputs=_input_geometry_bytes(grid), colors=input_colors,
+            rng=rng, targets=iter(_unique_color_targets(input_colors, destinations, rng)),
+            maps=[list(range(VOCAB_SIZE))], signatures=[tuple(input_colors)],
+            dihedrals=[0], map_indices=[0], counts=[1, 0, 0, 0, 0, 0, 0, 0],
+            tried={(tuple(input_colors), 0)}, geometry_order=geometries,
+            limit=min(max(1, int(max_augments)), math.perm(len(destinations), len(input_colors)) * 8),
+            order_seed=order_seed,
+        ))
+
+    def accept(state, signature, mapping, map_index):
+        table = bytes.maketrans(bytes(state["colors"]), bytes(signature))
+        for dihedral in sorted(state["geometry_order"], key=state["counts"].__getitem__):
+            if state["counts"][dihedral] >= math.ceil(state["limit"] / 8):
+                continue
+            candidate = (signature, dihedral)
+            if candidate in state["tried"]:
+                continue
+            state["tried"].add(candidate)
+            transformed = state["inputs"][dihedral].translate(table)
+            if transformed in seen_inputs:
+                continue
+            seen_inputs.add(transformed)
+            if map_index is None:
+                map_index = len(state["maps"])
+                state["maps"].append(mapping)
+                state["signatures"].append(signature)
+            state["dihedrals"].append(dihedral)
+            state["map_indices"].append(map_index)
+            state["counts"][dihedral] += 1
+            return True
+        return False
+
+    # Round-robin across pairs so one pair cannot consume the entire shared
+    # set of possible recolorings before another identical pair gets a turn.
+    active = list(states)
+    while active:
+        remaining = []
+        for state in active:
+            if len(state["dihedrals"]) >= state["limit"]:
+                continue
+            signature = next(state["targets"], None)
+            if signature is None:
+                continue
+            mapping = list(range(VOCAB_SIZE))
+            other_colors = [color for color in movable if color not in state["colors"]]
+            available = [color for color in destinations if color not in signature]
+            other_targets = state["rng"].sample(available, len(other_colors))
+            sources = state["colors"] + other_colors
+            targets = list(signature) + other_targets
+            for source, target in zip(sources, targets):
+                mapping[source] = target
+            # Complete the ten-label bijection; protected labels stay fixed.
+            unused_sources = set(destinations) - set(sources)
+            unused_targets = set(destinations) - set(targets)
+            for source, target in zip(sorted(unused_sources - unused_targets), sorted(unused_targets - unused_sources)):
+                mapping[source] = target
+            existing_index = 0 if signature == tuple(state["colors"]) else None
+            accept(state, signature, state["maps"][0] if existing_index == 0 else mapping, existing_index)
+            remaining.append(state)
+        active = remaining
+
+    active = [state for state in states if len(state["dihedrals"]) < state["limit"]]
+    while active:
+        remaining = []
+        for state in active:
+            for index, (signature, mapping) in enumerate(zip(state["signatures"], state["maps"])):
+                if accept(state, signature, mapping, index):
+                    if len(state["dihedrals"]) < state["limit"]:
+                        remaining.append(state)
+                    break
+        active = remaining
+
+    return {
+        state["key"]: Augments(
+            color_maps=torch.tensor(state["maps"], dtype=mapping_dtype),
+            dihedral_indices=state["dihedrals"], color_map_indices=state["map_indices"],
+            order_seed=state["order_seed"], unique_inputs=True,
+        ) for state in states
+    }
+
+
+def _select_augment_index(
+    augments: Augments,
+    order_seed: int,
+    epoch: int,
+    preselected_dihedral: Optional[int] = None,
+    dihedral_occurrence: Optional[int] = None,
+) -> int:
+    if augments.unique_inputs:
+        if len(augments.dihedral_indices) == 1:
+            return 0
+        candidates = augments._candidates.get(preselected_dihedral)
+        if candidates is None:
+            candidates = [index for index, dihedral in enumerate(augments.dihedral_indices)
+                          if preselected_dihedral is None or dihedral == preselected_dihedral]
+            if not candidates:
+                candidates = list(range(len(augments.dihedral_indices)))
+            augments._candidates[preselected_dihedral] = candidates
+        if len(candidates) == 1:
+            return candidates[0]
+        selection = max(0, int(epoch if dihedral_occurrence is None else dihedral_occurrence))
+        cycle, offset = divmod(selection, len(candidates))
+        cache_key = (order_seed, preselected_dihedral)
+        cached = augments._orders.get(cache_key)
+        if cached is None or cached[0] != cycle:
+            cached = (cycle, _order_for_cycle(order_seed, candidates, 3, cycle))
+            augments._orders[cache_key] = cached
+        return cached[1][offset]
+    candidates = list(range(len(augments.dihedral_indices)))
+    if preselected_dihedral is not None:
+        matching = [
+            index
+            for index in candidates
+            if int(augments.dihedral_indices[index]) == int(preselected_dihedral)
+        ]
+        candidates = matching or candidates
+    selection_index = epoch if dihedral_occurrence is None else dihedral_occurrence
+    return _index_for_epoch(order_seed, candidates, selection_index, 3)
 
 
 class Augmentor:
@@ -997,45 +2336,42 @@ class Augmentor:
         self,
         augments_by_key: Dict[Tuple[str, str, int], Augments],
         *,
-        color_apply_to_test_split: bool,
-        dihedral_apply_to_test_split: bool,
         max_augments: int = 0,
     ) -> None:
         self.augments_by_key = augments_by_key
-        self.color_apply_to_test_split = bool(color_apply_to_test_split)
-        self.dihedral_apply_to_test_split = bool(dihedral_apply_to_test_split)
         self.max_augments = int(max_augments)
         self._enabled = True
         self._epoch = 0
+        self._shared_epoch: Optional[torch.Tensor] = None
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = bool(enabled)
 
+    def set_shared_epoch_buffer(self, shared_epoch: Optional[torch.Tensor]) -> None:
+        self._shared_epoch = shared_epoch
+        if shared_epoch is not None:
+            shared_epoch.fill_(int(self._epoch))
+
+    def _current_epoch(self) -> int:
+        if self._shared_epoch is not None:
+            return int(self._shared_epoch.item())
+        return self._epoch
+
     def set_epoch(self, epoch: int) -> None:
         self._epoch = max(0, int(epoch))
+        if self._shared_epoch is not None:
+            self._shared_epoch.fill_(int(self._epoch))
 
-    def _resolve_flags(self, split: str) -> Tuple[bool, bool]:
-        if split == "test":
-            return self.color_apply_to_test_split, self.dihedral_apply_to_test_split
-        return True, True
-
-    def _select_index_for_epoch(
-        self, augments: Augments, *, color_enabled: bool, dihedral_enabled: bool
-    ) -> int:
-        if not color_enabled and not dihedral_enabled:
-            return augments.identity_tuple_index
-        if not color_enabled:
-            candidates = augments.color_identity_indices
-        elif not dihedral_enabled:
-            candidates = augments.dihedral_identity_indices
-        else:
-            candidates = list(range(len(augments.dihedral_indices)))
-        if not candidates:
-            return augments.identity_tuple_index
-        if len(candidates) == 1:
-            return candidates[0]
-        mode = (1 if color_enabled else 0) | (2 if dihedral_enabled else 0)
-        return _index_for_epoch(augments.order_seed, candidates, self._epoch, mode)
+    def _select_index_for_epoch(self, augments: Augments, epoch: Optional[int] = None) -> int:
+        count = len(augments.dihedral_indices)
+        if count <= 1:
+            return 0
+        effective_epoch = self._current_epoch() if epoch is None else max(0, int(epoch))
+        return _select_augment_index(
+            augments,
+            augments.order_seed,
+            effective_epoch,
+        )
 
     def select_for_example(self, example: SequenceExample) -> Tuple[Optional[torch.Tensor], Optional[int]]:
         if not self._enabled:
@@ -1044,248 +2380,280 @@ class Augmentor:
         augments = self.augments_by_key.get(key)
         if augments is None:
             return None, None
-        color_enabled, dihedral_enabled = self._resolve_flags(example.split)
-        idx = self._select_index_for_epoch(
-            augments, color_enabled=color_enabled, dihedral_enabled=dihedral_enabled
+        effective_epoch = getattr(example, "augment_epoch_override", None)
+        selection_epoch = (
+            self._current_epoch() if effective_epoch is None else effective_epoch
+        )
+        preselected = getattr(example, "preselected_dihedral_index", None)
+        idx = _select_augment_index(
+            augments,
+            augments.order_seed,
+            selection_epoch,
+            preselected,
+            getattr(example, "dihedral_occurrence_override", None),
         )
         color_idx = augments.color_map_indices[idx]
-        dihedral_idx = augments.dihedral_indices[idx]
+        dihedral_idx = (
+            augments.dihedral_indices[idx] if preselected is None or augments.unique_inputs else int(preselected)
+        )
         mapping = augments.color_maps[color_idx]
+        if mapping.dtype != torch.long:
+            mapping = mapping.long()
         return mapping, dihedral_idx
+
+
+class CombinedAugmentor:
+    """Dispatch regular, REARC, and NVARC augmentation policies from one selector."""
+
+    def __init__(
+        self,
+        regular_augmentor: Optional[Augmentor],
+        *,
+        rearc_seed: int = 0,
+        task_colors: Optional[Dict[str, Sequence[int]]] = None,
+        max_augments: int = 0,
+        augmentation_sampling_mode: Optional[str] = None,
+        task_output_only_colors: Optional[Dict[str, Sequence[int]]] = None,
+        dataset: Optional[ARCExampleDataset] = None,
+    ) -> None:
+        self.regular_augmentor = regular_augmentor
+        self.rearc_seed = int(rearc_seed)
+        self.augmentation_sampling_mode = normalize_augmentation_sampling_mode(augmentation_sampling_mode)
+        self.task_output_only_colors = task_output_only_colors or {}
+        self.dataset = dataset if self.augmentation_sampling_mode == "single_grid_prefix" else None
+        self.task_colors = {
+            str(task_id): tuple(int(color) for color in colors if 0 <= int(color) <= 9)
+            for task_id, colors in (task_colors or {}).items()
+        }
+        self._enabled = True
+        self._epoch = 0
+        self._shared_epoch: Optional[torch.Tensor] = None
+        source = regular_augmentor
+        self.max_augments = (
+            int(source.max_augments) if source is not None else max(1, int(max_augments))
+        )
+        self._rearc_augments_by_task: Dict[str, Augments] = {}
+        self._unique_augmentors: Dict[str, Augmentor] = {}
+
+    def _unique_augmentor(self, task_id: str, example: Optional[SequenceExample] = None) -> Augmentor:
+        augmentor = self._unique_augmentors.get(task_id)
+        if augmentor is None:
+            if self.dataset is not None:
+                pairs = self.dataset.pairs_by_task[task_id]
+                inputs = {(task_id, "train", index): pair["input"] for index, pair in enumerate(pairs)}
+                originals = [pair["input"] for pair in self.dataset.test_pairs_by_task.get(task_id, ())]
+            elif example is not None:
+                # Standalone selectors can still construct a one-pair pool.
+                inputs = {(task_id, example.split, example.pair_index):
+                          tokens_to_grid(example.tokens[1:example.sep_index].tolist())}
+                originals = []
+            else:
+                raise ValueError("Unique lazy augmentation requires the source dataset.")
+            augmentor = Augmentor(build_unique_input_augments(
+                inputs, self.task_colors.get(task_id, ()),
+                protected_colors=self.task_output_only_colors.get(task_id, ()),
+                original_inputs=originals, max_augments=self.max_augments, seed=self.rearc_seed,
+                mapping_dtype=torch.uint8,
+            ), max_augments=self.max_augments)
+            self._unique_augmentors[task_id] = augmentor
+        return augmentor
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = bool(enabled)
+        if self.regular_augmentor is not None:
+            self.regular_augmentor.set_enabled(enabled)
+
+    def set_shared_epoch_buffer(self, shared_epoch: Optional[torch.Tensor]) -> None:
+        self._shared_epoch = shared_epoch
+        if shared_epoch is not None:
+            shared_epoch.fill_(int(self._epoch))
+        if self.regular_augmentor is not None:
+            self.regular_augmentor.set_shared_epoch_buffer(shared_epoch)
+
+    def _current_epoch(self) -> int:
+        if self._shared_epoch is not None:
+            return int(self._shared_epoch.item())
+        return self._epoch
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = max(0, int(epoch))
+        if self._shared_epoch is not None:
+            self._shared_epoch.fill_(int(self._epoch))
+        if self.regular_augmentor is not None:
+            self.regular_augmentor.set_epoch(epoch)
+
+    def _select_nvarc_mapping(
+        self,
+        example: SequenceExample,
+        epoch: int,
+    ) -> Optional[torch.Tensor]:
+        colors, destinations = color_augmentation_domain(
+            self.task_colors.get(example.task_id, ()),
+            self.task_output_only_colors.get(example.task_id, ()),
+            self.augmentation_sampling_mode,
+        )
+        if not colors:
+            return None
+        mapping_seed = _derive_order_seed(
+            self.rearc_seed,
+            (example.task_id, "nvarc_color", example.pair_index),
+        )
+        return random_color_mapping(colors, _cycle_seed(mapping_seed, 5, epoch), destination_colors=destinations)
+
+    def _rearc_augments(self, task_id: str) -> Augments:
+        augments = self._rearc_augments_by_task.get(task_id)
+        if augments is None:
+            schedule_seed = _derive_order_seed(
+                self.rearc_seed, (task_id, "rearc_augmentation", 0)
+            )
+            colors, destinations = color_augmentation_domain(
+                self.task_colors.get(task_id, ()), self.task_output_only_colors.get(task_id, ()),
+                self.augmentation_sampling_mode,
+            )
+            mappings, dihedrals = build_augmentation_schedule(
+                colors, self.max_augments, schedule_seed, destination_colors=destinations
+            )
+            augments = Augments(
+                color_maps=mappings,
+                dihedral_indices=dihedrals,
+                color_map_indices=list(range(len(dihedrals))),
+            )
+            self._rearc_augments_by_task[task_id] = augments
+        return augments
+
+    def _select_rearc_index(self, task_id: str, pair_index: int, epoch: int) -> int:
+        augments = self._rearc_augments(task_id)
+        order_seed = _derive_order_seed(
+            self.rearc_seed, (task_id, "train", int(pair_index))
+        )
+        return _index_for_epoch(
+            order_seed, list(range(len(augments.dihedral_indices))), epoch, 3
+        )
+
+    def select_lazy_dihedral(
+        self, task_id: str, pair_index: int, epoch: int, *, is_nvarc: bool
+    ) -> int:
+        if self.augmentation_sampling_mode == "single_grid_prefix":
+            augments = self._unique_augmentor(task_id).augments_by_key[(task_id, "train", pair_index)]
+            return augments.dihedral_indices[_select_augment_index(augments, augments.order_seed, epoch)]
+        if is_nvarc:
+            order_seed = _derive_order_seed(
+                self.rearc_seed, (task_id, "train", int(pair_index))
+            )
+            return _index_for_epoch(order_seed, list(range(8)), epoch, 2)
+        augments = self._rearc_augments(task_id)
+        return augments.dihedral_indices[
+            self._select_rearc_index(task_id, pair_index, epoch)
+        ]
+
+    def select_for_example(
+        self, example: SequenceExample
+    ) -> Tuple[Optional[torch.Tensor], Optional[int]]:
+        if not self._enabled:
+            return None, None
+        effective_epoch = getattr(example, "augment_epoch_override", None)
+        if effective_epoch is None:
+            effective_epoch = self._current_epoch()
+        preselected = getattr(example, "preselected_dihedral_index", None)
+        if self.augmentation_sampling_mode == "single_grid_prefix" and (example.is_rearc or example.is_nvarc):
+            augmentor = self._unique_augmentor(example.task_id, example)
+            augmentor.set_epoch(effective_epoch)
+            return augmentor.select_for_example(example)
+        if example.is_rearc:
+            augments = self._rearc_augments(example.task_id)
+            order_seed = _derive_order_seed(
+                self.rearc_seed,
+                (example.task_id, "train", int(example.pair_index)),
+            )
+            idx = _select_augment_index(
+                augments,
+                order_seed,
+                effective_epoch,
+                preselected,
+                getattr(example, "dihedral_occurrence_override", None),
+            )
+            return (
+                augments.color_maps[idx],
+                augments.dihedral_indices[idx]
+                if preselected is None
+                else int(preselected),
+            )
+        if example.is_nvarc:
+            key = (example.task_id, example.split, example.pair_index)
+            order_seed = _derive_order_seed(self.rearc_seed, key)
+            dihedral_idx = (
+                _index_for_epoch(
+                    order_seed,
+                    list(range(8)),
+                    effective_epoch,
+                    2,
+                )
+                if preselected is None
+                else int(preselected)
+            )
+            return self._select_nvarc_mapping(example, effective_epoch), dihedral_idx
+        if self.regular_augmentor is not None:
+            return self.regular_augmentor.select_for_example(example)
+        return None, None
 
 
 def build_augmentor(
     dataset: Iterable[SequenceExample],
-    task_input_colors: Dict[str, Sequence[int]],
+    task_colors: Dict[str, Sequence[int]],
     *,
     max_augments: int,
-    enable_color: bool,
-    enable_dihedral: bool,
     seed: int,
-    color_apply_to_test_split: bool,
-    dihedral_apply_to_test_split: bool,
+    augmentation_sampling_mode: Optional[str] = None,
+    task_output_only_colors: Optional[Dict[str, Sequence[int]]] = None,
+    task_inputs: Optional[Dict[str, Sequence[Sequence[Sequence[int]]]]] = None,
 ) -> Augmentor:
-    """Build an Augmentor with color and dihedral augmentations for the dataset."""
-    rng = random.Random(int(seed))
-    max_augments = int(max_augments)
-    if max_augments <= 0:
-        max_augments = 1
-    max_dihedral = 8 if enable_dihedral else 1
-
-    examples_by_task: Dict[str, List[Tuple[str, str, int]]] = {}
-    input_tokens_by_key: Dict[Tuple[str, str, int], List[List[int]]] = {}
-    input_colors_by_key: Dict[Tuple[str, str, int], List[int]] = {}
-
+    """Build exact, seed-reproducible color/dihedral attempt schedules."""
+    attempt_count = max(1, int(max_augments))
+    augments_by_key: Dict[Tuple[str, str, int], Augments] = {}
+    keys_by_task: Dict[str, List[Tuple[str, str, int]]] = {}
+    inputs_by_task: Dict[str, Dict[Tuple[str, str, int], Sequence[Sequence[int]]]] = {}
+    unique_inputs = normalize_augmentation_sampling_mode(augmentation_sampling_mode) == "single_grid_prefix"
     for example in dataset:
         key = (example.task_id, example.split, example.pair_index)
-        tokens_by_dihedral = example.tokens_by_dihedral or [example.tokens]
-        num_dihedral = 8 if enable_dihedral else 1
-        input_tokens_by_dihedral: List[List[int]] = []
-        for d in range(num_dihedral):
-            tokens = tokens_by_dihedral[d]
-            tokens_list = tokens.tolist() if isinstance(tokens, torch.Tensor) else list(tokens)
-            input_tokens_by_dihedral.append(_extract_input_tokens(tokens_list))
-        input_tokens_by_key[key] = input_tokens_by_dihedral
-        input_colors_by_key[key] = _colors_from_tokens(input_tokens_by_dihedral[0])
-        examples_by_task.setdefault(example.task_id, []).append(key)
+        keys_by_task.setdefault(example.task_id, []).append(key)
+        if unique_inputs:
+            inputs_by_task.setdefault(example.task_id, {})[key] = tokens_to_grid(
+                example.tokens[1:example.sep_index].tolist()
+            )
 
-    augments_by_key: Dict[Tuple[str, str, int], Augments] = {}
-    stats: List[int] = []
-
-    for task_id, keys in examples_by_task.items():
-        seen_hashes: Set[int] = set()
-        for key in keys:
-            identity_tokens = input_tokens_by_key[key][0]
-            seen_hashes.add(_hash_tokens(identity_tokens))
-
-        allowed_colors = [int(c) for c in task_input_colors.get(task_id, []) if 1 <= int(c) <= 9]
-        allowed_set = set(allowed_colors)
-        task_input_set: Set[int] = set()
-        for key in keys:
-            task_input_set.update(input_colors_by_key[key])
-        colors_a = sorted(task_input_set)
-        if not allowed_set:
-            allowed_set = set(colors_a)
-        colors_b = sorted(allowed_set - set(colors_a))
-        domain_colors = colors_a + colors_b
-        identity_perm = tuple(domain_colors)
-
-        identity_map = list(range(VOCAB_SIZE))
-        sequence_states: Dict[Tuple[str, str, int], Dict[str, object]] = {}
-        remaining = 0
-        for key in keys:
-            input_colors = input_colors_by_key[key]
-            max_color_x = _max_color_permutations(len(domain_colors), len(input_colors))
-            if enable_color:
-                max_possible = max_color_x * max_dihedral
-            else:
-                max_possible = max_dihedral
-            augment_limit = min(max_augments, max_possible)
-            if augment_limit <= 0:
-                augment_limit = 1
-            order_seed = _derive_order_seed(seed, key)
-            dihedral_order = list(range(max_dihedral))
-            if len(dihedral_order) > 1:
-                dihedral_order = _shuffled_indices(dihedral_order, order_seed)
-            identity_signature = tuple(input_colors)
-            state: Dict[str, object] = {
-                "input_colors": input_colors,
-                "input_tokens_by_dihedral": input_tokens_by_key[key],
-                "color_maps": [identity_map],
-                "dihedral_indices": [0],
-                "color_map_indices": [0],
-                "augment_limit": int(augment_limit),
-                "augment_count": 1,
-                "seen_signatures": {identity_signature},
-                "seen_pairs": {(identity_signature, 0)},
-                "mapping_index_by_key": {tuple(identity_map): 0},
-                "mapping_signatures": [identity_signature],
-                "dihedral_order": dihedral_order,
-                "dihedral_cursor": 0,
-                "order_seed": order_seed,
-            }
-            if state["augment_count"] < state["augment_limit"]:
-                remaining += 1
-            sequence_states[key] = state
-
-        if enable_color and remaining > 0:
-            task_permutations = _generate_task_permutations(domain_colors, 5000, rng)
-            for perm in task_permutations:
-                if remaining == 0:
-                    break
-                if perm == identity_perm:
-                    continue
-                mapping = _mapping_from_permutation(domain_colors, perm)
-                mapping_key = tuple(mapping)
-
-                for key in keys:
-                    state = sequence_states[key]
-                    if state["augment_count"] >= state["augment_limit"]:
-                        continue
-                    input_colors = state["input_colors"]
-                    signature = tuple(mapping[color] for color in input_colors)
-                    if signature in state["seen_signatures"]:
-                        continue
-                    input_tokens_by_dihedral = state["input_tokens_by_dihedral"]
-                    dihedral_order = state["dihedral_order"]
-                    if not dihedral_order:
-                        continue
-                    dihedral_cursor = int(state["dihedral_cursor"])
-                    order_len = len(dihedral_order)
-                    selected_idx: Optional[int] = None
-                    selected_hash: Optional[int] = None
-                    for offset in range(order_len):
-                        d_idx = int(dihedral_order[(dihedral_cursor + offset) % order_len])
-                        if (signature, d_idx) in state["seen_pairs"]:
-                            continue
-                        tokens = input_tokens_by_dihedral[d_idx]
-                        mapped_tokens = [
-                            mapping[tok] if 0 <= tok < len(mapping) else tok
-                            for tok in tokens
-                        ]
-                        hashed = _hash_tokens(mapped_tokens)
-                        state["seen_pairs"].add((signature, d_idx))
-                        if hashed in seen_hashes:
-                            continue
-                        selected_idx = d_idx
-                        selected_hash = hashed
-                        state["dihedral_cursor"] = (dihedral_cursor + offset + 1) % order_len
-                        break
-
-                    if selected_idx is None or selected_hash is None:
-                        state["seen_signatures"].add(signature)
-                        continue
-
-                    map_idx = state["mapping_index_by_key"].get(mapping_key)
-                    if map_idx is None:
-                        map_idx = len(state["color_maps"])
-                        state["color_maps"].append(mapping)
-                        state["mapping_index_by_key"][mapping_key] = map_idx
-                        state["mapping_signatures"].append(signature)
-                    state["dihedral_indices"].append(int(selected_idx))
-                    state["color_map_indices"].append(int(map_idx))
-                    state["augment_count"] += 1
-                    state["seen_signatures"].add(signature)
-                    seen_hashes.add(selected_hash)
-                    if state["augment_count"] >= state["augment_limit"]:
-                        remaining -= 1
-                        if remaining == 0:
-                            break
-
-        if enable_dihedral and remaining > 0:
-            for pass_idx in range(max_dihedral):
-                if remaining == 0:
-                    break
-                for key in keys:
-                    state = sequence_states[key]
-                    if state["augment_count"] >= state["augment_limit"]:
-                        continue
-                    input_tokens_by_dihedral = state["input_tokens_by_dihedral"]
-                    dihedral_order = list(range(max_dihedral))
-                    if len(dihedral_order) > 1:
-                        dihedral_order = _shuffled_indices(
-                            dihedral_order, _cycle_seed(state["order_seed"], 3, pass_idx)
-                        )
-                    for map_idx, signature in enumerate(state["mapping_signatures"]):
-                        if state["augment_count"] >= state["augment_limit"]:
-                            break
-                        mapping = state["color_maps"][map_idx]
-                        for d in dihedral_order:
-                            if state["augment_count"] >= state["augment_limit"]:
-                                break
-                            if (signature, d) in state["seen_pairs"]:
-                                continue
-                            tokens = input_tokens_by_dihedral[d]
-                            mapped_tokens = [
-                                mapping[tok] if 0 <= tok < len(mapping) else tok
-                                for tok in tokens
-                            ]
-                            hashed = _hash_tokens(mapped_tokens)
-                            state["seen_pairs"].add((signature, d))
-                            if hashed in seen_hashes:
-                                continue
-                            state["dihedral_indices"].append(int(d))
-                            state["color_map_indices"].append(int(map_idx))
-                            state["augment_count"] += 1
-                            seen_hashes.add(hashed)
-                            if state["augment_count"] >= state["augment_limit"]:
-                                remaining -= 1
-                            break
-                    if remaining == 0:
-                        break
-
-        for key in keys:
-            state = sequence_states[key]
-            color_maps_tensor = torch.tensor(state["color_maps"], dtype=torch.long)
-            color_identity_indices = [
-                idx for idx, c in enumerate(state["color_map_indices"]) if c == 0
-            ]
-            dihedral_identity_indices = [
-                idx for idx, d in enumerate(state["dihedral_indices"]) if d == 0
-            ]
-            augments = Augments(
-                color_maps=color_maps_tensor,
-                dihedral_indices=state["dihedral_indices"],
-                color_map_indices=state["color_map_indices"],
-                identity_tuple_index=0,
-                color_identity_indices=color_identity_indices,
-                dihedral_identity_indices=dihedral_identity_indices,
+    for task_id in sorted(keys_by_task):
+        if unique_inputs:
+            augments_by_key.update(build_unique_input_augments(
+                inputs_by_task[task_id], task_colors.get(task_id, ()),
+                protected_colors=(task_output_only_colors or {}).get(task_id, ()),
+                original_inputs=(task_inputs or {}).get(task_id, ()),
+                max_augments=attempt_count, seed=seed,
+            ))
+            continue
+        pair_keys = sorted(set(keys_by_task[task_id]))
+        colors, destinations = color_augmentation_domain(
+            task_colors.get(task_id, ()), (task_output_only_colors or {}).get(task_id, ()),
+            augmentation_sampling_mode,
+        )
+        color_schedules = build_balanced_color_schedules(
+            colors, pair_keys, attempt_count, seed, destination_colors=destinations
+        )
+        for key in pair_keys:
+            schedule_seed = _derive_order_seed(
+                seed, (task_id, f"{key[1]}:{key[2]}", 0)
+            )
+            _, dihedrals = build_augmentation_schedule(
+                task_colors.get(task_id, ()), attempt_count, schedule_seed
+            )
+            if len(dihedrals) < attempt_count:
+                dihedrals = (dihedrals * math.ceil(attempt_count / len(dihedrals)))[
+                    :attempt_count
+                ]
+            augments_by_key[key] = Augments(
+                color_maps=color_schedules[key],
+                dihedral_indices=dihedrals,
+                color_map_indices=list(range(attempt_count)),
                 order_seed=_derive_order_seed(seed, key),
             )
-            augments_by_key[key] = augments
-            stats.append(len(state["dihedral_indices"]))
 
-    if stats:
-        avg = sum(stats) / len(stats)
-        print(
-            "Augmentation stats: "
-            f"{len(stats)} sequences, avg augments={avg:.1f}, "
-            f"min={min(stats)}, max={max(stats)}"
-        )
-
-    return Augmentor(
-        augments_by_key,
-        color_apply_to_test_split=color_apply_to_test_split,
-        dihedral_apply_to_test_split=dihedral_apply_to_test_split,
-        max_augments=max_augments,
-    )
+    return Augmentor(augments_by_key, max_augments=attempt_count)

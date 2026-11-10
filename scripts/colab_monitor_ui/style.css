@@ -1,0 +1,14 @@
+:root{color-scheme:light dark;font:14px/1.5 system-ui,sans-serif}
+body{margin:0;background:Canvas;color:CanvasText}
+main{max-width:1100px;margin:24px auto;padding:0 18px}
+header,.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+header{justify-content:space-between}h1{font-size:20px;margin:0}h2{font-size:15px;margin:24px 0 10px}
+h3{font:600 13px/1.5 ui-monospace,monospace;overflow-wrap:anywhere;margin:0 0 4px}
+p{margin:7px 0}.muted,small{color:GrayText;font-size:12px}button{font:inherit;padding:5px 10px;cursor:pointer}
+button:disabled{cursor:wait;opacity:.55}.vm{border:1px solid GrayText;border-radius:3px;padding:12px;margin:10px 0}
+.actions{margin:10px 0}.output:empty{display:none}.output{border-top:1px solid color-mix(in srgb,GrayText 35%,transparent);padding-top:8px;margin-top:8px}
+.error{color:light-dark(#a31818,#ff9b9b)}table{border-collapse:collapse;font-size:12px;max-width:100%;display:block;overflow:auto}
+th,td{text-align:right;white-space:nowrap;padding:4px 12px 4px 0;border-bottom:1px solid color-mix(in srgb,GrayText 25%,transparent)}
+th:first-child,td:first-child{text-align:left;white-space:normal;min-width:150px}details{margin-top:8px}summary{cursor:pointer;font-size:12px}
+.numbers{font-variant-numeric:tabular-nums}strong{font-weight:650}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}
+@media(max-width:600px){main{margin:14px auto}.vm{padding:10px}button{min-height:36px}}

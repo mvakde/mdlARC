@@ -1,0 +1,42 @@
+{
+  "run_name": "reasoning_default_eval_10",
+  "checkpoint": "runs/reasoning_default/pretrain/tiny.pt",
+  "eval_only": true,
+  "skip_data_build": true,
+  "skip_evals": false,
+  "score_results": true,
+  "visualize": false,
+  "dataset": {
+    "prefinesub": false,
+    "style": "pretrain",
+    "dataset": "arc1",
+    "add_conceptarc": true,
+    "add_filtered": true,
+    "add_rearc": null,
+    "add_nvarc_training": false,
+    "add_nvarc_full": false
+  },
+  "enable_finetune": false,
+  "defaults": {
+    "FA": 2,
+    "device": "cuda"
+  },
+  "finetune_defaults": {},
+  "finetunes": {},
+  "eval_defaults": {
+    "mode": "full-decode",
+    "batch_size": 120,
+    "max_augments": 10,
+    "enable_aug": true,
+    "seed": 42,
+    "inference_temperature": null,
+    "inference_top_k": null,
+    "allow_missing_tasks": true,
+    "extend_checkpoint_task_ids": true
+  },
+  "evals": {
+    "final": {
+      "checkpoint": "checkpoint"
+    }
+  }
+}

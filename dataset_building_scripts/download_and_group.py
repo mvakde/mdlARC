@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import shutil
 import urllib.request
@@ -6,7 +7,15 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 
-ASSETS = Path("../assets_tmp")
+SCRIPT_DIR = Path(__file__).resolve().parent
+ASSETS = SCRIPT_DIR.parent / "assets_tmp"
+
+# Pin source revisions so upstream branch updates cannot change an experiment's data.
+# ARC-1, ARC-2, and ConceptARC were checked against the existing grouped assets.
+ARC1_COMMIT = "399030444e0ab0cc8b4e199870fb20b863846f34"
+ARC2_COMMIT = "f3283f727488ad98fe575ea6a5ac981e4a188e49"
+CONCEPTARC_COMMIT = "0e67da6af879e4bad3d7cd3c196e8d551b445725"
+REARC_COMMIT = "e5b7f1d06362a76f9d3b8c25154ff1fafca897ce"
 
 def _load_clean(path: Path) -> dict:
     """Loads a JSON and keeps ONLY 'train' and 'test' keys."""
@@ -16,7 +25,7 @@ def _load_clean(path: Path) -> dict:
         "test": data["test"]
     }
 
-def download_and_extract(url, extract_path, dest_folder):
+def download_and_extract(url, extract_path, dest_folder, dest_subdir="raw"):
     print(f"Downloading {dest_folder}...")
     with urllib.request.urlopen(url) as resp:
         with zipfile.ZipFile(BytesIO(resp.read())) as zf:
@@ -27,7 +36,7 @@ def download_and_extract(url, extract_path, dest_folder):
     
     # Move files from extracted nested dir to clean dest
     raw_path = ASSETS / extract_path
-    final_path = ASSETS / dest_folder / "raw"
+    final_path = ASSETS / dest_folder / dest_subdir
     final_path.parent.mkdir(parents=True, exist_ok=True)
     if final_path.exists(): shutil.rmtree(final_path)
     shutil.move(str(raw_path), str(final_path))
@@ -87,20 +96,56 @@ def filter_overlaps():
     
     print(f"  Removed {len(duplicates)} overlapping tasks from both datasets.")
 
+def _download_and_group_conceptarc():
+    download_and_extract(
+        f"https://github.com/victorvikram/ConceptARC/archive/{CONCEPTARC_COMMIT}.zip",
+        f"ConceptARC-{CONCEPTARC_COMMIT}/corpus",
+        "ConceptARC",
+    )
+    group_concept()
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Download and group ARC datasets.")
+    parser.add_argument(
+        "--conceptarc-only",
+        action="store_true",
+        help="Download and group only ConceptARC.",
+    )
+    args = parser.parse_args()
+
+    if args.conceptarc_only:
+        _download_and_group_conceptarc()
+        return
+
     # 1. ARC-1
-    download_and_extract("https://github.com/fchollet/ARC-AGI/archive/master.zip", "ARC-AGI-master/data", "ARC-1")
+    download_and_extract(
+        f"https://github.com/fchollet/ARC-AGI/archive/{ARC1_COMMIT}.zip",
+        f"ARC-AGI-{ARC1_COMMIT}/data",
+        "ARC-1",
+    )
     group_arc("ARC-1", "arc1")
 
     # 2. ARC-2
-    download_and_extract("https://github.com/arcprize/ARC-AGI-2/archive/main.zip", "ARC-AGI-2-main/data", "ARC-2")
+    download_and_extract(
+        f"https://github.com/arcprize/ARC-AGI-2/archive/{ARC2_COMMIT}.zip",
+        f"ARC-AGI-2-{ARC2_COMMIT}/data",
+        "ARC-2",
+    )
     group_arc("ARC-2", "arc2")
 
     filter_overlaps() 
 
     # 3. ConceptARC
-    download_and_extract("https://github.com/victorvikram/ConceptARC/archive/main.zip", "ConceptARC-main/corpus", "ConceptARC")
-    group_concept()
+    _download_and_group_conceptarc()
+
+    # 4. RE-ARC
+    download_and_extract(
+        f"https://raw.githubusercontent.com/michaelhodel/re-arc/{REARC_COMMIT}/re_arc.zip",
+        "re_arc/tasks",
+        "RE-ARC",
+        dest_subdir="tasks",
+    )
 
 if __name__ == "__main__":
     main()

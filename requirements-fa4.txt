@@ -1,0 +1,6 @@
+# Alternative CUDA 13 training stack for B200/B300; retains the image's Torch.
+torch
+flash-attn-4[cu13]==4.0.0b36
+numpy
+numba
+matplotlib

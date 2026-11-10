@@ -1,0 +1,21 @@
+{
+  "trial_id": "example_arc2_b8_e330",
+  "template": "specs/arc2_finetune_sweep_template.json",
+  "overrides": {
+    "finetune_defaults": {
+      "normuon_lr": 0.0003,
+      "adamw_lr": 0.003,
+      "batch_size": 8
+    },
+    "finetunes": {
+      "example_arc2_b8_e330": {
+        "epochs": 330
+      }
+    },
+    "evals": {
+      "example_arc2_b8_e330": {
+        "checkpoint": "finetune.example_arc2_b8_e330.final"
+      }
+    }
+  }
+}

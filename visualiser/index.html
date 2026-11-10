@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#090b0f" />
+    <title>mdlARC Task Atlas</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app" aria-live="polite">
+      <header class="topbar">
+        <div class="brand" aria-label="mdlARC task atlas">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span>mdlARC</span>
+          <span class="brand-divider">/</span>
+          <span class="brand-muted">TASK ATLAS</span>
+        </div>
+
+        <div class="selectors">
+          <label>
+            <span>DATASET</span>
+            <select id="dataset-select" aria-label="Dataset"></select>
+          </label>
+          <label class="task-selector">
+            <span>TASK</span>
+            <select id="task-select" aria-label="Task"></select>
+          </label>
+        </div>
+
+        <div class="task-meta">
+          <span id="split-badge" class="badge" hidden></span>
+          <span id="task-position">— / —</span>
+          <span class="meta-divider">·</span>
+          <span id="pair-position">— pairs</span>
+        </div>
+      </header>
+
+      <section id="workspace" class="workspace" aria-label="Task pairs">
+        <button id="previous-task" class="task-nav task-nav-left" type="button" aria-label="Previous task">
+          <span class="nav-arrow" aria-hidden="true">‹</span>
+          <span class="nav-caption">TASK</span>
+        </button>
+
+        <div id="pair-grid" class="pair-grid"></div>
+
+        <nav class="pair-nav" aria-label="Pair pages">
+          <button id="previous-page" type="button" aria-label="Previous 12 pairs">
+            <span aria-hidden="true">↑</span>
+          </button>
+          <div class="page-readout" aria-label="Pair page">
+            <span id="page-current">1</span>
+            <span class="page-line"></span>
+            <span id="page-total">1</span>
+          </div>
+          <button id="next-page" type="button" aria-label="Next 12 pairs">
+            <span aria-hidden="true">↓</span>
+          </button>
+        </nav>
+
+        <button id="next-task" class="task-nav task-nav-right" type="button" aria-label="Next task">
+          <span class="nav-arrow" aria-hidden="true">›</span>
+          <span class="nav-caption">TASK</span>
+        </button>
+      </section>
+
+      <div id="loading" class="loading" hidden>
+        <span></span><span></span><span></span>
+      </div>
+
+      <div id="error" class="error" hidden>
+        <strong>Could not load this task.</strong>
+        <span id="error-message"></span>
+        <button id="retry" type="button">Retry</button>
+      </div>
+
+      <footer class="hintbar">
+        <span><kbd>←</kbd><kbd>→</kbd> tasks</span>
+        <span><kbd>↑</kbd><kbd>↓</kbd> pair pages</span>
+        <span class="hint-spacer"></span>
+        <span id="source-label">assets_tmp</span>
+      </footer>
+    </main>
+
+    <dialog id="detail-dialog">
+      <button id="close-detail" class="close-detail" type="button" aria-label="Close expanded pair">×</button>
+      <div id="detail-title" class="detail-title"></div>
+      <div id="detail-grids" class="detail-grids"></div>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "image": "nvcr.io/nvidia/pytorch:26.05-py3",
+  "image_selection": "cuda",
+  "gpu_names": ["B200"],
+  "num_gpus": 1,
+  "min_gpu_memory_gb": 170,
+  "max_gpu_memory_gb": null,
+  "min_cuda_version": 13.2
+}

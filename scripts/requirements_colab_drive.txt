@@ -1,0 +1,5 @@
+# Patched CA bundle for the October 2026 eMudhra incident.
+certifi>=2026.10.19
+google-api-python-client>=2,<3
+google-auth>=2,<3
+google-auth-oauthlib>=1,<2

@@ -1,0 +1,14 @@
+{
+  "flash_attn": "2.8.3.post1",
+  "wheel": "flash_attn-2.8.3.post1-cp313-cp313-linux_x86_64.whl",
+  "sha256": "f6c76df393420f6fbfcd4c6da903817eba2c4665f0338a2f458f7d47634a27cc",
+  "python": "3.13.15 (main, Aug  6 2026, 11:06:22) [GCC 13.3.0]",
+  "torch": "2.11.0+cu130",
+  "torch_cuda": "13.0",
+  "torch_cxx11_abi": true,
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "compute_capability": [
+    8,
+    0
+  ]
+}
