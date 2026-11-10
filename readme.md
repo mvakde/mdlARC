@@ -67,7 +67,7 @@ RunPod accounts and needs your own credentials and storage.
 ## Links
 
 - Blog post: https://mvakde.github.io/blog/looped-mdlarc/
-- Model weights: https://www.kaggle.com/models/mithilavakde/mdlarc
+- Model weights (99.8M, the 37.08% Kaggle model): https://www.kaggle.com/models/mithilavakde/mdlarc-loopv3-private/pyTorch/d1024-e440
 - ARC Data Squeeze: https://github.com/mvakde/arc-data-squeeze
 
 Released under the MIT License (see [LICENSE](LICENSE)).
