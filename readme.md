@@ -6,14 +6,16 @@ ARC-AGI from scratch: small transformers trained only on ARC puzzles, with no la
 
 | Version | Date | Result | Code | Post |
 | --- | --- | --- | --- | --- |
-| **v3: Looped mdlARC** | Nov 2026 | 37.08% on ARC-AGI-2 (Kaggle public leaderboard, no pretrained LLM); 71.88 / 81.50 top-2 / oracle on ARC-AGI-1 at 19M parameters | `main` (tag `v3-nov2026`) | [Looped mdlARC](https://mvakde.github.io/blog/looped-mdlarc/) |
+| **v3: Looped mdlARC** | Nov 2026 | 37.08% on ARC-AGI-2 (Kaggle public score¹), no pretrained LLM; 71.88 / 81.50 top-2 / oracle on ARC-AGI-1 at 19M parameters | `main` (tag `v3-nov2026`) | [Looped mdlARC](https://mvakde.github.io/blog/looped-mdlarc/) |
 | v2 | Mar 2026 | 44% on ARC-AGI-1 for 67 cents, 75M unlooped transformer | tag [`v2-mar2026`](https://github.com/mvakde/mdlARC/tree/v2-mar2026) | [44% on ARC-AGI-1 in 67 cents](https://mvakde.github.io/blog/44-on-arc-1/) |
 | v1 | Dec 2025 | 27.5% on ARC-AGI-1, 28M transformer, ~$2 | tag [`v1-dec2025`](https://github.com/mvakde/mdlARC/tree/v1-dec2025) | [New Pareto Frontier on ARC-AGI](https://mvakde.github.io/blog/new-pareto-frontier-arc-agi/) |
 
+¹ The Kaggle public score of the final submission (57908007). It was submitted before the deadline but scored after the leaderboard froze, so the official board shows the previous looped model at 35.69% (rank 141).
+
 ## v3: Looped mdlARC
 This repository holds the code for **"Looped mdlARC: ARC-AGI Without Language Models"**,
-our ARC Prize 2026 entry. The submitted model scored **37.08% on the Kaggle ARC-AGI-2
-public leaderboard** (submission 57908007).
+our ARC Prize 2026 entry. The submitted model scored **37.08% on ARC-AGI-2** (Kaggle public score¹,
+submission 57908007).
 
 It is a snapshot of the research code, plus the exact training specs and the submitted Kaggle
 notebook. The research-branch notes are in [README_research.md](README_research.md).
