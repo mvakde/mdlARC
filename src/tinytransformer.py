@@ -221,6 +221,11 @@ class TinyTransformerConfig:
             raise ValueError("num_task_embedding_latents must be >= 1.")
 
 
+# Task-indexed tables that exist only when ``task_embeddings`` is on.
+# Checkpoints saved before they were dropped still carry them unused.
+TASK_TABLE_MODULES = ("task_factor_embedding", "example_embedding", "value_embeddings")
+
+
 def _has_value_embedding(layer_idx: int, n_layers: int) -> bool:
     return layer_idx % 2 == (n_layers - 1) % 2
 
@@ -1380,13 +1385,13 @@ class TinyTransformer(nn.Module):
                     nn.init.zeros_(gate.bias)
                     block.attention.target_demo_gate = gate
 
-        # Keep shared initial weights identical across the task ablation. These
-        # tables remain in the state dict, but disabled conditioning has no
-        # lookup, gradient, optimizer state, or effect on any model path.
+        # Without task embeddings the task tables would have no lookup,
+        # gradient or optimizer state, so they are deleted. They are still
+        # built and initialized above, so every other weight starts the same
+        # for a given seed. The small gates stay in the state dict, frozen.
         if not config.task_embeddings:
-            self.task_factor_embedding.requires_grad_(False)
-            self.example_embedding.requires_grad_(False)
-            self.value_embeddings.requires_grad_(False)
+            for name in TASK_TABLE_MODULES:
+                delattr(self, name)
             self.example_gate_logit.requires_grad_(False)
             for block in self.blocks:
                 block.example_input_skip_scale.requires_grad_(False)
@@ -1396,6 +1401,12 @@ class TinyTransformer(nn.Module):
         # Cache structural mask metadata by device, capacity, and KV block.
         self._decode_block_mask_cache: Dict[tuple, object] = {}
         self._decode_block_size = 128
+
+    @property
+    def conditioning_dtype(self) -> torch.dtype:
+        """Dtype of the example/dihedral conditioning stream."""
+        table = self.example_embedding if self.config.task_embeddings else self.token_embedding
+        return table.weight.dtype
 
     @property
     def cache_layer_count(self) -> int:
@@ -1826,7 +1837,7 @@ class TinyTransformer(nn.Module):
             example_embeds = self._lookup_example_embeds(example_ids)
         else:
             example_embeds = example_embeds.to(
-                device=device, dtype=self.example_embedding.weight.dtype
+                device=device, dtype=self.conditioning_dtype
             )
         dihedral_embeds = self._lookup_dihedral_embeds(
             dihedral_ids, batch_size=batch_size, device=device,
@@ -2842,7 +2853,7 @@ class TinyTransformer(nn.Module):
                     "conditioning_embeds must have batch dimension matching input_ids."
                 )
             conditioning_embeds = conditioning_embeds.to(
-                device=device, dtype=self.example_embedding.weight.dtype
+                device=device, dtype=self.conditioning_dtype
             )
             if self.config.dihedral_embeddings:
                 # Keep the historical separate shortcut streams even when the
@@ -2871,7 +2882,7 @@ class TinyTransformer(nn.Module):
                         "example_embeds must have batch dimension matching input_ids."
                     )
                 example_embeds = example_embeds.to(
-                    device=device, dtype=self.example_embedding.weight.dtype
+                    device=device, dtype=self.conditioning_dtype
                 )
             (
                 hidden_states,

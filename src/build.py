@@ -32,6 +32,7 @@ from common import (
 )
 from tinytransformer import (
     TinyTransformer,
+    TASK_TABLE_MODULES,
     TinyTransformerConfig,
     normalize_flash_attention_version,
 )
@@ -319,6 +320,12 @@ def _load_model_state(
     checkpoint_embedding_row_ids = tuple(
         str(task_id) for task_id in checkpoint["embedding_task_ids"]
     )
+    # Checkpoints saved before the model dropped its unused task tables still
+    # carry them; a model without the tables ignores them.
+    task_table_prefixes = tuple(f"{name}." for name in TASK_TABLE_MODULES)
+    if not any(key.startswith(task_table_prefixes) for key in expected):
+        for key in [key for key in state_dict if key.startswith(task_table_prefixes)]:
+            del state_dict[key]
 
     def _align_task_factor_weight() -> None:
         key = "task_factor_embedding.weight"
@@ -761,7 +768,7 @@ def build_model_and_data(
               f"KL weight={config.next_latent_kl_weight}; "
               f"MTP heads={config.n_predict - 1}.")
 
-    if checkpoint is None and isinstance(dataset, VariationTrainingDataset):
+    if checkpoint is None and isinstance(dataset, VariationTrainingDataset) and model.config.task_embeddings:
         dataset.initialize_task_factors(model.task_factor_embedding)
 
     if checkpoint:

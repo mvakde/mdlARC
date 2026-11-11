@@ -115,6 +115,9 @@ and on Kaggle as the model variation
 [`mithilavakde/mdlarc-loopv3-private/pyTorch/d1024-e440`](https://www.kaggle.com/models/mithilavakde/mdlarc-loopv3-private/pyTorch/d1024-e440).
 Both are the same file (SHA-256 `328f80bc…3a38cfc`). To download and verify it:
 `python data_generation/fetch.py --name mdlarc-d1024-e440.pt`.
+This file, like every checkpoint saved before the model stopped building them, also holds unused
+task-embedding tables (27.5M values; every v3 spec sets `task_embeddings: false`). The loader drops
+them, newer checkpoints leave them out, and the 99.8M count excludes them.
 
 Multi-GPU specs set `"distributed": {"nproc_per_node": N}`; `launch_run.py` then starts one process per
 GPU on a single machine.

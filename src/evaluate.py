@@ -833,7 +833,7 @@ def _prefill_prompts(
     conditioning_embeds = model.compute_conditioning_embeds(
         example_ids_tensor,
         dihedral_ids_tensor,
-    ).to(dtype=model.example_embedding.weight.dtype)
+    ).to(dtype=model.conditioning_dtype)
     value_embeds = model.compute_value_embeds(example_ids_tensor)
     outputs = model.forward_generate(
         input_ids=input_ids, example_ids=example_ids_tensor, past_key_values=None,

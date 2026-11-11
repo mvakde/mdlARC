@@ -136,7 +136,7 @@ def cached_target_logits(model, attempt, device, max_new_tokens, token_limit, *,
     positions = evaluate._pad_cached_positions([item.positions], pad_len, device)
     ids = torch.tensor([item.task_embedding_ids], dtype=torch.int32, device=device)
     dihedrals = torch.tensor([item.dihedral_index], dtype=torch.int32, device=device)
-    conditioning = model.compute_conditioning_embeds(ids, dihedrals).to(model.example_embedding.weight.dtype)
+    conditioning = model.compute_conditioning_embeds(ids, dihedrals).to(model.conditioning_dtype)
     values = model.compute_value_embeds(ids)
     shared = dict(example_ids=ids, dihedral_ids=dihedrals,
                   conditioning_embeds=conditioning, value_embeds=values)

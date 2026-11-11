@@ -143,8 +143,9 @@ def test_context_loss_and_gradients_match_target_only_reference(enabled, path, m
 @pytest.mark.parametrize("compiled", [False, True])
 def test_disabled_task_conditioning_is_inert_in_training_prefill_and_cached_decode(compiled):
     enabled, model = _model(True), _model(False).eval()
-    for name, weight in enabled.state_dict().items():
-        torch.testing.assert_close(weight, model.state_dict()[name], rtol=0, atol=0)
+    # The disabled model lacks only the task tables; every shared weight is equal.
+    for name, weight in model.state_dict().items():
+        torch.testing.assert_close(weight, enabled.state_dict()[name], rtol=0, atol=0)
     tokens, sep = encode_context([{"input": [[5]], "output": [[6]]}] * 2,
                                  {"input": [[1, 2]], "output": [[3, 4]]})
     positions = compute_positions_3d(tokens[None])
