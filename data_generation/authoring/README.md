@@ -170,4 +170,5 @@ parts will not run as copied:
 - Some READMEs mention other files or folders from the original repository
   that are not included here.
 
-Licence: to be decided.
+Licence: MIT-0, like the rest of this repository; see
+[Licence](../../README.md#licence).
