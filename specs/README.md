@@ -52,7 +52,7 @@ These defaults differ from earlier versions of this code. Every paper spec sets 
 | `scale_augmentation` | `false` | `true` | ReARC specs (2.1, 2.2) and 2.3 set `true` |
 | `inference_scale_views` | `false` | `true` | set in 2.1, 2.2 and the 2.4 / 2.5 evaluations |
 | `inference_symbolic_guards` | `false` | `true` | set in 2.1, 2.2 |
-| `inference_rescore` | `false` | `true` | set in 2.1, 2.2 (in-decode likelihood ranking) |
+| `inference_rescore` | `false` | `true` | set in 1.3, 1.10, 2.1, 2.2 (in-decode likelihood ranking) |
 | `dataset.add_rearc` | `null` | `1000` | set to `1000` in 2.1, 2.2 |
 | `compile_scope` | `"blocks"` | whole model (before per-block compilation) | `"blocks"` compiles each transformer block once; specs whose run compiled the whole model set `"model"` |
 | `inference_speculative` | `true` | `false` (before the decode speed-ups) | self-speculative greedy decoding; specs whose run decoded with plain greedy steps set `false` |
@@ -76,14 +76,14 @@ demonstrations; the ARC-AGI-2 rows swap the two ARC sets) unless stated.
 | --- | --- | --- | --- | --- |
 | 1.1 | [`data_squeeze/arc1_d256x6.json`](data_squeeze/arc1_d256x6.json) | d256, 8 blocks, [2,6) ×6 + DS (8.4M) | 330 | 66.25 / 77.25 |
 | 1.2 | [`data_squeeze/arc1_d256x6_seed43.json`](data_squeeze/arc1_d256x6_seed43.json) | as 1.1, seed 43 | 330 | 62.00 / 76.12 |
-| 1.3 | [`data_squeeze/arc1_d384x6.json`](data_squeeze/arc1_d384x6.json) | d384 ×6 + DS (18.9M) | 330 | 68.38 / 79.62 |
+| 1.3 | [`data_squeeze/arc1_d384x6.json`](data_squeeze/arc1_d384x6.json) | d384 ×6 + DS (18.9M) | 330 | 68.38 / 79.62 (likelihood ranking 70.25) |
 | 1.4 | [`data_squeeze/arc1_d144x6.json`](data_squeeze/arc1_d144x6.json) | d144 ×6 + DS, 3 heads, FFN 384 (2.0M) | 330 | 55.63 / 68.00 |
 | 1.5 | [`data_squeeze/arc1_d96x6.json`](data_squeeze/arc1_d96x6.json) | d96 ×6 + DS, 4 heads, FFN 320 (1.05M) | 330 | 49.00 / 60.62 |
 | 1.6 | [`data_squeeze/arc1_d96x6_ffn256.json`](data_squeeze/arc1_d96x6_ffn256.json) | d96 ×6 + DS, 3 heads, FFN 256 (0.90M) | 330 | 41.25 / 55.50 |
 | 1.7 | [`data_squeeze/arc1_d128x6.json`](data_squeeze/arc1_d128x6.json) | d128 ×6 + DS, 2 heads, FFN 512 (2.1M) | 330 | 51.25 / 65.25 |
 | 1.8 | [`data_squeeze/arc1_d80x6.json`](data_squeeze/arc1_d80x6.json) | d80 ×6 + DS, 4 heads, FFN 256 (0.71M) | 330 | 33.38 / 48.12 |
 | 1.9 | [`data_squeeze/arc1_d96x6_ffn296.json`](data_squeeze/arc1_d96x6_ffn296.json) | d96 ×6 + DS, 4 heads, FFN 296 (0.99M) | 330 | 41.50 / 55.88 |
-| 1.10 | [`data_squeeze/arc2_d384x6.json`](data_squeeze/arc2_d384x6.json) | ARC-AGI-2, d384 ×6 + DS | 330 | 13.89 / 20.56 (16.67 / 24.67 of 120) |
+| 1.10 | [`data_squeeze/arc2_d384x6.json`](data_squeeze/arc2_d384x6.json) | ARC-AGI-2, d384 ×6 + DS | 330 | 13.89 / 20.56 (16.67 / 24.67 of 120; likelihood ranking 15.14) |
 | 1.11 | [`data_squeeze/arc2_d256x8.json`](data_squeeze/arc2_d256x8.json) | ARC-AGI-2, d256 ×8 + DS | 330 | 12.64 / 18.89 (15.17 / 22.67 of 120) |
 
 ### ReARC and scale augmentation
@@ -153,6 +153,11 @@ demonstrations; the ARC-AGI-2 rows swap the two ARC sets) unless stated.
 - **1.1, 3.9.** The oracle comes from a second decode of the same checkpoint (same top-2). With this
   code one decode writes both scores.
 - **1.2.** Same recipe as 1.1 with seed 43, but run on a later, faster version of the code.
+- **1.3, 1.10.** These specs also rank each output's 20 most-voted candidates by likelihood
+  (`inference_rescore`), the [ARC Data Squeeze](https://github.com/mvakde/arc-data-squeeze) record
+  recipe. One decode writes both scores: `score.json` has the ranked top-2 and `oracle_score.json`
+  keeps the plain-vote top-2 (`top2_votes`) that the paper reports. The ranked scores (70.25 and
+  15.14) come from ranking a decode's saved candidates, so a fresh decode can differ by a few vote ties.
 - **2.3 / 2.4.** The run was trained in two parts with the same effective batch of 64: epochs 1–130 at
   micro-batch 16 × 4 accumulation, epochs 131–330 at 32 × 2. The spec runs all 330 epochs at 16 × 4.
 - **2.5.** The spec ranks the 2.4 candidates by likelihood (71.25 top-2; plain votes 70.50). The

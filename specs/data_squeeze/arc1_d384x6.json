@@ -129,7 +129,9 @@
     "inference_top_k": null,
     "allow_missing_tasks": true,
     "extend_checkpoint_task_ids": true,
-    "inference_demo_policy": "leave_one_out"
+    "inference_demo_policy": "leave_one_out",
+    "inference_rescore": true,
+    "rescore_top_k": 20
   },
   "evals": {
     "accuracy": {

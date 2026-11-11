@@ -38,8 +38,10 @@ Kaggle model trains on the generated task families in [`data_generation/`](data_
 | d96, looped ×6 | 1.05M | 49.00 / 60.62 | | [`arc1_d96x6`](specs/data_squeeze/arc1_d96x6.json) |
 | d1024, looped ×6, Kaggle model (with test-time fine-tuning) | 99.8M | | 37.08 (Kaggle public score¹) | [`specs/paper/kaggle_d1024/`](specs/paper/kaggle_d1024/), [`kaggle_submissions/`](kaggle_submissions/) |
 
-The 71.88 row ranks the decoded candidates by likelihood, then applies the symbolic guards with
-[`tools/guards_eval.py`](tools/guards_eval.py). The loop ablations, the unlooped depth ladder, the
+The two d384 ×6 specs also rank each output's 20 most-voted candidates by likelihood (the ARC Data
+Squeeze record recipe): their `score.json` gives 70.25 on ARC-AGI-1 and 15.14 on ARC-AGI-2, and
+`oracle_score.json` keeps the plain-vote scores above. The 71.88 row ranks the decoded candidates by
+likelihood, then applies the symbolic guards with [`tools/guards_eval.py`](tools/guards_eval.py). The loop ablations, the unlooped depth ladder, the
 sub-1M models and the other paper rows are listed with their specs and scores in
 [`specs/README.md`](specs/README.md).
 
