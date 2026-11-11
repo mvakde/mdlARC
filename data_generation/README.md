@@ -20,7 +20,9 @@ produced each puzzle, so the package can be regenerated and checked: all but
 > evaluation set.** It was built for the ARC Prize 2026 Kaggle competition,
 > which scores on hidden tasks that are not in it.
 
-Licence: to be decided.
+Licence: the generators and scripts are MIT-0 and the generated puzzles are
+CC0 1.0; the original ARC-AGI-2 tasks in the package stay under ARC-AGI-2's
+Apache License 2.0. See [Licence](../README.md#licence).
 
 ## What the data is
 
@@ -256,11 +258,16 @@ The repository's Releases page (tag `v3.1-nov2026`) has:
 - `mdlarc-generators-v3.1.zip`: `generators/` and `manifest/` from this folder
   (40,996,904 bytes, SHA-256
   `5e3ecd55f98c5b5b77b90990104f9943c0706df3e8251cbffe8c5035d03eba99`);
+- `mdlarc-d1024-e440.pt`: the epoch-440 d1024 checkpoint behind the 37.08
+  Kaggle submission (910,480,739 bytes, SHA-256
+  `328f80bc60ba8105455fdd5f0eed921afdbfb22a84880d63e250b75dc3a38cfc`), the same
+  file as the Kaggle model; fetched only with `--name`;
 - `SHA256SUMS`.
 
 ```bash
 python data_generation/fetch.py              # both ZIPs into assets_tmp/ (where training reads the package)
 python data_generation/fetch.py --name mdlarc-generators-v3.1.zip --dest downloads
+python data_generation/fetch.py --name mdlarc-d1024-e440.pt   # the checkpoint (910 MB)
 ```
 
 `fetch.py` downloads from
@@ -285,5 +292,3 @@ the generator repository is needed for training.
 - the 10,540 per-task prompt and recorded-input records of the authoring
   runs. They are the prompt templates in `authoring/` filled with each task's
   grids, and they contain local paths.
-
-Licence: to be decided.

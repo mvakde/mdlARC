@@ -9,6 +9,7 @@ hash are kept. Standard library only.
 
   python fetch.py                       # both ZIPs into assets_tmp/ (where training reads the package)
   python fetch.py --name mdlarc-generators-v3.1.zip --dest downloads
+  python fetch.py --name mdlarc-d1024-e440.pt     # the 37.08 Kaggle model's checkpoint (910 MB)
 """
 from __future__ import annotations
 
@@ -24,11 +25,13 @@ DEFAULT_TAG = 'v3.1-nov2026'
 BASE_URL = 'https://github.com/mvakde/mdlARC/releases/download'
 PACKAGE = 'arc2-family-full-counts-v1-20261024-r1.zip'
 GENERATORS = 'mdlarc-generators-v3.1.zip'
+CHECKPOINT = 'mdlarc-d1024-e440.pt'
 # Pinned hashes. The package hash is also pinned in manifest/release.json and
 # in the mdlARC training spec that used it.
 KNOWN_SHA256 = {
     PACKAGE: '51d8450883db3467d738b5dbebcd60a763e55fac91335b0afcf0d91f79a3a809',
     GENERATORS: '5e3ecd55f98c5b5b77b90990104f9943c0706df3e8251cbffe8c5035d03eba99',
+    CHECKPOINT: '328f80bc60ba8105455fdd5f0eed921afdbfb22a84880d63e250b75dc3a38cfc',
 }
 USER_AGENT = 'mdlarc-fetch/1.0'
 

@@ -14,10 +14,11 @@ ARC-AGI from scratch: small transformers trained only on ARC puzzles, with no la
 
 ## v3: Looped mdlARC
 
-This repository reproduces **"Looped mdlARC: ARC-AGI Without Language Models"**, our ARC Prize 2026
-entry. Every result in the paper has a spec here. The training data for the Kaggle model can be
-downloaded or regenerated from the released generators, and the submitted Kaggle notebooks are
-included unchanged.
+This repository reproduces
+**[Looped mdlARC: Autoregressive transformer trained from scratch w/o LLMs](https://www.kaggle.com/competitions/arc-prize-2026-paper-track/writeups/looped-mdlarc-autoregressive-transformer-trained)**,
+our ARC Prize 2026 Paper Track entry. Every result in the paper has a spec here. The training data
+for the Kaggle model can be downloaded or regenerated from the released generators, and the
+submitted Kaggle notebooks are included unchanged.
 
 ### Main results
 
@@ -108,8 +109,12 @@ checkpoint of the training spec they name, from `runs/<that run>/pretrain/tiny.p
 4. **Test-time fine-tune and decode.** [`kaggle_submissions/`](kaggle_submissions/) holds the
    submitted notebooks and explains their inputs and recipe.
 
-The epoch-440 checkpoint (99.8M parameters) is published on Kaggle as the model variation
+The epoch-440 checkpoint (99.8M parameters) is on this repository's Releases page as
+`mdlarc-d1024-e440.pt` (910 MB; it includes the optimizer state, so training can continue from it)
+and on Kaggle as the model variation
 [`mithilavakde/mdlarc-loopv3-private/pyTorch/d1024-e440`](https://www.kaggle.com/models/mithilavakde/mdlarc-loopv3-private/pyTorch/d1024-e440).
+Both are the same file (SHA-256 `328f80bc…3a38cfc`). To download and verify it:
+`python data_generation/fetch.py --name mdlarc-d1024-e440.pt`.
 
 Multi-GPU specs set `"distributed": {"nproc_per_node": N}`; `launch_run.py` then starts one process per
 GPU on a single machine.
@@ -166,6 +171,7 @@ kaggle_submissions/        the submitted Kaggle notebooks, their wheel build and
 tools/                     guard re-ranking of saved candidates; decode batch sizing for your GPU
 visualiser/                browser viewer for tasks and model outputs
 tests/                     unit tests (CPU): python -m pytest -q tests
+LICENSE, LICENSES/         MIT-0 for this repository; CC0, ARC-AGI-2 and transductARC licence texts
 ```
 
 ## Built on
@@ -174,15 +180,31 @@ tests/                     unit tests (CPU): python -m pytest -q tests
   the tasks and evaluation sets.
 - [ConceptARC](https://github.com/victorvikram/ConceptARC) and
   [Re-ARC](https://github.com/michaelhodel/re-arc): extra training tasks, downloaded at pinned commits.
-- transductARC: the rules of the symbolic guards.
+- [transductARC](https://github.com/kschweig/transductARC): scale augmentation and the rules of the
+  symbolic guards.
 - [NVARC](https://github.com/1ytic/NVARC): the section format of the task summaries used as examples in the generator prompts
   ([`data_generation/authoring/`](data_generation/authoring/)).
 
 ## Links
 
-- Paper: <!-- TODO(paper link) -->
+- Paper (ARC Prize 2026 Paper Track writeup): https://www.kaggle.com/competitions/arc-prize-2026-paper-track/writeups/looped-mdlarc-autoregressive-transformer-trained
 - Blog post: https://mvakde.github.io/blog/looped-mdlarc/
-- Model weights (99.8M, the 37.08% Kaggle model): https://www.kaggle.com/models/mithilavakde/mdlarc-loopv3-private/pyTorch/d1024-e440
+- Model weights (99.8M, the 37.08% Kaggle model): https://www.kaggle.com/models/mithilavakde/mdlarc-loopv3-private/pyTorch/d1024-e440 and this repository's Releases page (`mdlarc-d1024-e440.pt`)
 - ARC Data Squeeze benchmark: https://github.com/mvakde/arc-data-squeeze
 
-<!-- TODO(licence): decided last, with the user -->
+## Licence
+
+- **Code**: everything in this repository, including the generators in `data_generation/` and the
+  Kaggle notebooks, is under [MIT No Attribution (MIT-0)](LICENSE).
+- **Model weights**: the d1024 epoch-440 checkpoint on the Releases page is under MIT-0 too.
+- **Training puzzle package** (`arc2-family-full-counts-v1-20261024-r1.zip`): the generated puzzles
+  are dedicated to the public domain under [CC0 1.0](LICENSES/CC0-1.0.txt).
+- **ARC-AGI-2 tasks**: the package also contains the 1,120 original ARC-AGI-2 tasks. They, and any
+  task grids reproduced from them here, stay under ARC-AGI-2's
+  [Apache License 2.0](LICENSES/ARC-AGI-2-Apache-2.0.txt) (Copyright 2019 ARC Prize Foundation).
+- **transductARC**: the scale augmentation and the symbolic guard rules follow
+  [transductARC](https://github.com/kschweig/transductARC) (Copyright (c) 2026 Kajetan Schweighofer,
+  [MIT](LICENSES/transductARC-MIT.txt)).
+
+The datasets that `dataset_building_scripts/` downloads (ARC-AGI-1, ARC-AGI-2, ConceptARC, Re-ARC)
+are not redistributed here and keep their own licences.
