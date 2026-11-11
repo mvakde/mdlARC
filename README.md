@@ -146,6 +146,11 @@ These options are off by default and switched on in the specs that use them:
 | Likelihood ranking of the most-voted candidates | `inference_rescore` |
 | ReARC generated tasks in training | `dataset.add_rearc` |
 
+Likelihood ranking normally runs inside the decode (`inference_rescore`). An evaluation with
+`"mode": "rescore"` and a `candidates_path` instead ranks the candidates saved by a finished decode
+(rows 2.5 and 2.6 in [`specs/README.md`](specs/README.md) do this). It does not use the decode's
+speed-ups and is several times slower, so use `inference_rescore` for new runs.
+
 [`specs/README.md`](specs/README.md) lists every default and how it differs from earlier versions of
 this code.
 

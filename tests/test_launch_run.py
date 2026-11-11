@@ -136,6 +136,32 @@ def test_eval_only_launches_no_training(monkeypatch) -> None:
     assert calls == ["final"]
 
 
+def test_cuda_validation_creates_the_run_folder_first(monkeypatch, tmp_path) -> None:
+    run_dir = tmp_path / "runs" / "eval"
+    outputs = []
+
+    def validate(command, **kwargs):
+        assert run_dir.is_dir(), "validation started before the run folder existed"
+        outputs.append(Path(command[3]))
+
+    monkeypatch.setattr(launch_run.subprocess, "run", validate)
+    monkeypatch.setattr(launch_run, "run_eval_stage_isolated", lambda plan, name: None)
+    launch_run.execute_plan({
+        "spec_path": Path("/tmp/eval.json"), "run_name": "eval", "run_dir": run_dir,
+        "skip_data_build": True, "eval_only": True, "validate_cuda": True,
+        "pretrain": {"FA": 2}, "evals": {"final": {}},
+    })
+    assert outputs == [run_dir / "cuda_validation.json"]
+
+
+def test_empty_and_dot_search_path_entries_are_dropped() -> None:
+    env = {"LIBRARY_PATH": "/usr/local/cuda/lib64:", "PATH": ".:/usr/bin::/bin", "CPATH": ":",
+           "LD_LIBRARY_PATH": "/opt/lib", "HOME": "/home/me:"}
+    launch_run.drop_current_directory_search_entries(env)
+    assert env == {"LIBRARY_PATH": "/usr/local/cuda/lib64", "PATH": "/usr/bin:/bin",
+                   "LD_LIBRARY_PATH": "/opt/lib", "HOME": "/home/me:"}
+
+
 def test_failed_child_stops_later_stages(monkeypatch) -> None:
     calls = []
 
@@ -163,6 +189,7 @@ def test_child_dispatches_only_requested_stage(monkeypatch, flag, name, expected
     plan = {"eval_only": False, "pretrain": {}, "finetunes": {"arc": {}}, "evals": {"final": {}}}
     monkeypatch.setattr(sys, "argv", ["launch_run.py", "--config", "/tmp/spec.json", flag, name])
     monkeypatch.setattr(launch_run, "update_env_from_file", lambda *args: None)
+    monkeypatch.setattr(launch_run, "drop_current_directory_search_entries", lambda env: None)
     monkeypatch.setattr(launch_run, "load_spec", lambda path: {})
     monkeypatch.setattr(launch_run, "build_plan", lambda *args: plan)
     monkeypatch.setattr(launch_run, "run_training_stage", lambda stage, label: calls.append(label))

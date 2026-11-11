@@ -555,6 +555,29 @@ def update_env_from_file(env: Any, path: Path) -> None:
             env[key] = value
 
 
+# Search paths in which an empty entry (a leading, trailing or doubled ":") or "." means the current
+# directory. Some container images (for example NGC PyTorch 26.09) end LIBRARY_PATH with ":"; gcc,
+# which Triton calls for torch.compile, then reads this repository's specs/ folder as a gcc spec file
+# and fails with "cannot read spec file './specs'".
+SEARCH_PATH_VARIABLES = (
+    "PATH", "LIBRARY_PATH", "LD_LIBRARY_PATH", "COMPILER_PATH", "CPATH", "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH", "PKG_CONFIG_PATH", "PYTHONPATH",
+)
+
+
+def drop_current_directory_search_entries(env: Any) -> None:
+    """Remove empty and "." entries from the search-path variables in ``env``."""
+    for name in SEARCH_PATH_VARIABLES:
+        value = env.get(name)
+        if value is None:
+            continue
+        kept = [entry for entry in value.split(os.pathsep) if entry not in ("", ".")]
+        if kept:
+            env[name] = os.pathsep.join(kept)
+        else:
+            del env[name]
+
+
 def run_dataset_script(script_path: Path, *args: str) -> None:
     command = [dataset_builder_python(), str(script_path), *args]
     print(f"Running: {' '.join(command)}")
@@ -1561,6 +1584,7 @@ def execute_plan(plan: dict[str, Any]) -> None:
         prepare_data(plan)
     validate_run_split(plan)
     if plan.get("validate_cuda", False):
+        plan["run_dir"].mkdir(parents=True, exist_ok=True)  # an eval-only run has no folder yet
         subprocess.run([sys.executable, "-u", str(SRC_DIR / "ablation_validation.py"),
                         str(plan["run_dir"] / "cuda_validation.json"),
                         str(plan["pretrain"].get("FA", 2))], check=True, cwd=REPO_ROOT)
@@ -1627,6 +1651,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     update_env_from_file(os.environ, DATASET_BUILD_ENV_PATH)
+    drop_current_directory_search_entries(os.environ)
     spec_path = Path(args.config).expanduser().resolve()
     plan = build_plan(load_spec(spec_path), spec_path)
     if args.prepare_data:
