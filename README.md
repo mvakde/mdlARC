@@ -2,13 +2,21 @@
 
 ARC-AGI from scratch: small transformers trained only on ARC puzzles, with no language-model pretraining.
 
+[![37% on ARC-AGI-2 without an LLM, matching Opus 4.5 at max thinking. ARC-AGI-2 scores on Kaggle's hidden tasks: looped mdlARC 100M 37.08 (final submission, first try); Opus 4.5 37.64 at 64K thinking tokens, 30.56 at 32K, 7.78 with none; looped mdlARC 76M 35.69 (official leaderboard); my best non-looped model, 1B, 33.89; NVARC, last year's winner, 27.64; next-best LLM-free entry 12.08](docs/arc-agi-2-kaggle.png)](https://mvakde.github.io/blog/looped-mdlarc/)
+
+*ARC-AGI-2 scores on Kaggle's hidden tasks (12 hours on 4×L4 GPUs). The 37.08 run was scored after the leaderboard froze; see note ¹ below. Opus 4.5 scores are from the ARC Prize leaderboard.*
+
 ## Versions
 
 | Version | Date | Result | Code | Post |
 | --- | --- | --- | --- | --- |
-| **v3: Looped mdlARC** | Nov 2026 | 37.08% on ARC-AGI-2 (Kaggle public score¹), no pretrained LLM; 71.88 / 81.50 top-2 / oracle on ARC-AGI-1 at 19M parameters | `main` (tag `v3.1-nov2026`; first release `v3-nov2026`) | [Looped mdlARC](https://mvakde.github.io/blog/looped-mdlarc/) |
+| **v3: Looped mdlARC** | Nov 2026 | 37.08% on ARC-AGI-2 (Kaggle public score¹), no pretrained LLM; 70.25% top-2 on ARC-AGI-1 at 19M parameters (the [ARC Data Squeeze](https://github.com/mvakde/arc-data-squeeze) record) | `main` (tag `v3.1-nov2026`; first release `v3-nov2026`) | [Looped mdlARC](https://mvakde.github.io/blog/looped-mdlarc/) |
 | v2 | Mar 2026 | 44% on ARC-AGI-1 for 67 cents, 75M unlooped transformer | tag [`v2-mar2026`](https://github.com/mvakde/mdlARC/tree/v2-mar2026) | [44% on ARC-AGI-1 in 67 cents](https://mvakde.github.io/blog/44-on-arc-1/) |
 | v1 | Dec 2025 | 27.5% on ARC-AGI-1, 28M transformer, ~$2 | tag [`v1-dec2025`](https://github.com/mvakde/mdlARC/tree/v1-dec2025) | [New Pareto Frontier on ARC-AGI](https://mvakde.github.io/blog/new-pareto-frontier-arc-agi/) |
+
+![ARC-AGI-1 public eval score against parameters trained: looped mdlARC v3 reaches 49% at 1.05M and 70.25% at 19M parameters, 81.38% with RE-ARC, above HRM (40.3%, 27M + 538M embeddings), TRM (44.6%, 7M + 430M embeddings), CompressARC (20%), mdlARC v1 (27.5%, 28M) and v2 (44%, 76.6M)](docs/arc-agi-1-public-eval.png)
+
+*ARC-AGI-1 public eval (top-2) against parameters trained, from the [blog post](https://mvakde.github.io/blog/looped-mdlarc/#fig-params3). HRM and TRM are plotted at their full trained size, including their per-puzzle embeddings. The 19M point is the d384 ×6 model with likelihood ranking; the 81.38% point adds ReARC, scale augmentation and answer filters (see [Main results](#main-results)).*
 
 ¹ The Kaggle public score of the final submission (57908007). It was submitted before the deadline but scored after the leaderboard froze, so the official board shows the previous looped model at 35.69% (rank 141).
 
@@ -174,6 +182,7 @@ kaggle_submissions/        the submitted Kaggle notebooks, their wheel build and
 tools/                     guard re-ranking of saved candidates; decode batch sizing for your GPU
 visualiser/                browser viewer for tasks and model outputs
 tests/                     unit tests (CPU): python -m pytest -q tests
+docs/                      the README's images
 LICENSE, LICENSES/         MIT-0 for this repository; CC0, ARC-AGI-2 and transductARC licence texts
 ```
 
